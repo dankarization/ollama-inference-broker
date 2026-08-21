@@ -14,9 +14,21 @@ class Profile:
 # or unbounded generation parameters.
 PROFILES = {
     "interactive": Profile("interactive", "nemotron3:33b", 16_384, 2_048, 180),
-    "photo": Profile("photo", "qwen3-vl:32b", 16_384, 1_024, 120),
     "cron": Profile("cron", "nemotron3:33b", 8_192, 1_024, 120),
+    "shutterstock": Profile("shutterstock", "qwen3-vl:32b", 16_384, 1_024, 120),
+    # `olya` is intentionally only a source/profile key. Do not infer an
+    # integration from this name; its model can be changed in broker config.
+    "olya": Profile("olya", "nemotron3:33b", 8_192, 1_024, 120),
     "batch-video": Profile("batch-video", "nemotron3:33b", 8_192, 512, 120),
 }
 
-PRIORITY = {"interactive": 0, "photo": 1, "cron": 2, "batch-video": 3}
+# Lower is more important. These classes are policy compiled into the broker,
+# never trusted from a caller-provided priority field.
+FIXED_SOURCE_PRIORITIES = {
+    "interactive": 1,  # OpenClaw interactive/open session
+    "cron": 2,         # OpenClaw cron
+    "shutterstock": 3,
+    "olya": 4,
+}
+MIN_PRIORITY = 1
+MAX_PRIORITY = 10

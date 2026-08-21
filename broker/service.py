@@ -7,7 +7,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .profiles import PROFILES, PRIORITY
+from .profiles import FIXED_SOURCE_PRIORITIES, MAX_PRIORITY, MIN_PRIORITY, PROFILES
 
 
 class Broker:
@@ -25,9 +25,16 @@ class Broker:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("""CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
+                source TEXT NOT NULL, priority INTEGER NOT NULL,
                 payload TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
                 started REAL, finished REAL, lease_until REAL, error TEXT,
                 switch_reason TEXT)""")
+            # Compatible with databases created by the first isolated MVP.
+            columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
+            if "source" not in columns:
+                self.db.execute("ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'")
+            if "priority" not in columns:
+                self.db.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 10")
 
     def recover(self):
         # A prior process cannot own the remote GPU after its lease. Requeue stale
@@ -37,16 +44,30 @@ class Broker:
             self.db.execute("UPDATE jobs SET state='queued', started=NULL, lease_until=NULL, error='requeued after broker restart' "
                             "WHERE state='running' AND (lease_until IS NULL OR lease_until < ?)", (now,))
 
-    def submit(self, profile: str, kind: str, payload: dict) -> dict:
+    def submit(self, profile: str, kind: str, payload: dict, source: str | None = None,
+               priority: int | None = None) -> dict:
         if profile not in PROFILES:
             raise ValueError("unknown profile")
         if kind not in {"chat", "generate"}:
             raise ValueError("kind must be chat or generate")
+        source = source or profile
+        resolved_priority = self._resolve_priority(source, priority)
         job_id, now = str(uuid.uuid4()), self.clock()
         with self.lock, self.db:
-            self.db.execute("INSERT INTO jobs(id,profile,kind,payload,state,created) VALUES(?,?,?,?,?,?)",
-                            (job_id, profile, kind, json.dumps(payload), "queued", now))
+            self.db.execute("INSERT INTO jobs(id,profile,kind,source,priority,payload,state,created) VALUES(?,?,?,?,?,?,?,?)",
+                            (job_id, profile, kind, source, resolved_priority, json.dumps(payload), "queued", now))
         return self.status(job_id)
+
+    @staticmethod
+    def _resolve_priority(source: str, priority: int | None) -> int:
+        fixed = FIXED_SOURCE_PRIORITIES.get(source)
+        if fixed is not None:
+            if priority is not None and priority != fixed:
+                raise ValueError(f"source '{source}' has fixed priority {fixed}")
+            return fixed
+        if isinstance(priority, bool) or not isinstance(priority, int) or not MIN_PRIORITY <= priority <= MAX_PRIORITY:
+            raise ValueError(f"priority for non-fixed sources must be an integer from {MIN_PRIORITY} to {MAX_PRIORITY}")
+        return priority
 
     def status(self, job_id: str) -> dict | None:
         with self.lock:
@@ -62,9 +83,8 @@ class Broker:
 
     def _position(self, row):
         before = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued' AND "
-            "(CASE profile WHEN 'interactive' THEN 0 WHEN 'photo' THEN 1 WHEN 'cron' THEN 2 ELSE 3 END < ? "
-            "OR (CASE profile WHEN 'interactive' THEN 0 WHEN 'photo' THEN 1 WHEN 'cron' THEN 2 ELSE 3 END = ? AND created < ?))",
-            (PRIORITY[row["profile"]], PRIORITY[row["profile"]], row["created"])).fetchone()[0]
+            "(priority < ? OR (priority = ? AND (created < ? OR (created = ? AND id < ?))))",
+            (row["priority"], row["priority"], row["created"], row["created"], row["id"])).fetchone()[0]
         return before + 1
 
     def cancel(self, job_id: str) -> dict | None:
@@ -80,8 +100,9 @@ class Broker:
         return self.status(job_id)
 
     def _next(self):
-        return self.db.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY "
-            "CASE profile WHEN 'interactive' THEN 0 WHEN 'photo' THEN 1 WHEN 'cron' THEN 2 ELSE 3 END, created LIMIT 1").fetchone()
+        # Strict priority is deliberate: no aging can promote lower-priority
+        # work ahead of a waiting higher-priority job.
+        return self.db.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY priority, created, id LIMIT 1").fetchone()
 
     def dispatch_once(self) -> bool:
         with self.lock, self.db:

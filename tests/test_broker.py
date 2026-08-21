@@ -21,17 +21,38 @@ class FakeOllama:
 
 
 class BrokerTests(unittest.TestCase):
-    def make(self, loaded=None):
+    def make(self, loaded=None, clock=None):
         self.calls=[]; self.tmp=tempfile.NamedTemporaryFile(); self.ol=FakeOllama(self.calls, loaded)
-        return Broker(self.tmp.name, self.ol, FakeWol(self.calls))
-    def test_priority_then_fifo(self):
-        b=self.make(["nemotron3:33b"])
+        return Broker(self.tmp.name, self.ol, FakeWol(self.calls), clock=clock or __import__("time").time)
+    def test_fixed_source_priorities_then_fifo(self):
+        b=self.make(["nemotron3:33b"], clock=iter(range(1_000)).__next__)
         cron=b.submit("cron", "generate", {"prompt":"cron"})["id"]
         first=b.submit("interactive", "generate", {"prompt":"one"})["id"]
         second=b.submit("interactive", "generate", {"prompt":"two"})["id"]
+        shutterstock=b.submit("shutterstock", "generate", {"prompt":"photo"})["id"]
+        olya=b.submit("olya", "generate", {"prompt":"olya"})["id"]
         b.dispatch_once(); self.assertEqual(b.status(first)["state"], "completed")
         b.dispatch_once(); self.assertEqual(b.status(second)["state"], "completed")
         b.dispatch_once(); self.assertEqual(b.status(cron)["state"], "completed")
+        b.dispatch_once(); self.assertEqual(b.status(shutterstock)["state"], "completed")
+        b.dispatch_once(); self.assertEqual(b.status(olya)["state"], "completed")
+
+    def test_fixed_source_mapping_is_server_owned(self):
+        b=self.make()
+        self.assertEqual(b.submit("interactive", "generate", {"prompt":"x"})["priority"], 1)
+        self.assertEqual(b.submit("cron", "generate", {"prompt":"x"})["priority"], 2)
+        self.assertEqual(b.submit("shutterstock", "generate", {"prompt":"x"})["priority"], 3)
+        self.assertEqual(b.submit("olya", "generate", {"prompt":"x"})["priority"], 4)
+        with self.assertRaisesRegex(ValueError, "fixed priority 1"):
+            b.submit("interactive", "generate", {"prompt":"x"}, priority=10)
+
+    def test_dynamic_priority_requires_integer_in_range(self):
+        b=self.make()
+        job=b.submit("batch-video", "generate", {"prompt":"x"}, source="another-submitters", priority=7)
+        self.assertEqual(job["priority"], 7)
+        for bad in (None, 0, 11, True, "3"):
+            with self.assertRaisesRegex(ValueError, "integer from 1 to 10"):
+                b.submit("batch-video", "generate", {"prompt":"x"}, source="another-submitters", priority=bad)
     def test_wol_readiness_unload_and_server_limits(self):
         b=self.make(["qwen3-vl:32b"])
         job=b.submit("interactive", "generate", {"model":"evil", "prompt":"x", "keep_alive":"forever", "options":{"num_ctx":999999,"num_predict":999999}})["id"]

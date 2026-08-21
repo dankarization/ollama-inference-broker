@@ -21,13 +21,22 @@ Cloud-routed workloads, CPU jobs, and current Whisper GPU workers remain outside
 
 Run only in a lab/staging shell: `MAINPC_MAC=2c:f0:5d:74:6a:44 python -m broker`. It binds localhost by default and does not edit OpenClaw, Ollama, Shutterstock, M101, or MAIN-PC configuration.
 
-- `POST /v1/jobs` with `{ "profile":"interactive", "kind":"chat|generate", "payload":{...} }` returns a persisted job (`202`).
+- `POST /v1/jobs` with `{ "profile":"interactive", "kind":"chat|generate", "payload":{...} }` returns a persisted job (`202`). `source` defaults to `profile`. Non-fixed sources must also send an integer `priority` from 1 to 10.
 - `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel`, `GET /v1/metrics` expose lifecycle and MAIN-PC `/api/ps` model/VRAM data.
 - `/api/chat` and `/api/generate` currently return `501`: an Ollama-compatible streaming proxy is deliberately deferred until the client migration contract is tested.
 
-The server chooses profiles, model, context, output cap and keepalive; a caller-supplied `model`, `num_ctx`, `num_predict`, or `keep_alive` cannot escalate those limits. SQLite uses WAL. Dispatch is one job at a time, priority then FIFO: interactive, photo, cron, batch-video. On model change it wakes MAIN-PC, observes `/api/ps`, unloads incompatible models, requests/readiness-checks the target, and only then runs the job. A stale running lease is requeued on restart.
+The server chooses profiles, model, context, output cap and keepalive; a caller-supplied `model`, `num_ctx`, `num_predict`, or `keep_alive` cannot escalate those limits. SQLite uses WAL. Dispatch is one job at a time, strict priority then FIFO. A smaller number is more important; this is deliberately not aging-based, so lower priority work cannot jump a waiting higher-priority job.
 
-Safe canary acceptance: submit mock/staging interactive, photo, cron and batch jobs; verify one remote request at a time, priority/FIFO order, WOL/readiness and unload-before-switch telemetry; restart with an expired lease and observe requeue; then cancel a queued job. No live caller is migrated before those checks pass and rollback is simply stopping the broker with no route changes.
+| Source / config key | Fixed priority |
+| --- | ---: |
+| OpenClaw interactive/open session (`interactive`) | 1 |
+| OpenClaw cron (`cron`) | 2 |
+| Shutterstock (`shutterstock`) | 3 |
+| Olya (`olya`) | 4 |
+
+The literal key is `olya`; it labels a source and does not imply an integration. These four priorities are broker-owned: callers may omit `priority` or repeat the fixed value, but cannot override it. Other sources provide `source` plus a validated whole-number priority from 1 (highest) to 10 (lowest), for example `{ "profile":"batch-video", "source":"maintenance", "priority":7, ... }`. On model change it wakes MAIN-PC, observes `/api/ps`, unloads incompatible models, requests/readiness-checks the target, and only then runs the job. A stale running lease is requeued on restart.
+
+Safe canary acceptance: submit mock/staging interactive, cron, Shutterstock, Olya and dynamic-priority jobs; verify one remote request at a time, priority/FIFO order, WOL/readiness and unload-before-switch telemetry; restart with an expired lease and observe requeue; then cancel a queued job. No live caller is migrated before those checks pass and rollback is simply stopping the broker with no route changes.
 
 ## Development
 
@@ -36,7 +45,7 @@ Safe canary acceptance: submit mock/staging interactive, photo, cron and batch j
 ## Initial policy
 
 - Admit one active local GPU workload at a time.
-- Priority order: interactive human request, local photo processing, cron, then batch video.
+- Priority: 1 is highest and 10 is lowest. Fixed policy is interactive/open session 1, cron 2, Shutterstock 3, and `olya` 4; other sources select 1–10 at enqueue time.
 - Before a model change, unload an incompatible loaded model, wait until the target model is ready, then start the request.
 - Default to one request per model. Each workload profile caps context and maximum output.
 - Keep a model resident for 2–5 minutes only when its queue has follow-up work; otherwise unload it.

@@ -2,13 +2,13 @@
 
 ## Phase 0 — Contract and inventory
 
-Define the broker API, caller identities, workload profiles, priority classes, cancellation behavior, and model inventory. Identify every direct local Ollama caller and document the supported MAIN-PC health signals.
+Define the broker API, caller identities, workload profiles, priority classes, cancellation behavior, and model inventory. Identify every direct local Ollama caller and document the supported MAIN-PC health signals. The broker contract fixes OpenClaw interactive/open-session at priority 1, OpenClaw cron at 2, Shutterstock at 3, and literal source key `olya` at 4; 1 is highest. Other sources must submit an integer priority from 1 through 10.
 
 Ready to advance when every intended caller has a migration owner and no unresolved ambiguity remains around local versus cloud routing.
 
 ## Phase 1 — MVP: safe serialized admission (implemented in isolated form)
 
-Build a single broker process with a persistent queue and one active local workload. Implement priority dispatch, exclusive Ollama access, target-model readiness checks, controlled unload/switch, profile limits for context/output, and bounded keepalive.
+Build a single broker process with a persistent queue and one active local workload. Implement strict priority dispatch (then FIFO within equal priority), exclusive Ollama access, target-model readiness checks, controlled unload/switch, profile limits for context/output, and bounded keepalive. Do not add priority aging that allows a lower class to overtake a waiting higher class.
 
 Ready to advance when representative interactive, photo, cron, and batch-video requests cannot overlap on the GPU; cancelled or failed work releases the lock; and restart recovery leaves no stuck workload.
 

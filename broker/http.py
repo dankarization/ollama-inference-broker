@@ -9,7 +9,8 @@ def serve(broker, host="127.0.0.1", port=8088):
         def do_POST(self):
             size=int(self.headers.get("Content-Length", 0)); body=json.loads(self.rfile.read(size) or b"{}")
             if self.path == "/v1/jobs":
-                try: self._json(202, broker.submit(body["profile"], body["kind"], body.get("payload", {})))
+                try: self._json(202, broker.submit(body["profile"], body["kind"], body.get("payload", {}),
+                                                  body.get("source"), body.get("priority")))
                 except (KeyError, ValueError) as e: self._json(400, {"error": str(e)})
             elif self.path.startswith("/v1/jobs/") and self.path.endswith("/cancel"):
                 result=broker.cancel(self.path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
