@@ -1,6 +1,6 @@
 # Local Inference Broker
 
-Private control plane for one GPU-backed Ollama host. It prevents competing local workloads from racing for VRAM and gives the work that matters to a person priority over scheduled and batch jobs.
+Private control plane for one GPU-backed Ollama host. It prevents competing local workloads from racing for VRAM and gives the work that matters to a person priority over scheduled and batch jobs. It is intentionally an isolated MVP: no current caller or production route is changed.
 
 ## Problem
 
@@ -9,13 +9,29 @@ Ollama shares loaded model weights, but every concurrent request consumes its ow
 The broker is the single admission point for all local inference. Callers do not call Ollama directly.
 
 ```text
-OpenClaw chats ─┐
-Hermes ─────────┼──> Local Inference Broker ───> Ollama ───> MAIN-PC GPU / VRAM
-Pipelines ──────┘          queue, priority,
-                              limits, locks
+OpenClaw always-on host: broker + SQLite WAL      MAIN-PC (wakeable executor)
+OpenClaw / M101 jobs ──> queue, policy, API ──> Ollama ──> one GPU / VRAM
+                         resource: mainpc-gpu        ^
+                                                    WOL when a job dispatches
 ```
 
-Cloud-routed workloads remain outside this path: they do not consume the MAIN-PC GPU and must not be serialized with local work.
+Cloud-routed workloads, CPU jobs, and current Whisper GPU workers remain outside this path: they do not consume `mainpc-gpu` (Whisper will get its own explicit resource profile later) and must not be serialized with it. The broker runs outside MAIN-PC so it survives a WOL cycle; MAIN-PC has no queue state.
+
+## MVP API and runbook
+
+Run only in a lab/staging shell: `MAINPC_MAC=2c:f0:5d:74:6a:44 python -m broker`. It binds localhost by default and does not edit OpenClaw, Ollama, Shutterstock, M101, or MAIN-PC configuration.
+
+- `POST /v1/jobs` with `{ "profile":"interactive", "kind":"chat|generate", "payload":{...} }` returns a persisted job (`202`).
+- `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel`, `GET /v1/metrics` expose lifecycle and MAIN-PC `/api/ps` model/VRAM data.
+- `/api/chat` and `/api/generate` currently return `501`: an Ollama-compatible streaming proxy is deliberately deferred until the client migration contract is tested.
+
+The server chooses profiles, model, context, output cap and keepalive; a caller-supplied `model`, `num_ctx`, `num_predict`, or `keep_alive` cannot escalate those limits. SQLite uses WAL. Dispatch is one job at a time, priority then FIFO: interactive, photo, cron, batch-video. On model change it wakes MAIN-PC, observes `/api/ps`, unloads incompatible models, requests/readiness-checks the target, and only then runs the job. A stale running lease is requeued on restart.
+
+Safe canary acceptance: submit mock/staging interactive, photo, cron and batch jobs; verify one remote request at a time, priority/FIFO order, WOL/readiness and unload-before-switch telemetry; restart with an expired lease and observe requeue; then cancel a queued job. No live caller is migrated before those checks pass and rollback is simply stopping the broker with no route changes.
+
+## Development
+
+`python -m unittest discover -s tests -v` runs adapter-mocked tests and never sends WOL or Ollama traffic.
 
 ## Initial policy
 
