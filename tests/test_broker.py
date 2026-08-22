@@ -4,6 +4,7 @@ import unittest
 from urllib.request import urlopen
 
 from broker.http import serve
+from broker.__main__ import dispatch_enabled
 from broker.service import Broker
 
 
@@ -27,6 +28,12 @@ class BrokerTests(unittest.TestCase):
     def make(self, loaded=None, clock=None):
         self.calls=[]; self.tmp=tempfile.NamedTemporaryFile(); self.ol=FakeOllama(self.calls, loaded)
         return Broker(self.tmp.name, self.ol, FakeWol(self.calls), clock=clock or __import__("time").time)
+    def test_dispatch_enabled_requires_an_explicit_valid_boolean(self):
+        self.assertTrue(dispatch_enabled(None))
+        self.assertTrue(dispatch_enabled("YES"))
+        self.assertFalse(dispatch_enabled("false"))
+        with self.assertRaisesRegex(ValueError, "must be true or false"):
+            dispatch_enabled("later")
     def test_fixed_source_priorities_then_fifo(self):
         b=self.make(["nemotron3:33b"], clock=iter(range(1_000)).__next__)
         cron=b.submit("cron", "generate", {"prompt":"cron"})["id"]

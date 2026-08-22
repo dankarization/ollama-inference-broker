@@ -28,6 +28,9 @@
   может получить MAIN-PC GPU.
 - [x] Локальный `GET /healthz`: состояние очереди и активной lease без WOL,
   запроса к MAIN-PC или обращения к Ollama.
+- [x] Развёрнут loopback-only user-service с durable SQLite и явным
+  admission-only guard (`BROKER_DISPATCH_ENABLED=false`). Проверены `/healthz`
+  и приём/отмена synthetic job: dispatch, WOL и MAIN-PC/Ollama не вызывались.
 - [ ] Canary с mock/staging заданиями и подтверждением WOL/readiness,
   unload-before-switch и отсутствия overlap на MAIN-PC. Сейчас заблокировано:
   новый профиль `shutterstock-video` использует уже подтверждённый

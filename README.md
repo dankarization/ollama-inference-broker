@@ -35,6 +35,27 @@ MAINPC_MAC=2c:f0:5d:74:6a:44 python -m broker
 По умолчанию сервер слушает localhost и не изменяет конфигурации OpenClaw,
 Ollama, Shutterstock, M101 или MAIN-PC.
 
+### Локальный user-service: admission без dispatch
+
+В `systemd/ollama-inference-broker.service` намеренно зафиксированы loopback
+`127.0.0.1:8088`, локальный SQLite в `~/.local/state/ollama-inference-broker`
+и `BROKER_DISPATCH_ENABLED=false`. В таком режиме service переживает сбой,
+принимает и устойчиво сохраняет jobs, но не запускает dispatcher: WOL, `/api/ps`
+и любой запрос к MAIN-PC/Ollama невозможны. Это безопасный deployment state до
+отдельного разрешения на canary dispatch.
+
+```bash
+install -D -m 0644 systemd/ollama-inference-broker.service \
+  ~/.config/systemd/user/ollama-inference-broker.service
+systemctl --user daemon-reload
+systemctl --user enable --now ollama-inference-broker.service
+curl --fail http://127.0.0.1:8088/healthz
+```
+
+Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
+Удаление SQLite state не требуется для остановки и должно выполняться только
+после отдельной проверки queued jobs.
+
 - `POST /v1/jobs` принимает `{ "profile":"interactive", "kind":"chat|generate", "payload":{...} }` и возвращает сохранённое задание (`202`).
 - `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel` и `GET /v1/metrics` дают доступ к жизненному циклу и данным MAIN-PC `/api/ps`.
 - `GET /healthz` проверяет только локальное состояние broker: очередь, активную lease и timestamp. Он не отправляет WOL и не обращается к MAIN-PC/Ollama.

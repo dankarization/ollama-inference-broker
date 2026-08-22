@@ -1,0 +1,22 @@
+[Unit]
+Description=Local Ollama inference broker (admission-only)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.openclaw/workspace/.worktrees/ollama-inference-broker-main.NHyaee
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=MAINPC_MAC=2c:f0:5d:74:6a:44
+Environment=BROKER_BIND=127.0.0.1
+Environment=BROKER_PORT=8088
+Environment=BROKER_DB=%h/.local/state/ollama-inference-broker/broker.sqlite3
+Environment=BROKER_DISPATCH_ENABLED=false
+ExecStartPre=/usr/bin/mkdir -p %h/.local/state/ollama-inference-broker
+ExecStart=/usr/bin/python3 -m broker
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
