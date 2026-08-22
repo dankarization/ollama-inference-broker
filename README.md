@@ -56,10 +56,14 @@ Ollama, Shutterstock, M101 или MAIN-PC.
 | --- | ---: |
 | Интерактивная сессия OpenClaw (`interactive`) | 1 |
 | OpenClaw cron (`cron`) | 2 |
-| Shutterstock (`shutterstock`) | 5 |
+| Локальное Shutterstock video (`shutterstock-video`) | 5 |
 | Olya (`olya`) | 8 |
 
-Ключ `olya` — только имя источника, а не интеграция. Эти четыре значения
+Shutterstock photo остаётся cloud workload через OmniRoute и не имеет профиля
+broker: оно не ставит задание в эту очередь, не отправляет WOL и не занимает
+GPU MAIN-PC. `shutterstock-video` — отдельный локальный workload на
+`nemotron3:33b`; только он получает приоритет 5. Ключ `olya` — только имя
+источника, а не интеграция. Эти четыре значения
 принадлежат broker: caller может не передавать `priority` либо повторить
 фиксированное значение, но не может его переопределить. Остальные источники
 обязаны передать целый `priority` от 1 (максимальный) до 10 (минимальный),
@@ -80,10 +84,10 @@ Ollama, Shutterstock, M101 или MAIN-PC.
 broker без изменения routes.
 
 Перед live canary оператор обязан проверить, что на MAIN-PC уже установлены
-все модели server-side profiles. В частности, `shutterstock` требует
-`qwen3-vl:32b`. Если целевой модели нет в `/api/tags`, canary прекращается до
-dispatch, WOL, unload или попытки pull модели; подключать Shutterstock к
-broker в таком состоянии нельзя.
+все модели server-side local-GPU profiles. Для `shutterstock-video` нужна
+`nemotron3:33b`; cloud photo через OmniRoute этой проверки не требует и в
+broker не подключается. Если целевой модели нет в `/api/tags`, canary
+прекращается до dispatch, WOL, unload или попытки pull модели.
 
 ```bash
 python -m unittest discover -s tests -v

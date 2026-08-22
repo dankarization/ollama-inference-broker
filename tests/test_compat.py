@@ -32,6 +32,7 @@ class CompatibilityTests(unittest.TestCase):
     def test_request_validation_rejects_unknown_profile_and_model_override(self):
         broker = self.make()
         with self.assertRaisesRegex(CompatibilityError, "server-side profile"): submit(broker, "generate", {"prompt": "x"})
+        with self.assertRaisesRegex(CompatibilityError, "server-side profile"): submit(broker, "generate", {"profile": "shutterstock", "prompt": "photo"})
         with self.assertRaisesRegex(CompatibilityError, "caller model"): submit(broker, "generate", {"profile": "cron", "model": "evil", "prompt": "x"})
         with self.assertRaisesRegex(CompatibilityError, "messages"): submit(broker, "chat", {"profile": "interactive", "messages": []})
 

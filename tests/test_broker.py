@@ -32,19 +32,23 @@ class BrokerTests(unittest.TestCase):
         cron=b.submit("cron", "generate", {"prompt":"cron"})["id"]
         first=b.submit("interactive", "generate", {"prompt":"one"})["id"]
         second=b.submit("interactive", "generate", {"prompt":"two"})["id"]
-        shutterstock=b.submit("shutterstock", "generate", {"prompt":"photo"})["id"]
+        shutterstock_video=b.submit("shutterstock-video", "generate", {"prompt":"video"})["id"]
         olya=b.submit("olya", "generate", {"prompt":"olya"})["id"]
         b.dispatch_once(); self.assertEqual(b.status(first)["state"], "completed")
         b.dispatch_once(); self.assertEqual(b.status(second)["state"], "completed")
         b.dispatch_once(); self.assertEqual(b.status(cron)["state"], "completed")
-        b.dispatch_once(); self.assertEqual(b.status(shutterstock)["state"], "completed")
+        b.dispatch_once(); self.assertEqual(b.status(shutterstock_video)["state"], "completed")
         b.dispatch_once(); self.assertEqual(b.status(olya)["state"], "completed")
 
     def test_fixed_source_mapping_is_server_owned(self):
         b=self.make()
         self.assertEqual(b.submit("interactive", "generate", {"prompt":"x"})["priority"], 1)
         self.assertEqual(b.submit("cron", "generate", {"prompt":"x"})["priority"], 2)
-        self.assertEqual(b.submit("shutterstock", "generate", {"prompt":"x"})["priority"], 5)
+        video = b.submit("shutterstock-video", "generate", {"prompt":"x"})
+        self.assertEqual(video["priority"], 5)
+        self.assertEqual(video["profile"], "shutterstock-video")
+        with self.assertRaisesRegex(ValueError, "unknown profile"):
+            b.submit("shutterstock", "generate", {"prompt":"photo"})
         self.assertEqual(b.submit("olya", "generate", {"prompt":"x"})["priority"], 8)
         with self.assertRaisesRegex(ValueError, "fixed priority 1"):
             b.submit("interactive", "generate", {"prompt":"x"}, priority=10)
@@ -57,15 +61,25 @@ class BrokerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "integer from 1 to 10"):
                 b.submit("batch-video", "generate", {"prompt":"x"}, source="another-submitters", priority=bad)
     def test_wol_readiness_unload_and_server_limits(self):
-        b=self.make(["qwen3-vl:32b"])
+        b=self.make(["incompatible-model:1"])
         job=b.submit("interactive", "generate", {"model":"evil", "prompt":"x", "keep_alive":"forever", "options":{"num_ctx":999999,"num_predict":999999}})["id"]
         b.dispatch_once()
         self.assertEqual(b.status(job)["state"], "completed")
-        self.assertLess(self.calls.index(("unload", "qwen3-vl:32b")), next(i for i,x in enumerate(self.calls) if isinstance(x,tuple) and x[0]=="run"))
+        self.assertLess(self.calls.index(("unload", "incompatible-model:1")), next(i for i,x in enumerate(self.calls) if isinstance(x,tuple) and x[0]=="run"))
         last=[x for x in self.calls if isinstance(x,tuple) and x[0]=="run" and x[2].get("prompt")=="x"][0][2]
         self.assertEqual(last["model"], "nemotron3:33b")
         self.assertEqual(last["options"], {"num_ctx":16384,"num_predict":2048})
         self.assertEqual(self.calls[0], "wake")
+    def test_shutterstock_video_switches_to_nemotron_with_server_owned_limits(self):
+        b=self.make(["incompatible-model:1"])
+        job=b.submit("shutterstock-video", "generate", {"prompt":"video", "options":{"num_ctx":999999,"num_predict":999999}})["id"]
+        b.dispatch_once()
+        self.assertEqual(b.status(job)["state"], "completed")
+        self.assertEqual(b.status(job)["switch_reason"], "unloaded incompatible model before switch")
+        self.assertIn(("unload", "incompatible-model:1"), self.calls)
+        request=[x[2] for x in self.calls if isinstance(x,tuple) and x[0]=="run" and x[2].get("prompt")=="video"][0]
+        self.assertEqual(request["model"], "nemotron3:33b")
+        self.assertEqual(request["options"], {"num_ctx":16384,"num_predict":1024})
     def test_cancel_queued_and_recover_expired_lease(self):
         b=self.make(["nemotron3:33b"])
         queued=b.submit("cron", "generate", {"prompt":"x"})["id"]
