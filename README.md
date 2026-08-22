@@ -79,6 +79,12 @@ Ollama, Shutterstock, M101 или MAIN-PC.
 Ни один live caller не мигрируется до успешной проверки; откат — остановить
 broker без изменения routes.
 
+Перед live canary оператор обязан проверить, что на MAIN-PC уже установлены
+все модели server-side profiles. В частности, `shutterstock` требует
+`qwen3-vl:32b`. Если целевой модели нет в `/api/tags`, canary прекращается до
+dispatch, WOL, unload или попытки pull модели; подключать Shutterstock к
+broker в таком состоянии нельзя.
+
 ```bash
 python -m unittest discover -s tests -v
 ```

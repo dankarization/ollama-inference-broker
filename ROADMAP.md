@@ -26,7 +26,10 @@
   запроса к MAIN-PC или обращения к Ollama.
 - [ ] Canary с mock/staging заданиями и подтверждением WOL/readiness,
   unload-before-switch и отсутствия overlap на MAIN-PC. Сейчас заблокировано:
-  MAIN-PC занят Nemotron, обращаться к нему запрещено.
+  controlled preflight 2026-08-22 подтвердил, что `nemotron3:33b` загружен,
+  но обязательная для profile `shutterstock` модель `qwen3-vl:32b` отсутствует
+  в `/api/tags`. До отдельной установки модели canary не запускается и не
+  делаются WOL, unload, pull либо caller migration.
 
 MVP остаётся control plane на постоянном хосте OpenClaw для ресурса
 `mainpc-gpu`; MAIN-PC — только executor. Эта фаза не меняет callers, трафик,
