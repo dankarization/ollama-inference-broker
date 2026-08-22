@@ -1,58 +1,90 @@
-# Local Inference Broker
+# Локальный брокер инференса
 
-Private control plane for one GPU-backed Ollama host. It prevents competing local workloads from racing for VRAM and gives the work that matters to a person priority over scheduled and batch jobs. It is intentionally an isolated MVP: no current caller or production route is changed.
+Это приватный control plane для одного GPU-хоста с Ollama. Брокер предотвращает
+конкуренцию локальных задач за VRAM и предоставляет строгую очередь с
+приоритетами. Это изолированный MVP: он не меняет текущих callers, трафик,
+маршрутизацию, production-конфигурацию или порядок source roots.
 
-## Problem
+## Назначение
 
-Ollama shares loaded model weights, but every concurrent request consumes its own KV cache and generation or image buffers. Two different models need both sets of weights too. Large contexts make this especially easy to exhaust. Ollama can load and serve models, but it does not understand the priority of OpenClaw, Hermes, or pipeline work.
-
-The broker is the single admission point for all local inference. Callers do not call Ollama directly.
+Ollama хранит веса моделей, но каждый параллельный запрос использует собственный
+KV cache и буферы генерации либо изображений. При больших контекстах или смене
+модели это может исчерпать VRAM. Брокер является единой точкой admission для
+локального инференса: callers ставят задания в очередь, а не вызывают Ollama
+напрямую.
 
 ```text
-OpenClaw always-on host: broker + SQLite WAL      MAIN-PC (wakeable executor)
-OpenClaw / M101 jobs ──> queue, policy, API ──> Ollama ──> one GPU / VRAM
-                         resource: mainpc-gpu        ^
-                                                    WOL when a job dispatches
+Постоянный хост OpenClaw: broker + SQLite WAL      MAIN-PC: executor Ollama
+Задания OpenClaw / M101 ──> очередь, policy, API ──> Ollama ──> один GPU / VRAM
+                              resource: mainpc-gpu       ^
+                                                   WOL при dispatch задания
 ```
 
-Cloud-routed workloads, CPU jobs, and current Whisper GPU workers remain outside this path: they do not consume `mainpc-gpu` (Whisper will get its own explicit resource profile later) and must not be serialized with it. The broker runs outside MAIN-PC so it survives a WOL cycle; MAIN-PC has no queue state.
+Cloud-routed нагрузки, CPU-задачи и существующие GPU-workers Whisper остаются
+вне этого пути. Брокер запускается вне MAIN-PC, поэтому его очередь переживает
+WOL cycle; MAIN-PC не хранит состояние очереди.
 
-## MVP API and runbook
+## API MVP
 
-Run only in a lab/staging shell: `MAINPC_MAC=2c:f0:5d:74:6a:44 python -m broker`. It binds localhost by default and does not edit OpenClaw, Ollama, Shutterstock, M101, or MAIN-PC configuration.
+Запускайте только в лабораторной или staging-среде:
 
-- `POST /v1/jobs` with `{ "profile":"interactive", "kind":"chat|generate", "payload":{...} }` returns a persisted job (`202`). `source` defaults to `profile`. Non-fixed sources must also send an integer `priority` from 1 to 10.
-- `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel`, `GET /v1/metrics` expose lifecycle and MAIN-PC `/api/ps` model/VRAM data.
-- `/api/chat` and `/api/generate` currently return `501`: an Ollama-compatible streaming proxy is deliberately deferred until the client migration contract is tested.
+```bash
+MAINPC_MAC=2c:f0:5d:74:6a:44 python -m broker
+```
 
-The server chooses profiles, model, context, output cap and keepalive; a caller-supplied `model`, `num_ctx`, `num_predict`, or `keep_alive` cannot escalate those limits. SQLite uses WAL. Dispatch is one job at a time, strict priority then FIFO. A smaller number is more important; this is deliberately not aging-based, so lower priority work cannot jump a waiting higher-priority job.
+По умолчанию сервер слушает localhost и не изменяет конфигурации OpenClaw,
+Ollama, Shutterstock, M101 или MAIN-PC.
 
-| Source / config key | Fixed priority |
+- `POST /v1/jobs` принимает `{ "profile":"interactive", "kind":"chat|generate", "payload":{...} }` и возвращает сохранённое задание (`202`).
+- `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel` и `GET /v1/metrics` дают доступ к жизненному циклу и данным MAIN-PC `/api/ps`.
+- `/api/chat` и `/api/generate` сейчас возвращают `501`: совместимый streaming proxy будет добавлен после проверки контракта миграции callers.
+
+Сервер сам выбирает профиль, модель, контекст, лимит вывода и keepalive.
+Переданные caller значения `model`, `num_ctx`, `num_predict` и `keep_alive` не
+могут повысить эти лимиты. SQLite использует WAL. Dispatch выполняется строго
+по приоритету, затем FIFO; старение очереди намеренно не применяется.
+
+## Действующая политика приоритетов
+
+Меньшее число означает более высокий приоритет.
+
+| Источник / ключ конфигурации | Фиксированный приоритет |
 | --- | ---: |
-| OpenClaw interactive/open session (`interactive`) | 1 |
+| Интерактивная сессия OpenClaw (`interactive`) | 1 |
 | OpenClaw cron (`cron`) | 2 |
-| Shutterstock (`shutterstock`) | 3 |
-| Olya (`olya`) | 4 |
+| Shutterstock (`shutterstock`) | 5 |
+| Olya (`olya`) | 8 |
 
-The literal key is `olya`; it labels a source and does not imply an integration. These four priorities are broker-owned: callers may omit `priority` or repeat the fixed value, but cannot override it. Other sources provide `source` plus a validated whole-number priority from 1 (highest) to 10 (lowest), for example `{ "profile":"batch-video", "source":"maintenance", "priority":7, ... }`. On model change it wakes MAIN-PC, observes `/api/ps`, unloads incompatible models, requests/readiness-checks the target, and only then runs the job. A stale running lease is requeued on restart.
+Ключ `olya` — только имя источника, а не интеграция. Эти четыре значения
+принадлежат broker: caller может не передавать `priority` либо повторить
+фиксированное значение, но не может его переопределить. Остальные источники
+обязаны передать целый `priority` от 1 (максимальный) до 10 (минимальный),
+например `{ "profile":"batch-video", "source":"maintenance", "priority":7 }`.
 
-Safe canary acceptance: submit mock/staging interactive, cron, Shutterstock, Olya and dynamic-priority jobs; verify one remote request at a time, priority/FIFO order, WOL/readiness and unload-before-switch telemetry; restart with an expired lease and observe requeue; then cancel a queued job. No live caller is migrated before those checks pass and rollback is simply stopping the broker with no route changes.
+При смене модели broker будит MAIN-PC, читает `/api/ps`, выгружает несовместимую
+модель, запрашивает и проверяет готовность целевой модели и только затем
+запускает задание. Просроченная running lease возвращается в очередь при
+перезапуске broker.
 
-## Development
+## Проверка и разработка
 
-`python -m unittest discover -s tests -v` runs adapter-mocked tests and never sends WOL or Ollama traffic.
+Безопасная canary-проверка использует mock или staging задания `interactive`,
+`cron`, `shutterstock`, `olya` и dynamic priority. Следует проверить один
+удалённый запрос за раз, порядок priority/FIFO, WOL/readiness, unload перед
+сменой модели, восстановление просроченной lease и отмену queued задания.
+Ни один live caller не мигрируется до успешной проверки; откат — остановить
+broker без изменения routes.
 
-## Initial policy
+```bash
+python -m unittest discover -s tests -v
+```
 
-- Admit one active local GPU workload at a time.
-- Priority: 1 is highest and 10 is lowest. Fixed policy is interactive/open session 1, cron 2, Shutterstock 3, and `olya` 4; other sources select 1–10 at enqueue time.
-- Before a model change, unload an incompatible loaded model, wait until the target model is ready, then start the request.
-- Default to one request per model. Each workload profile caps context and maximum output.
-- Keep a model resident for 2–5 minutes only when its queue has follow-up work; otherwise unload it.
-- Make cancellation, queue position, dispatch decisions, and model-switch reasons explicit.
+Тесты используют адаптеры-заглушки и не отправляют WOL либо запросы Ollama.
 
-## Scope
+## Границы MVP
 
-The broker owns admission, ordering, model residency, request profiles, and operational telemetry. Ollama remains the inference runtime. It is not a replacement for cloud routing, task orchestration, or caller-specific business logic.
+Broker владеет admission, порядком, residency моделей, request profiles и
+операционной телеметрией. Ollama остаётся inference runtime. Проект не заменяет
+cloud routing, task orchestration или бизнес-логику callers.
 
-See [ROADMAP.md](ROADMAP.md) for the staged delivery plan.
+Подробный поэтапный план — в [ROADMAP.md](ROADMAP.md).

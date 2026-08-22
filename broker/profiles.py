@@ -27,8 +27,8 @@ PROFILES = {
 FIXED_SOURCE_PRIORITIES = {
     "interactive": 1,  # OpenClaw interactive/open session
     "cron": 2,         # OpenClaw cron
-    "shutterstock": 3,
-    "olya": 4,
+    "shutterstock": 5,
+    "olya": 8,
 }
 MIN_PRIORITY = 1
 MAX_PRIORITY = 10

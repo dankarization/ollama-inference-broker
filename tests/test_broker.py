@@ -41,8 +41,8 @@ class BrokerTests(unittest.TestCase):
         b=self.make()
         self.assertEqual(b.submit("interactive", "generate", {"prompt":"x"})["priority"], 1)
         self.assertEqual(b.submit("cron", "generate", {"prompt":"x"})["priority"], 2)
-        self.assertEqual(b.submit("shutterstock", "generate", {"prompt":"x"})["priority"], 3)
-        self.assertEqual(b.submit("olya", "generate", {"prompt":"x"})["priority"], 4)
+        self.assertEqual(b.submit("shutterstock", "generate", {"prompt":"x"})["priority"], 5)
+        self.assertEqual(b.submit("olya", "generate", {"prompt":"x"})["priority"], 8)
         with self.assertRaisesRegex(ValueError, "fixed priority 1"):
             b.submit("interactive", "generate", {"prompt":"x"}, priority=10)
 

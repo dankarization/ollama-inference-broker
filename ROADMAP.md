@@ -1,35 +1,56 @@
-# Roadmap
+# Дорожная карта
 
-## Phase 0 — Contract and inventory
+## Фаза 0 — контракт и инвентаризация
 
-Define the broker API, caller identities, workload profiles, priority classes, cancellation behavior, and model inventory. Identify every direct local Ollama caller and document the supported MAIN-PC health signals. The broker contract fixes OpenClaw interactive/open-session at priority 1, OpenClaw cron at 2, Shutterstock at 3, and literal source key `olya` at 4; 1 is highest. Other sources must submit an integer priority from 1 through 10.
+Определить API broker, идентичности callers, workload profiles, классы
+приоритетов, отмену и инвентарь моделей. Зафиксировать всех прямых callers
+локального Ollama и поддерживаемые сигналы здоровья MAIN-PC.
 
-Ready to advance when every intended caller has a migration owner and no unresolved ambiguity remains around local versus cloud routing.
+Действующая фиксированная политика: `interactive` — 1, `cron` — 2,
+`shutterstock` — 5 и `olya` — 8. Меньшее число означает более высокий
+приоритет. Другие источники передают целый приоритет от 1 до 10.
 
-## Phase 1 — MVP: safe serialized admission (implemented in isolated form)
+Переход возможен, когда у каждого предполагаемого caller есть владелец миграции
+и нет неясности между local и cloud routing.
 
-Build a single broker process with a persistent queue and one active local workload. Implement strict priority dispatch (then FIFO within equal priority), exclusive Ollama access, target-model readiness checks, controlled unload/switch, profile limits for context/output, and bounded keepalive. Do not add priority aging that allows a lower class to overtake a waiting higher class.
+## Фаза 1 — MVP безопасного последовательного admission
 
-Ready to advance when representative interactive, photo, cron, and batch-video requests cannot overlap on the GPU; cancelled or failed work releases the lock; and restart recovery leaves no stuck workload.
+Реализовать один процесс broker с устойчивой очередью и одной активной локальной
+нагрузкой. Нужны strict priority, затем FIFO при равенстве, exclusive access к
+Ollama, readiness checks целевой модели, управляемые unload/switch, profile
+limits контекста и вывода и ограниченный keepalive. Нельзя вводить priority
+aging, позволяющее менее важному классу обойти ожидающий более важный.
 
-The MVP is an always-on OpenClaw-host control plane with a SQLite WAL queue for the `mainpc-gpu` resource; MAIN-PC is only a WOL-started Ollama executor. It excludes cloud and CPU paths plus existing Whisper GPU workers, which require a later separate resource profile. It performs no migration or production configuration change.
+MVP — control plane на постоянном хосте OpenClaw с SQLite WAL очередью ресурса
+`mainpc-gpu`; MAIN-PC является только WOL-started executor Ollama. Cloud и CPU
+пути, а также существующие GPU-workers Whisper исключены и потребуют отдельного
+resource profile. Эта изолированная фаза не меняет callers, трафик,
+маршрутизацию, production configuration или source-root order.
 
-## Phase 2 — Integrations
+Переход возможен, когда representative interactive, photo, cron и batch-video
+задания не пересекаются на GPU, cancelled/failed задания освобождают lock, а
+восстановление после restart не оставляет зависшей работы.
 
-Move OpenClaw, Hermes, and local pipelines to the broker API. Block or alert on new direct Ollama calls. Preserve separate cloud-photo concurrency, because it does not use MAIN-PC VRAM.
+## Фаза 2 — интеграции
 
-Ready to advance when production callers use the broker exclusively for local inference and fallback behavior is documented and exercised.
+Перевести OpenClaw, Hermes и локальные pipelines на API broker. Блокировать или
+сигнализировать о новых прямых вызовах Ollama. Сохранить отдельную cloud-photo
+concurrency, поскольку она не использует VRAM MAIN-PC.
 
-First add and test an Ollama-compatible streaming proxy contract, then migrate one explicit canary caller. Do not redirect a caller merely because its process happens to run on OpenClaw or M101.
+Сначала добавить и проверить Ollama-compatible streaming proxy, затем
+мигрировать один явно определённый canary caller. Нельзя перенаправлять caller
+только потому, что его процесс запущен на OpenClaw или M101.
 
-## Phase 3 — Observability and operations
+## Фаза 3 — наблюдаемость и операции
 
-Expose queue depth and wait time, active workload, priority, selected model, loaded models and VRAM from Ollama `/api/ps`, profile-limit rejections, cancellations, and model-switch reasons. Add health checks, structured logs, and operational dashboards/alerts.
+Публиковать глубину и время ожидания очереди, активную нагрузку, priority,
+выбранную модель, загруженные модели и VRAM из Ollama `/api/ps`, отказы по
+profile limits, отмены и причины model switch. Добавить health checks,
+structured logs и операционные dashboards/alerts.
 
-Ready to advance when an operator can explain every delayed, rejected, cancelled, or switched request from telemetry alone.
+## Фаза 4 — контролируемый rollout и настройка
 
-## Phase 4 — Controlled rollout and tuning
-
-Roll out by caller class: interactive traffic first, then photo, cron, and batch video. Tune profile limits and keepalive using observed queue and VRAM data. Keep a documented rollback path to the serialized lock-and-queue mode.
-
-Complete when VRAM races are absent under representative load, interactive work meets its wait-time target, and a rollback drill succeeds without orphaning work.
+Раскатывать по классам callers: сначала interactive traffic, затем photo, cron
+и batch video. Настраивать profile limits и keepalive по наблюдаемым данным
+очереди и VRAM. Сохранить документированный rollback к режиму serialized
+lock-and-queue.
