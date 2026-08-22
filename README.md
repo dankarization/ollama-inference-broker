@@ -37,7 +37,11 @@ Ollama, Shutterstock, M101 или MAIN-PC.
 
 - `POST /v1/jobs` принимает `{ "profile":"interactive", "kind":"chat|generate", "payload":{...} }` и возвращает сохранённое задание (`202`).
 - `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel` и `GET /v1/metrics` дают доступ к жизненному циклу и данным MAIN-PC `/api/ps`.
-- `/api/chat` и `/api/generate` сейчас возвращают `501`: совместимый streaming proxy будет добавлен после проверки контракта миграции callers.
+- `GET /healthz` проверяет только локальное состояние broker: очередь, активную lease и timestamp. Он не отправляет WOL и не обращается к MAIN-PC/Ollama.
+- `/api/chat` и `/api/generate` реализуют локальный compatibility contract:
+  обязателен server-side `profile`, а `stream=true` возвращает NDJSON admission
+  frame. Endpoint только ставит job в очередь и не dispatch-ит его; реальный
+  model output не обещается до отдельной integration/canary фазы.
 
 Сервер сам выбирает профиль, модель, контекст, лимит вывода и keepalive.
 Переданные caller значения `model`, `num_ctx`, `num_predict` и `keep_alive` не

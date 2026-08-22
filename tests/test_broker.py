@@ -1,6 +1,9 @@
 import tempfile
+import threading
 import unittest
+from urllib.request import urlopen
 
+from broker.http import serve
 from broker.service import Broker
 
 
@@ -75,5 +78,27 @@ class BrokerTests(unittest.TestCase):
     def test_metrics_include_queue_and_vram_source(self):
         b=self.make(["nemotron3:33b"]); b.submit("cron", "generate", {"prompt":"x"})
         data=b.metrics(); self.assertEqual(data["resource"], "mainpc-gpu"); self.assertEqual(data["queue_depth"], 1); self.assertEqual(data["loaded_models"][0]["size_vram"], 1)
+
+    def test_local_health_never_touches_wol_or_ollama(self):
+        b=self.make(); b.submit("cron", "generate", {"prompt":"x"})
+        data=b.health()
+        self.assertEqual(data["status"], "ready")
+        self.assertEqual(data["queue_depth"], 1)
+        self.assertIsNone(data["active_job_id"])
+        self.assertEqual(self.calls, [])
+
+    def test_healthz_http_endpoint_is_local_only(self):
+        b=self.make()
+        server=serve(b, port=0)
+        thread=threading.Thread(target=server.handle_request)
+        thread.start()
+        try:
+            with urlopen(f"http://127.0.0.1:{server.server_port}/healthz") as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(__import__("json").loads(response.read())["status"], "ready")
+        finally:
+            thread.join(timeout=1)
+            server.server_close()
+        self.assertEqual(self.calls, [])
 
 if __name__ == "__main__": unittest.main()

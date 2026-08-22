@@ -156,6 +156,21 @@ class Broker:
         return {"resource": "mainpc-gpu", "queue_depth": queued, "active": self._job(active) if active else None,
                 "loaded_models": ps.get("models", []), "timestamp": self.clock()}
 
+    def health(self) -> dict:
+        """Return a local broker probe without waking or querying MAIN-PC."""
+        with self.lock:
+            queued = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0]
+            active = self.db.execute(
+                "SELECT * FROM jobs WHERE state IN ('running','cancel_requested')"
+            ).fetchone()
+        return {
+            "status": "busy" if active else "ready",
+            "resource": "mainpc-gpu",
+            "queue_depth": queued,
+            "active_job_id": active["id"] if active else None,
+            "timestamp": self.clock(),
+        }
+
 
 class Dispatcher(threading.Thread):
     def __init__(self, broker: Broker, interval=0.25):
