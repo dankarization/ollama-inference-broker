@@ -217,22 +217,35 @@ class AnalyticsTests(unittest.TestCase):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock)
         policy = self.policy({
-            "olya": {"enabled": True, "weight": 8},
+            "olya-vision": {"enabled": True, "weight": 8},
             "shutterstock-video": {"enabled": True, "weight": 3},
         })
         for index in range(20):
-            broker.submit("olya", "generate", {"prompt": f"o-{index}"})
+            broker.submit(
+                "olya-vision-gemma",
+                "generate",
+                {
+                    "prompt": f"o-{index}",
+                    "images": ["aGVsbG8="],
+                    "format": {"type": "object"},
+                },
+                source="olya-vision",
+                external_id=f"o-{index}",
+            )
             broker.submit("shutterstock-video", "generate", {"prompt": f"v-{index}"})
         for _ in range(11):
             self.assertTrue(broker.dispatch_once(policy=policy))
         snapshot = broker.analytics(policy, windows=(3_600,))
         scheduler = snapshot["scheduler"]["windows"]["3600"]
         self.assertEqual(scheduler["selections"], 11)
-        self.assertEqual(scheduler["sources"]["olya"]["selected"], 8)
+        self.assertEqual(scheduler["sources"]["olya-vision"]["selected"], 8)
         self.assertEqual(scheduler["sources"]["shutterstock-video"]["selected"], 3)
-        self.assertAlmostEqual(scheduler["sources"]["olya"]["expected_share"], 8 / 11, places=5)
+        self.assertAlmostEqual(
+            scheduler["sources"]["olya-vision"]["expected_share"], 8 / 11, places=5
+        )
         self.assertEqual(
-            snapshot["scheduler"]["active_policy"]["sources"]["olya"]["weight"], 8.0
+            snapshot["scheduler"]["active_policy"]["sources"]["olya-vision"]["weight"],
+            8.0,
         )
 
     def test_hot_weight_reload_remains_visible_without_resetting_history(self):
