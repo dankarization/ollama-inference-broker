@@ -719,7 +719,13 @@ class Broker:
         # A no-op generation is Ollama's explicit model-load/readiness contract.
         if not self.ollama.is_ready(profile.model):
             self.ollama.run("generate", {"model": profile.model, "prompt": "", "keep_alive": f"{profile.keep_alive_seconds}s"})
-        if not self.ollama.is_ready(profile.model):
+        wait_ready = getattr(self.ollama, "wait_ready", None)
+        ready = (
+            wait_ready(profile.model, timeout_seconds=30)
+            if wait_ready is not None
+            else self.ollama.is_ready(profile.model)
+        )
+        if not ready:
             raise RuntimeError("target model did not become ready")
         payload = json.loads(row["payload"])
         options = dict(payload.get("options", {}))

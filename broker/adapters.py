@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 import urllib.request
 
 
@@ -40,6 +41,27 @@ class OllamaHTTP:
 
     def is_ready(self, model: str) -> bool:
         return any(item.get("name") == model for item in self.ps().get("models", []))
+
+    def wait_ready(
+        self,
+        model: str,
+        timeout_seconds: float = 30,
+        poll_seconds: float = 1,
+    ) -> bool:
+        """Wait for Ollama to publish a successfully loaded model in ``/api/ps``.
+
+        Ollama can return from the explicit load request just before the model
+        becomes visible to a concurrent ``/api/ps`` request.  Keep this wait
+        bounded so an unhealthy executor still fails closed.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if self.is_ready(model):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(poll_seconds, remaining))
 
     def unload(self, model: str) -> None:
         self._request("/api/generate", {"model": model, "keep_alive": 0})

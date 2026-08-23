@@ -4,6 +4,7 @@ import time
 import json
 import os
 import unittest
+from unittest.mock import patch
 from urllib.request import urlopen
 
 from broker.http import serve
@@ -52,6 +53,17 @@ class BrokerTests(unittest.TestCase):
     def test_ollama_timeout_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "must be positive"):
             OllamaHTTP(timeout_seconds=0)
+
+    def test_ollama_readiness_wait_tolerates_delayed_ps_visibility(self):
+        client = OllamaHTTP()
+        states = iter((False, False, True))
+        client.is_ready = lambda _model: next(states)
+        with (
+            patch("broker.adapters.time.monotonic", side_effect=(0.0, 0.0, 1.0)),
+            patch("broker.adapters.time.sleep") as sleep,
+        ):
+            self.assertTrue(client.wait_ready("gemma4:12b", timeout_seconds=3))
+        self.assertEqual(sleep.call_count, 2)
     def test_fixed_source_priorities_then_fifo(self):
         b=self.make(["nemotron3:33b"], clock=iter(range(1_000)).__next__)
         cron=b.submit("cron", "generate", {"prompt":"cron"})["id"]
