@@ -2,6 +2,7 @@ import tempfile
 import threading
 import time
 import json
+import os
 import unittest
 from urllib.request import urlopen
 
@@ -203,3 +204,194 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 if __name__ == "__main__": unittest.main()
+
+class SourcePolicyTests(unittest.TestCase):
+    def _policy_file(self, payload):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as handle:
+            json.dump(payload, handle)
+        return path
+
+    def test_policy_missing_file_keeps_empty_state(self):
+        from broker.service import SourcePolicy
+        policy = SourcePolicy("/nonexistent/policy.json")
+        self.assertEqual(policy.enabled_sources(), frozenset())
+        self.assertIsNone(policy.weight("shutterstock-video"))
+
+    def test_policy_loads_weights_and_enablement(self):
+        from broker.service import SourcePolicy
+        path = self._policy_file({
+            "version": 1,
+            "sources": {
+                "shutterstock-video": {"enabled": True, "weight": 2.0},
+                "pilot-mainpc": {"enabled": True, "weight": 3.0},
+                "cron": {"enabled": False, "weight": 1.0},
+            },
+        })
+        policy = SourcePolicy(path)
+        self.assertEqual(
+            policy.enabled_sources(), frozenset({"shutterstock-video", "pilot-mainpc"})
+        )
+        self.assertEqual(policy.weight("shutterstock-video"), 2.0)
+        self.assertEqual(policy.weight("cron"), 1.0)
+        snapshot = policy.snapshot()
+        self.assertEqual(snapshot["sources"]["pilot-mainpc"]["weight"], 3.0)
+        self.assertIn("path", snapshot)
+
+    def test_policy_atomic_reload_picks_up_weights_without_restart(self):
+        from broker.service import SourcePolicy
+        payload = {"version": 1, "sources": {"a": {"enabled": True, "weight": 1.0}, "b": {"enabled": True, "weight": 1.0}}}
+        path = self._policy_file(payload)
+        policy = SourcePolicy(path)
+        self.assertEqual(policy.enabled_sources(), frozenset({"a", "b"}))
+        # Simulate an atomic replace with changed weights.
+        new_path = path + ".tmp"
+        with open(new_path, "w") as handle:
+            json.dump({"version": 1, "sources": {"a": {"enabled": True, "weight": 1.0}, "b": {"enabled": False, "weight": 1.0}}}, handle)
+        os.replace(new_path, path)
+        self.assertEqual(policy.enabled_sources(), frozenset({"a"}))
+
+    def test_policy_invalid_file_is_ignored_fail_closed(self):
+        from broker.service import SourcePolicy
+        path = self._policy_file({"version": 1, "sources": {"a": {"enabled": True, "weight": 1.0}}})
+        policy = SourcePolicy(path)
+        self.assertEqual(policy.enabled_sources(), frozenset({"a"}))
+        with open(path, "w") as handle:
+            handle.write("{not valid json")
+        # mtime may not change; force reload by touching then writing.
+        os.utime(path, None)
+        self.assertEqual(policy.enabled_sources(), frozenset({"a"}))  # keeps previous
+
+    def test_invalid_source_weight_raises(self):
+        from broker.service import SourcePolicy, SourcePolicyError
+        path = self._policy_file({"version": 1, "sources": {"a": {"enabled": True, "weight": 0}}})
+        policy = SourcePolicy(path)
+        with self.assertRaises(SourcePolicyError):
+            policy.enabled_sources()
+
+class WeightedDispatchTests(unittest.TestCase):
+    def make(self, loaded=None):
+        self.calls=[]; self.tmp=tempfile.NamedTemporaryFile(); self.ol=FakeOllama(self.calls, loaded)
+        return Broker(self.tmp.name, self.ol, FakeWol(self.calls), clock=__import__("time").time)
+
+    def test_weighted_dispatch_rotates_between_sources(self):
+        from broker.service import SourcePolicy
+        b = self.make(["nemotron3:33b"])
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"version": 1, "sources": {
+                "interactive": {"enabled": True, "weight": 1.0},
+                "shutterstock-video": {"enabled": True, "weight": 1.0},
+            }}, handle)
+        policy = SourcePolicy(path)
+        ids = {
+            "interactive": b.submit("interactive", "generate", {"prompt": "i"})["id"],
+            "shutterstock-video": b.submit("shutterstock-video", "generate", {"prompt": "v"})["id"],
+        }
+        done = []
+        for _ in range(2):
+            self.assertTrue(b.dispatch_once(None, policy))
+        # With equal weights both complete; order may rotate but both must run.
+        self.assertEqual(b.status(ids["interactive"])["state"], "completed")
+        self.assertEqual(b.status(ids["shutterstock-video"])["state"], "completed")
+
+    def test_weighted_dispatch_respects_disabled_source(self):
+        from broker.service import SourcePolicy
+        b = self.make(["nemotron3:33b"])
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"version": 1, "sources": {
+                "interactive": {"enabled": True, "weight": 1.0},
+                "shutterstock-video": {"enabled": False, "weight": 1.0},
+            }}, handle)
+        policy = SourcePolicy(path)
+        interactive_id = b.submit("interactive", "generate", {"prompt": "i"})["id"]
+        video_id = b.submit("shutterstock-video", "generate", {"prompt": "v"})["id"]
+        self.assertTrue(b.dispatch_once(None, policy))
+        self.assertEqual(b.status(interactive_id)["state"], "completed")
+        self.assertEqual(b.status(video_id)["state"], "queued")
+
+    def test_dispatch_without_policy_uses_strict_priority(self):
+        b = self.make(["nemotron3:33b"])
+        video_id = b.submit("shutterstock-video", "generate", {"prompt": "v"})["id"]
+        interactive_id = b.submit("interactive", "generate", {"prompt": "i"})["id"]
+        b.dispatch_once()
+        # interactive has priority 1 and must win over video priority 5.
+        self.assertEqual(b.status(interactive_id)["state"], "completed")
+        self.assertEqual(b.status(video_id)["state"], "queued")
+
+class VideoEndpointTests(unittest.TestCase):
+    def make(self, loaded=None):
+        self.calls=[]; self.tmp=tempfile.NamedTemporaryFile(); self.ol=FakeOllama(self.calls, loaded)
+        return Broker(self.tmp.name, self.ol, FakeWol(self.calls), clock=__import__("time").time)
+
+    def test_video_payload_is_bounded_and_dispatches_to_nemotron(self):
+        b = self.make(["nemotron3:33b"])
+        job = b.submit("shutterstock-video", "generate", {
+            "prompt": "classify frames",
+            "images": ["aGVsbG8=", "d29ybGQ="],
+            "format": {"type": "object"},
+        })
+        self.assertEqual(job["source"], "shutterstock-video")
+        self.assertEqual(job["priority"], 5)
+        b.dispatch_once()
+        self.assertEqual(b.status(job["id"])["state"], "completed")
+        request = [x[2] for x in self.calls if isinstance(x, tuple) and x[0] == "run" and "classify" in x[2].get("prompt", "")]
+        self.assertTrue(request)
+        self.assertEqual(request[0]["model"], "nemotron3:33b")
+
+    def test_video_payload_rejects_too_many_frames(self):
+        b = self.make(["nemotron3:33b"])
+        with self.assertRaisesRegex(ValueError, "images"):
+            b.submit("shutterstock-video", "generate", {
+                "prompt": "classify", "images": ["aGVsbG8="] * 13, "format": {"type": "object"},
+            })
+
+    def test_video_endpoint_returns_broker_meta(self):
+        from broker.http import serve
+        b = self.make(["nemotron3:33b"])
+        server = serve(b, port=0)
+        response = {}
+        def client():
+            request = __import__("urllib.request", fromlist=["Request"]).Request(
+                f"http://127.0.0.1:{server.server_port}/v1/shutterstock-video/generate",
+                data=json.dumps({
+                    "model": "nemotron3:33b", "prompt": "classify",
+                    "images": ["aGVsbG8="], "format": {"type": "object"},
+                }).encode(), headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urlopen(request) as result:
+                response["status"] = result.status
+                response["body"] = json.loads(result.read())
+        worker = threading.Thread(target=server.handle_request)
+        caller = threading.Thread(target=client)
+        worker.start(); caller.start()
+        deadline = time.monotonic() + 1
+        while b.health()["queue_depth"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        b.dispatch_once(frozenset({"shutterstock-video"}))
+        caller.join(timeout=1); worker.join(timeout=1); server.server_close()
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["body"]["done"], True)
+        self.assertEqual(response["body"]["broker"]["state"], "completed")
+        self.assertIsInstance(response["body"]["broker"]["job_id"], str)
+
+    def test_sources_endpoint_reports_policy(self):
+        from broker.http import serve
+        from broker.service import SourcePolicy
+        b = self.make(["nemotron3:33b"])
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"version": 1, "sources": {"shutterstock-video": {"enabled": True, "weight": 1.0}}}, handle)
+        policy = SourcePolicy(path)
+        server = serve(b, port=0, policy=policy)
+        thread = threading.Thread(target=server.handle_request)
+        thread.start()
+        try:
+            with urlopen(f"http://127.0.0.1:{server.server_port}/v1/sources") as response:
+                self.assertEqual(response.status, 200)
+                body = json.loads(response.read())
+                self.assertEqual(body["policy"]["sources"]["shutterstock-video"]["weight"], 1.0)
+        finally:
+            thread.join(timeout=1)
+            server.server_close()

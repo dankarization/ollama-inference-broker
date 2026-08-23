@@ -114,6 +114,37 @@ server-side timeout 300 секунд. `shutterstock-video` — отдельны�
 durable `queued`. Это позволяет включить обратимый pilot без миграции либо
 активации других callers.
 
+### Runtime source policy (веса без рестарта)
+
+Вместо статичного env-allowlist можно включить weighted scheduler через
+`BROKER_SOURCES_POLICY=<path.json>`. Файл читается на каждом dispatch-шаге и
+перечитывается при изменении mtime (атомарная замена temp+rename), поэтому
+добавление/удаление источников и изменение весов не требуют остановки
+сервиса или drain очереди; queued/in-flight jobs остаются durable.
+
+```json
+{
+  "version": 1,
+  "sources": {
+    "shutterstock-video": {"enabled": true, "weight": 2.0},
+    "pilot-mainpc":      {"enabled": true, "weight": 1.0}
+  }
+}
+```
+
+Выбор при наличии policy: источники делят GPU пропорционально весам (weighted
+round-robin с вращающимся аккумулятором); внутри каждого источника сохраняется
+строгий порядок priority/FIFO, per-source concurrency и min-interval
+backpressure. Итоговый allowlist берётся из `enabled`-записей файла, а не из
+env. `GET /v1/sources` отдаёт текущий снапшот политики (без секретов). При
+отсутствии policy поведение прежнее: env-allowlist + strict priority.
+
+`POST /v1/shutterstock-video/generate` — синхронный bounded контракт локального
+видео-чанка (profile `shutterstock-video`, `nemotron3:33b`): принимает `prompt`,
+base64 `images` (до 12 кадров, 32 MiB) и JSON Schema в `format` (до 32 KiB),
+возвращает результат Ollama плюс `broker.job_id`. Dispatch источника включается
+только через policy/allowlist; без этого job остаётся durable `queued`.
+
 ## Проверка и разработка
 
 Безопасная canary-проверка использует mock или staging задания `interactive`,

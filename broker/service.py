@@ -7,8 +7,94 @@ import time
 import uuid
 from pathlib import Path
 
-from .compat import CompatibilityError, validate_shutterstock_canary_payload
+from .compat import (CompatibilityError, validate_shutterstock_canary_payload,
+                     validate_shutterstock_video_payload)
 from .profiles import FIXED_SOURCE_PRIORITIES, MAX_PRIORITY, MIN_PRIORITY, PROFILES
+
+
+class SourcePolicyError(ValueError):
+    pass
+
+
+class SourcePolicy:
+    """Runtime-reloadable per-source weights and enablement.
+
+    The policy file is a JSON document replaced atomically (write temp +
+    rename).  The broker re-reads it on every dispatch attempt and only when
+    its mtime changes, so adding/removing sources or changing weights never
+    requires a restart or a queue drain.  A missing or invalid file keeps the
+    previously loaded policy (fail closed), so a bad write cannot disable the
+    whole broker silently.
+
+    Shape::
+
+        {
+          "version": 1,
+          "sources": {
+            "shutterstock-video": {"enabled": true, "weight": 1.0},
+            "pilot-mainpc":      {"enabled": true, "weight": 3.0}
+          }
+        }
+    """
+
+    def __init__(self, path: str | Path, clock=time.time) -> None:
+        self.path = Path(path)
+        self.clock = clock
+        self._mtime_ns: int | None = None
+        self._sources: dict[str, dict[str, Any]] = {}
+
+    def _load_locked(self) -> None:
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return  # keep previous policy; file not created yet
+        if stat.st_mtime_ns == self._mtime_ns:
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return  # atomic replace means this is only a transient partial read
+        sources = raw.get("sources")
+        if not isinstance(raw, dict) or not isinstance(sources, dict):
+            raise SourcePolicyError("policy must contain an object 'sources'")
+        normalized: dict[str, dict[str, Any]] = {}
+        for name, entry in sources.items():
+            if not isinstance(name, str) or not name:
+                raise SourcePolicyError("source names must be non-empty strings")
+            if not isinstance(entry, dict):
+                raise SourcePolicyError(f"source {name!r} must be an object")
+            enabled = entry.get("enabled", True)
+            weight = entry.get("weight", 1.0)
+            if not isinstance(enabled, bool):
+                raise SourcePolicyError(f"source {name!r} enabled must be a boolean")
+            if (
+                isinstance(weight, bool)
+                or not isinstance(weight, (int, float))
+                or weight <= 0
+            ):
+                raise SourcePolicyError(f"source {name!r} weight must be a positive number")
+            normalized[name] = {"enabled": enabled, "weight": float(weight)}
+        self._sources = normalized
+        self._mtime_ns = stat.st_mtime_ns
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return the current effective policy for observability (no secrets)."""
+        self._load_locked()
+        return {
+            "path": str(self.path),
+            "sources": {name: dict(entry) for name, entry in self._sources.items()},
+        }
+
+    def enabled_sources(self) -> frozenset[str]:
+        self._load_locked()
+        return frozenset(
+            name for name, entry in self._sources.items() if entry["enabled"]
+        )
+
+    def weight(self, source: str) -> float | None:
+        self._load_locked()
+        entry = self._sources.get(source)
+        return entry["weight"] if entry else None
 
 
 class Broker:
@@ -65,6 +151,13 @@ class Broker:
                 payload = validate_shutterstock_canary_payload(payload)
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
+        if profile == "shutterstock-video":
+            if source != profile:
+                raise ValueError("shutterstock-video must use its dedicated source")
+            try:
+                payload = validate_shutterstock_video_payload(payload)
+            except CompatibilityError as exc:
+                raise ValueError(str(exc)) from exc
         resolved_priority = self._resolve_priority(source, priority)
         job_id, now = str(uuid.uuid4()), self.clock()
         with self.lock, self.db:
@@ -118,11 +211,16 @@ class Broker:
             self.completed.notify_all()
         return self.status(job_id)
 
-    def _next(self, allowed_sources: frozenset[str] | None = None):
-        # Strict priority is deliberate: no aging can promote lower-priority
-        # work ahead of a waiting higher-priority job.
+    def _candidates(self, allowed_sources: frozenset[str] | None = None):
+        """Queued rows eligible now, ordered by strict priority then FIFO.
+
+        Per-source concurrency and min-interval backpressure are applied here
+        exactly as before; this method returns the full ordered candidate list
+        so a weighted policy can pick a source fairly instead of always taking
+        the highest-priority row.
+        """
         if allowed_sources is not None and not allowed_sources:
-            return None
+            return []
         query = "SELECT * FROM jobs WHERE state='queued'"
         values: tuple = ()
         if allowed_sources is not None:
@@ -131,6 +229,7 @@ class Broker:
             values = tuple(sorted(allowed_sources))
         query += " ORDER BY priority, created, id"
         now = self.clock()
+        candidates = []
         for row in self.db.execute(query, values):
             profile = PROFILES[row["profile"]]
             running = self.db.execute(
@@ -141,14 +240,55 @@ class Broker:
                 "SELECT next_allowed FROM source_schedules WHERE source=?", (row["source"],)
             ).fetchone()
             if running < profile.max_concurrency and (scheduled is None or scheduled[0] <= now):
-                return row
-        return None
+                candidates.append(row)
+        return candidates
 
-    def dispatch_once(self, allowed_sources: frozenset[str] | None = None) -> bool:
+    def _weighted_pick(self, candidates, policy: SourcePolicy):
+        """Pick a candidate by weighted round-robin across sources.
+
+        Weights are relative shares of dispatch opportunities per source; the
+        first candidate of each source is ordered internally by strict
+        priority then FIFO.  A deterministic rotating accumulator keeps the
+        schedule fair and stable across policy reloads.  When the policy has
+        no entry for a source, the source keeps the default weight of 1.
+        """
+        by_source: dict[str, list] = {}
+        for row in candidates:
+            by_source.setdefault(row["source"], []).append(row)
+        if not by_source:
+            return None
+        accumulator = getattr(self, "_weight_accumulator", None)
+        if accumulator is None:
+            accumulator = self._weight_accumulator = {}
+        total_weight = 0.0
+        for source in by_source:
+            weight = policy.weight(source)
+            if weight is None:
+                weight = 1.0
+            total_weight += weight
+            accumulator[source] = accumulator.get(source, 0.0) + weight
+        chosen_source = max(accumulator, key=lambda source: accumulator[source])
+        accumulator[chosen_source] -= total_weight
+        return by_source[chosen_source][0]
+
+    def _next(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None):
+        # Strict priority is deliberate when no weighted policy is installed:
+        # no aging can promote lower-priority work ahead of a waiting
+        # higher-priority job.  With a policy, sources share the GPU by their
+        # configured weights instead (fairness), preserving per-source
+        # priority/FIFO order inside each source.
+        candidates = self._candidates(allowed_sources)
+        if not candidates:
+            return None
+        if policy is None:
+            return candidates[0]
+        return self._weighted_pick(candidates, policy)
+
+    def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None) -> bool:
         with self.lock, self.db:
             if self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested')").fetchone():
                 return False
-            row = self._next(allowed_sources)
+            row = self._next(allowed_sources, policy)
             if not row: return False
             now = self.clock()
             self.db.execute("UPDATE jobs SET state='running',started=?,lease_until=? WHERE id=?", (now, now+self.lease_seconds, row["id"]))
@@ -240,15 +380,27 @@ class Broker:
 
 class Dispatcher(threading.Thread):
     def __init__(
-        self, broker: Broker, interval=0.25, allowed_sources: frozenset[str] | None = None
+        self, broker: Broker, interval=0.25,
+        allowed_sources: frozenset[str] | None = None,
+        policy: SourcePolicy | None = None,
     ):
         super().__init__(daemon=True)
-        self.broker, self.interval, self.allowed_sources, self.stop_event = (
+        self.broker, self.interval, self.allowed_sources, self.policy, self.stop_event = (
             broker,
             interval,
             allowed_sources,
+            policy,
             threading.Event(),
         )
     def run(self):
         while not self.stop_event.is_set():
-            self.broker.dispatch_once(self.allowed_sources); self.stop_event.wait(self.interval)
+            # With a runtime policy, the effective allowlist and weights come
+            # from the reloaded policy file; without one, the env allowlist is
+            # used with strict priority (previous behaviour).
+            policy = self.policy
+            allowed = self.allowed_sources
+            if policy is not None:
+                enabled = policy.enabled_sources()
+                allowed = enabled if enabled else frozenset()
+            self.broker.dispatch_once(allowed, policy)
+            self.stop_event.wait(self.interval)

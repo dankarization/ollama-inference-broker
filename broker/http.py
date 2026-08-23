@@ -3,10 +3,10 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .compat import (CompatibilityError, stream_frames, submit as submit_compatibility,
-                     submit_shutterstock_canary)
+                     submit_shutterstock_canary, submit_shutterstock_video)
 from .profiles import PROFILES
 
-def serve(broker, host="127.0.0.1", port=8088):
+def serve(broker, host="127.0.0.1", port=8088, policy=None):
     class Handler(BaseHTTPRequestHandler):
         def _json(self, status, value):
             encoded=json.dumps(value).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
@@ -43,10 +43,32 @@ def serve(broker, host="127.0.0.1", port=8088):
                     else:
                         self._json(504, {"error": "broker job timed out", "job_id": job["id"]})
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
+            elif self.path == "/v1/shutterstock-video/generate":
+                try:
+                    job = submit_shutterstock_video(broker, body)
+                    result = broker.wait_for_terminal(
+                        job["id"], PROFILES["shutterstock-video"].request_timeout_seconds + 5,
+                    )
+                    if result is None:
+                        self._json(500, {"error": "submitted job disappeared"})
+                    elif result["state"] == "completed":
+                        response = dict(result["result"])
+                        response["broker"] = {"job_id": job["id"], "state": result["state"]}
+                        self._json(200, response)
+                    elif result["state"] == "failed":
+                        self._json(502, {"error": "broker job failed", "job_id": job["id"]})
+                    else:
+                        self._json(504, {"error": "broker job timed out", "job_id": job["id"]})
+                except CompatibilityError as e: self._json(400, {"error":str(e)})
             else: self._json(404, {"error":"not found"})
         def do_GET(self):
             if self.path == "/healthz": self._json(200, broker.health())
             elif self.path == "/v1/metrics": self._json(200, broker.metrics())
+            elif self.path == "/v1/sources":
+                if policy is None:
+                    self._json(200, {"policy": None})
+                else:
+                    self._json(200, {"policy": policy.snapshot()})
             elif self.path.startswith("/v1/jobs/"):
                 result=broker.status(self.path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
             else: self._json(404, {"error":"not found"})

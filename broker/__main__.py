@@ -1,7 +1,7 @@
 import os
 from .adapters import OllamaHTTP, WakeOnLan
 from .http import serve
-from .service import Broker, Dispatcher
+from .service import Broker, Dispatcher, SourcePolicy
 
 
 def dispatch_enabled(value: str | None) -> bool:
@@ -26,6 +26,14 @@ def dispatch_sources(value: str | None) -> frozenset[str]:
     return sources
 
 
+def policy_path(value: str | None) -> str | None:
+    """Return the runtime source-policy path, or None when unset/empty."""
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
 def main() -> None:
     broker = Broker(
         os.environ.get("BROKER_DB", "broker.sqlite3"),
@@ -35,12 +43,22 @@ def main() -> None:
         ),
         WakeOnLan(os.environ["MAINPC_MAC"]),
     )
+    policy = None
+    configured_policy = policy_path(os.environ.get("BROKER_SOURCES_POLICY"))
+    if configured_policy is not None:
+        policy = SourcePolicy(configured_policy)
     if dispatch_enabled(os.environ.get("BROKER_DISPATCH_ENABLED")):
+        allowed_sources = None
+        if policy is None:
+            # Strict-priority mode: env allowlist is required and immutable
+            # until a restart (previous behaviour).
+            allowed_sources = dispatch_sources(os.environ.get("BROKER_DISPATCH_SOURCES"))
         Dispatcher(
             broker,
-            allowed_sources=dispatch_sources(os.environ.get("BROKER_DISPATCH_SOURCES")),
+            allowed_sources=allowed_sources,
+            policy=policy,
         ).start()
-    serve(broker, os.environ.get("BROKER_BIND", "127.0.0.1"), int(os.environ.get("BROKER_PORT", "8088"))).serve_forever()
+    serve(broker, os.environ.get("BROKER_BIND", "127.0.0.1"), int(os.environ.get("BROKER_PORT", "8088")), policy=policy).serve_forever()
 
 
 if __name__ == "__main__":

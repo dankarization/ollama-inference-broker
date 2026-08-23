@@ -23,7 +23,12 @@ PROFILES = {
     "cron": Profile("cron", "nemotron3:33b", 8_192, 1_024, 120),
     # Shutterstock photos stay on cloud/OmniRoute and deliberately have no
     # broker profile. Only the local video workload may acquire MAIN-PC.
-    "shutterstock-video": Profile("shutterstock-video", "nemotron3:33b", 16_384, 1_024, 120),
+    # The video lane is multimodal: one chunk arrives as base64 frames plus a
+    # JSON Schema contract, so the profile admits bounded media input.
+    "shutterstock-video": Profile(
+        "shutterstock-video", "nemotron3:33b", 16_384, 1_024, 120,
+        max_images=12, max_schema_bytes=32_768,
+    ),
     # `olya` is intentionally only a source/profile key. Do not infer an
     # integration from this name; its model can be changed in broker config.
     "olya": Profile("olya", "nemotron3:33b", 8_192, 1_024, 120),
