@@ -2,7 +2,9 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .compat import CompatibilityError, stream_frames, submit as submit_compatibility
+from .compat import (CompatibilityError, stream_frames, submit as submit_compatibility,
+                     submit_shutterstock_canary)
+from .profiles import PROFILES
 
 def serve(broker, host="127.0.0.1", port=8088):
     class Handler(BaseHTTPRequestHandler):
@@ -23,6 +25,23 @@ def serve(broker, host="127.0.0.1", port=8088):
                     job=submit_compatibility(broker, self.path.rsplit("/", 1)[-1], body)
                     if body.get("stream", True): self._stream(202, stream_frames(job))
                     else: self._json(202, job)
+                except CompatibilityError as e: self._json(400, {"error":str(e)})
+            elif self.path == "/v1/shutterstock-canary/generate":
+                try:
+                    job = submit_shutterstock_canary(broker, body)
+                    result = broker.wait_for_terminal(
+                        job["id"], PROFILES["shutterstock-canary"].request_timeout_seconds + 5,
+                    )
+                    if result is None:
+                        self._json(500, {"error": "submitted job disappeared"})
+                    elif result["state"] == "completed":
+                        response = dict(result["result"])
+                        response["broker"] = {"job_id": job["id"], "state": result["state"]}
+                        self._json(200, response)
+                    elif result["state"] == "failed":
+                        self._json(502, {"error": "broker job failed", "job_id": job["id"]})
+                    else:
+                        self._json(504, {"error": "broker job timed out", "job_id": job["id"]})
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
             else: self._json(404, {"error":"not found"})
         def do_GET(self):

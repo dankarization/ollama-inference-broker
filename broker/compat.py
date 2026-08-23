@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import binascii
 from typing import Any
 
 from .profiles import PROFILES
@@ -41,6 +43,53 @@ def submit(broker: Any, kind: str, request: Any) -> dict[str, Any]:
         return broker.submit(profile, kind, payload, source, priority)
     except ValueError as exc:
         raise CompatibilityError(str(exc)) from exc
+
+
+def submit_shutterstock_canary(broker: Any, request: Any) -> dict[str, Any]:
+    """Admit the active photo-worker's VLM shape under a distinct canary source."""
+    payload = validate_shutterstock_canary_payload(request)
+    try:
+        return broker.submit("shutterstock-canary", "generate", payload, source="shutterstock-canary")
+    except ValueError as exc:
+        raise CompatibilityError(str(exc)) from exc
+
+
+def validate_shutterstock_canary_payload(request: Any) -> dict[str, Any]:
+    """Normalize the one bounded VLM payload that may use the canary profile."""
+    if not isinstance(request, dict):
+        raise CompatibilityError("request must be a JSON object")
+    profile = PROFILES["shutterstock-canary"]
+    if "model" in request and request["model"] != profile.model:
+        raise CompatibilityError("caller model must match the canary profile")
+    prompt = request.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 12_000:
+        raise CompatibilityError("prompt must be a non-empty string up to 12000 characters")
+    images = request.get("images")
+    if not isinstance(images, list) or not 1 <= len(images) <= profile.max_images:
+        raise CompatibilityError(f"images must contain 1 to {profile.max_images} base64 images")
+    total_bytes = 0
+    for image in images:
+        if not isinstance(image, str):
+            raise CompatibilityError("images must be base64 strings")
+        try:
+            total_bytes += len(base64.b64decode(image, validate=True))
+        except (ValueError, UnicodeEncodeError, binascii.Error):
+            raise CompatibilityError("images must be valid base64") from None
+    if total_bytes > 8 * 1024 * 1024:
+        raise CompatibilityError("decoded images exceed the 8 MiB canary limit")
+    schema = request.get("format")
+    if not isinstance(schema, dict):
+        raise CompatibilityError("format must be a JSON Schema object")
+    try:
+        schema_bytes = len(json.dumps(schema, separators=(",", ":")).encode())
+    except (TypeError, ValueError):
+        raise CompatibilityError("format must be JSON serializable") from None
+    if schema_bytes > profile.max_schema_bytes:
+        raise CompatibilityError("format exceeds the canary schema limit")
+    return {
+        "prompt": prompt, "images": images, "format": schema,
+        "think": "max", "options": {"temperature": 0, "seed": 42},
+    }
 
 
 def stream_frames(job: dict[str, Any]) -> list[bytes]:

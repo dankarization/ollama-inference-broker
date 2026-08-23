@@ -28,11 +28,11 @@ class OllamaHTTP:
             raise ValueError("Ollama timeout must be positive")
         self.timeout_seconds = timeout_seconds
 
-    def _request(self, path: str, body: dict | None = None):
+    def _request(self, path: str, body: dict | None = None, timeout_seconds: float | None = None):
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(self.base_url + path, data=data,
             headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+        with urllib.request.urlopen(request, timeout=timeout_seconds or self.timeout_seconds) as response:
             return json.loads(response.read() or b"{}")
 
     def ps(self) -> dict:
@@ -45,4 +45,8 @@ class OllamaHTTP:
         self._request("/api/generate", {"model": model, "keep_alive": 0})
 
     def run(self, kind: str, request: dict) -> dict:
-        return self._request("/api/" + kind, request)
+        # This private field is set by the broker from a server-owned profile;
+        # it is never sent to Ollama or accepted from the public API.
+        payload = dict(request)
+        timeout_seconds = payload.pop("_broker_timeout_seconds", None)
+        return self._request("/api/" + kind, payload, timeout_seconds)

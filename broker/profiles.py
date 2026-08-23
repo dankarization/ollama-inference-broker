@@ -8,6 +8,12 @@ class Profile:
     max_context: int
     max_output: int
     keep_alive_seconds: int
+    # These are admission/dispatch limits, not caller-controlled Ollama options.
+    max_concurrency: int = 1
+    min_interval_seconds: int = 0
+    request_timeout_seconds: int = 300
+    max_images: int = 0
+    max_schema_bytes: int = 0
 
 
 # This is deliberately server-owned. Callers can select a profile, never a model
@@ -22,6 +28,13 @@ PROFILES = {
     # integration from this name; its model can be changed in broker config.
     "olya": Profile("olya", "nemotron3:33b", 8_192, 1_024, 120),
     "batch-video": Profile("batch-video", "nemotron3:33b", 8_192, 512, 120),
+    # This is an intentionally separate source from the active Shutterstock
+    # worker.  It is the only VLM/media contract eligible for a future canary.
+    "shutterstock-canary": Profile(
+        "shutterstock-canary", "qwen3-vl:30b", 16_384, 512, 60,
+        max_concurrency=1, min_interval_seconds=60, request_timeout_seconds=300,
+        max_images=4, max_schema_bytes=16_384,
+    ),
 }
 
 # Lower is more important. These classes are policy compiled into the broker,
@@ -31,6 +44,7 @@ FIXED_SOURCE_PRIORITIES = {
     "cron": 2,         # OpenClaw cron
     "shutterstock-video": 5,
     "olya": 8,
+    "shutterstock-canary": 5,
 }
 MIN_PRIORITY = 1
 MAX_PRIORITY = 10

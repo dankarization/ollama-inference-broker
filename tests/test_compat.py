@@ -4,7 +4,7 @@ import threading
 import unittest
 from urllib.request import Request, urlopen
 
-from broker.compat import CompatibilityError, stream_frames, submit
+from broker.compat import CompatibilityError, stream_frames, submit, submit_shutterstock_canary
 from broker.http import serve
 from broker.service import Broker
 
@@ -35,6 +35,20 @@ class CompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(CompatibilityError, "server-side profile"): submit(broker, "generate", {"profile": "shutterstock", "prompt": "photo"})
         with self.assertRaisesRegex(CompatibilityError, "caller model"): submit(broker, "generate", {"profile": "cron", "model": "evil", "prompt": "x"})
         with self.assertRaisesRegex(CompatibilityError, "messages"): submit(broker, "chat", {"profile": "interactive", "messages": []})
+
+    def test_shutterstock_canary_accepts_media_shape_but_rejects_unbounded_input(self):
+        broker = self.make()
+        job = submit_shutterstock_canary(broker, {
+            "model": "qwen3-vl:30b", "prompt": "classify", "images": ["aGVsbG8="],
+            "format": {"type": "object"}, "options": {"num_ctx": 999999},
+        })
+        self.assertEqual(job["profile"], "shutterstock-canary")
+        self.assertEqual(job["source"], "shutterstock-canary")
+        self.assertEqual(job["payload"]["options"], {"temperature": 0, "seed": 42})
+        with self.assertRaisesRegex(CompatibilityError, "base64"):
+            submit_shutterstock_canary(broker, {"prompt": "x", "images": ["not base64!"], "format": {}})
+        with self.assertRaisesRegex(CompatibilityError, "JSON Schema"):
+            submit_shutterstock_canary(broker, {"prompt": "x", "images": ["aGVsbG8="], "format": "json"})
 
     def test_admission_uses_strict_broker_priority_order(self):
         broker = self.make()

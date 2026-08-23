@@ -63,6 +63,11 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
   обязателен server-side `profile`, а `stream=true` возвращает NDJSON admission
   frame. Endpoint только ставит job в очередь и не dispatch-ит его; реальный
   model output не обещается до отдельной integration/canary фазы.
+- `POST /v1/shutterstock-canary/generate` — отдельный синхронный VLM contract
+  для canary: принимает совместимые с Ollama `prompt`, base64 `images` и JSON
+  Schema в `format`, а после terminal completion возвращает исходный JSON-ответ
+  Ollama плюс `broker.job_id` для наблюдения job lifecycle. Он не запускает dispatcher сам: без отдельного allowlist job остаётся
+  durable `queued`, а HTTP-запрос завершится timeout.
 
 Сервер сам выбирает профиль, модель, контекст, лимит вывода и keepalive.
 Переданные caller значения `model`, `num_ctx`, `num_predict` и `keep_alive` не
@@ -78,11 +83,15 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
 | Интерактивная сессия OpenClaw (`interactive`) | 1 |
 | OpenClaw cron (`cron`) | 2 |
 | Локальное Shutterstock video (`shutterstock-video`) | 5 |
+| Изолированный VLM canary (`shutterstock-canary`) | 5 |
 | Olya (`olya`) | 8 |
 
-Shutterstock photo остаётся cloud workload через OmniRoute и не имеет профиля
-broker: оно не ставит задание в эту очередь, не отправляет WOL и не занимает
-GPU MAIN-PC. `shutterstock-video` — отдельный локальный workload на
+Рабочий source `shutterstock` намеренно не имеет broker profile и не может
+получить lease. Новый `shutterstock-canary` — отдельное имя source, а не
+переименование или включение рабочего Shutterstock. Он использует
+`qwen3-vl:30b` с максимум четырьмя изображениями, суммарно 8 MiB decoded,
+JSON Schema до 16 KiB, concurrency `1`, не чаще одного job в 60 секунд и
+server-side timeout 300 секунд. `shutterstock-video` — отдельный локальный workload на
 `nemotron3:33b`; только он получает приоритет 5. Ключ `olya` — только имя
 источника, а не интеграция. Эти четыре значения
 принадлежат broker: caller может не передавать `priority` либо повторить
@@ -113,6 +122,18 @@ durable `queued`. Это позволяет включить обратимый 
 сменой модели, восстановление просроченной lease и отмену queued задания.
 Ни один live caller не мигрируется до успешной проверки; откат — остановить
 broker без изменения routes.
+
+### Planned VLM canary rollout (not executed by this change)
+
+Перед единственным реальным запросом оператор должен убедиться, что
+`qwen3-vl:30b` установлен на MAIN-PC, временно добавить **только**
+`shutterstock-canary` в `BROKER_DISPATCH_SOURCES`, перезапустить user-service
+и отправить один bounded image+schema request на endpoint выше. Проверяются
+`queued → running → completed`, сохранённый `result` по `GET /v1/jobs/{id}` и
+состояние после service restart. Откат: удалить `shutterstock-canary` из
+allowlist (либо выключить dispatch), выполнить `daemon-reload` и restart
+service; source `shutterstock` при этом не добавляется никогда. Это изменение
+не выполняет ни один из этих шагов.
 
 Перед live canary оператор обязан проверить, что на MAIN-PC уже установлены
 все модели server-side local-GPU profiles. Для `shutterstock-video` нужна

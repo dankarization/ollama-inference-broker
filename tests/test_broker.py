@@ -1,5 +1,7 @@
 import tempfile
 import threading
+import time
+import json
 import unittest
 from urllib.request import urlopen
 
@@ -71,6 +73,17 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(video["profile"], "shutterstock-video")
         with self.assertRaisesRegex(ValueError, "unknown profile"):
             b.submit("shutterstock", "generate", {"prompt":"photo"})
+        canary = b.submit("shutterstock-canary", "generate", {
+            "prompt": "photo", "images": ["aGVsbG8="], "format": {"type": "object"},
+        })
+        self.assertEqual(canary["priority"], 5)
+        self.assertEqual(canary["source"], "shutterstock-canary")
+        with self.assertRaisesRegex(ValueError, "images"):
+            b.submit("shutterstock-canary", "generate", {"prompt": "unbounded"})
+        with self.assertRaisesRegex(ValueError, "dedicated source"):
+            b.submit("shutterstock-canary", "generate", {
+                "prompt": "photo", "images": ["aGVsbG8="], "format": {},
+            }, source="shutterstock")
         self.assertEqual(b.submit("olya", "generate", {"prompt":"x"})["priority"], 8)
         with self.assertRaisesRegex(ValueError, "fixed priority 1"):
             b.submit("interactive", "generate", {"prompt":"x"}, priority=10)
@@ -90,6 +103,50 @@ class BrokerTests(unittest.TestCase):
         self.assertTrue(b.dispatch_once(frozenset({"pilot-mainpc"})))
         self.assertEqual(b.status(pilot)["state"], "completed")
         self.assertEqual(b.status(blocked)["state"], "queued")
+
+    def test_canary_rate_limit_and_persisted_result(self):
+        now = [1_000]
+        b = self.make(["qwen3-vl:30b"], clock=lambda: now[0])
+        media = {"images": ["aGVsbG8="], "format": {"type": "object"}}
+        first = b.submit("shutterstock-canary", "generate", {"prompt": "one", **media})["id"]
+        now[0] += 1
+        second = b.submit("shutterstock-canary", "generate", {"prompt": "two", **media})["id"]
+        self.assertTrue(b.dispatch_once(frozenset({"shutterstock-canary"})))
+        self.assertEqual(b.status(first)["result"], {"done": True})
+        self.assertFalse(b.dispatch_once(frozenset({"shutterstock-canary"})))
+        self.assertEqual(b.status(second)["state"], "queued")
+        now[0] += 60
+        self.assertTrue(b.dispatch_once(frozenset({"shutterstock-canary"})))
+        request = [call[2] for call in self.calls if isinstance(call, tuple) and call[0] == "run" and call[2].get("prompt") == "one"][0]
+        self.assertEqual(request["_broker_timeout_seconds"], 300)
+
+    def test_synchronous_canary_endpoint_returns_ollama_result(self):
+        b = self.make(["qwen3-vl:30b"])
+        server = serve(b, port=0)
+        response = {}
+        def client():
+            request = __import__("urllib.request", fromlist=["Request"]).Request(
+                f"http://127.0.0.1:{server.server_port}/v1/shutterstock-canary/generate",
+                data=json.dumps({
+                    "model": "qwen3-vl:30b", "prompt": "classify",
+                    "images": ["aGVsbG8="], "format": {"type": "object"},
+                }).encode(), headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urlopen(request) as result:
+                response["status"] = result.status
+                response["body"] = json.loads(result.read())
+        worker = threading.Thread(target=server.handle_request)
+        caller = threading.Thread(target=client)
+        worker.start(); caller.start()
+        deadline = time.monotonic() + 1
+        while b.health()["queue_depth"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(b.health()["queue_depth"], 1)
+        b.dispatch_once(frozenset({"shutterstock-canary"}))
+        caller.join(timeout=1); worker.join(timeout=1); server.server_close()
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["body"]["done"], True)
+        self.assertEqual(response["body"]["broker"]["state"], "completed")
     def test_wol_readiness_unload_and_server_limits(self):
         b=self.make(["incompatible-model:1"])
         job=b.submit("interactive", "generate", {"model":"evil", "prompt":"x", "keep_alive":"forever", "options":{"num_ctx":999999,"num_predict":999999}})["id"]

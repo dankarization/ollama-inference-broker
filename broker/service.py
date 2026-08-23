@@ -7,6 +7,7 @@ import time
 import uuid
 from pathlib import Path
 
+from .compat import CompatibilityError, validate_shutterstock_canary_payload
 from .profiles import FIXED_SOURCE_PRIORITIES, MAX_PRIORITY, MIN_PRIORITY, PROFILES
 
 
@@ -17,6 +18,7 @@ class Broker:
         self.db = sqlite3.connect(str(database), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
+        self.completed = threading.Condition(self.lock)
         self._init_db()
         self.recover()
 
@@ -28,13 +30,17 @@ class Broker:
                 source TEXT NOT NULL, priority INTEGER NOT NULL,
                 payload TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
                 started REAL, finished REAL, lease_until REAL, error TEXT,
-                switch_reason TEXT)""")
+                switch_reason TEXT, result_json TEXT)""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS source_schedules (
+                source TEXT PRIMARY KEY, next_allowed REAL NOT NULL)""")
             # Compatible with databases created by the first isolated MVP.
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
             if "source" not in columns:
                 self.db.execute("ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'")
             if "priority" not in columns:
                 self.db.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 10")
+            if "result_json" not in columns:
+                self.db.execute("ALTER TABLE jobs ADD COLUMN result_json TEXT")
 
     def recover(self):
         # A prior process cannot own the remote GPU after its lease. Requeue stale
@@ -43,6 +49,7 @@ class Broker:
         with self.lock, self.db:
             self.db.execute("UPDATE jobs SET state='queued', started=NULL, lease_until=NULL, error='requeued after broker restart' "
                             "WHERE state='running' AND (lease_until IS NULL OR lease_until < ?)", (now,))
+            self.completed.notify_all()
 
     def submit(self, profile: str, kind: str, payload: dict, source: str | None = None,
                priority: int | None = None) -> dict:
@@ -51,6 +58,13 @@ class Broker:
         if kind not in {"chat", "generate"}:
             raise ValueError("kind must be chat or generate")
         source = source or profile
+        if profile == "shutterstock-canary":
+            if source != profile:
+                raise ValueError("shutterstock-canary must use its dedicated source")
+            try:
+                payload = validate_shutterstock_canary_payload(payload)
+            except CompatibilityError as exc:
+                raise ValueError(str(exc)) from exc
         resolved_priority = self._resolve_priority(source, priority)
         job_id, now = str(uuid.uuid4()), self.clock()
         with self.lock, self.db:
@@ -77,6 +91,10 @@ class Broker:
     def _job(self, row):
         data = dict(row)
         data["payload"] = json.loads(data["payload"])
+        if data.get("result_json") is not None:
+            data["result"] = json.loads(data.pop("result_json"))
+        else:
+            data.pop("result_json", None)
         if data["state"] == "queued":
             data["queue_position"] = self._position(row)
         return data
@@ -97,23 +115,34 @@ class Broker:
             # marked cancel_requested and releases the slot after its request returns.
             elif row["state"] == "running":
                 self.db.execute("UPDATE jobs SET state='cancel_requested' WHERE id=?", (job_id,))
+            self.completed.notify_all()
         return self.status(job_id)
 
     def _next(self, allowed_sources: frozenset[str] | None = None):
         # Strict priority is deliberate: no aging can promote lower-priority
         # work ahead of a waiting higher-priority job.
-        if allowed_sources is None:
-            return self.db.execute(
-                "SELECT * FROM jobs WHERE state='queued' ORDER BY priority, created, id LIMIT 1"
-            ).fetchone()
-        if not allowed_sources:
+        if allowed_sources is not None and not allowed_sources:
             return None
-        placeholders = ",".join("?" for _ in allowed_sources)
-        return self.db.execute(
-            f"SELECT * FROM jobs WHERE state='queued' AND source IN ({placeholders}) "
-            "ORDER BY priority, created, id LIMIT 1",
-            tuple(sorted(allowed_sources)),
-        ).fetchone()
+        query = "SELECT * FROM jobs WHERE state='queued'"
+        values: tuple = ()
+        if allowed_sources is not None:
+            placeholders = ",".join("?" for _ in allowed_sources)
+            query += f" AND source IN ({placeholders})"
+            values = tuple(sorted(allowed_sources))
+        query += " ORDER BY priority, created, id"
+        now = self.clock()
+        for row in self.db.execute(query, values):
+            profile = PROFILES[row["profile"]]
+            running = self.db.execute(
+                "SELECT count(*) FROM jobs WHERE source=? AND state IN ('running','cancel_requested')",
+                (row["source"],),
+            ).fetchone()[0]
+            scheduled = self.db.execute(
+                "SELECT next_allowed FROM source_schedules WHERE source=?", (row["source"],)
+            ).fetchone()
+            if running < profile.max_concurrency and (scheduled is None or scheduled[0] <= now):
+                return row
+        return None
 
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None) -> bool:
         with self.lock, self.db:
@@ -123,11 +152,19 @@ class Broker:
             if not row: return False
             now = self.clock()
             self.db.execute("UPDATE jobs SET state='running',started=?,lease_until=? WHERE id=?", (now, now+self.lease_seconds, row["id"]))
+            interval = PROFILES[row["profile"]].min_interval_seconds
+            if interval:
+                self.db.execute(
+                    "INSERT INTO source_schedules(source,next_allowed) VALUES(?,?) "
+                    "ON CONFLICT(source) DO UPDATE SET next_allowed=excluded.next_allowed",
+                    (row["source"], now + interval),
+                )
         try:
             self._execute(row)
         except Exception as exc:
             with self.lock, self.db:
                 self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (self.clock(), str(exc), row["id"]))
+                self.completed.notify_all()
         return True
 
     def _execute(self, row):
@@ -152,12 +189,30 @@ class Broker:
         request = {k: v for k, v in payload.items() if k not in {"model", "keep_alive"}}
         request.update({"model": profile.model, "stream": False, "options": options,
                         "keep_alive": f"{profile.keep_alive_seconds}s"})
-        self.ollama.run(row["kind"], request)
+        request["_broker_timeout_seconds"] = profile.request_timeout_seconds
+        result = self.ollama.run(row["kind"], request)
+        if not isinstance(result, dict):
+            raise RuntimeError("Ollama returned a non-object response")
+        result_json = json.dumps(result)
         with self.lock, self.db:
             state = self.db.execute("SELECT state FROM jobs WHERE id=?", (row["id"],)).fetchone()[0]
             final = "cancelled" if state == "cancel_requested" else "completed"
-            self.db.execute("UPDATE jobs SET state=?,finished=?,lease_until=NULL,switch_reason=? WHERE id=?",
-                            (final, self.clock(), reason, row["id"]))
+            self.db.execute("UPDATE jobs SET state=?,finished=?,lease_until=NULL,switch_reason=?,result_json=? WHERE id=?",
+                            (final, self.clock(), reason, result_json, row["id"]))
+            self.completed.notify_all()
+
+    def wait_for_terminal(self, job_id: str, timeout_seconds: float) -> dict | None:
+        """Wait for a persisted terminal state; executor dispatch remains external."""
+        deadline = time.monotonic() + timeout_seconds
+        with self.completed:
+            while True:
+                job = self.status(job_id)
+                if job is None or job["state"] in {"completed", "failed", "cancelled"}:
+                    return job
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return job
+                self.completed.wait(remaining)
 
     def metrics(self) -> dict:
         with self.lock:
