@@ -58,8 +58,12 @@ order.
 
 ## Фаза 3 — наблюдаемость и операции
 
-- [ ] Добавить health checks за пределами локального `/healthz`, structured
-  logs, dashboards и alerts.
+- [x] Добавлены durable audit events, история attempts/retry/requeue,
+  payload-free correlation lookup, per-source latency/throughput/error metrics,
+  scheduler decision context и fairness windows. Действующий scheduler не
+  изменён.
+- [ ] Добавить health checks за пределами локального `/healthz`, dashboards и
+  alerts поверх накопленной истории.
 - [ ] Публиковать данные MAIN-PC о VRAM и loaded models только при отдельно
   разрешённом внешнем обращении.
 

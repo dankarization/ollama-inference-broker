@@ -395,3 +395,83 @@ class VideoEndpointTests(unittest.TestCase):
         finally:
             thread.join(timeout=1)
             server.server_close()
+
+
+class OlyaVisionEndpointTests(unittest.TestCase):
+    def make(self, loaded=None):
+        self.calls=[]; self.tmp=tempfile.NamedTemporaryFile(); self.ol=FakeOllama(self.calls, loaded)
+        return Broker(self.tmp.name, self.ol, FakeWol(self.calls), clock=__import__("time").time)
+
+    def test_dual_model_profiles_preserve_verified_runtime_and_idempotency(self):
+        for profile, model, think, num_ctx in (
+            ("olya-vision-gemma", "gemma4:12b", False, 245_760),
+            ("olya-vision-qwen", "qwen3-vl:30b", "max", 212_992),
+        ):
+            b = self.make([model])
+            payload = {
+                "prompt": "photos only", "images": ["aGVsbG8="],
+                "format": {"type": "object"},
+            }
+            job = b.submit(
+                profile, "generate", payload, source="olya-vision",
+                source_item_id="vision-42", external_id=f"vision-42:{model}",
+            )
+            duplicate = b.submit(
+                profile, "generate", payload, source="olya-vision",
+                source_item_id="vision-42", external_id=f"vision-42:{model}",
+            )
+            self.assertEqual(duplicate["id"], job["id"])
+            self.assertEqual(job["priority"], 8)
+            b.dispatch_once(frozenset({"olya-vision"}))
+            request = [
+                call[2] for call in self.calls
+                if isinstance(call, tuple) and call[0] == "run"
+                and call[2].get("prompt") == "photos only"
+            ][0]
+            self.assertEqual(request["model"], model)
+            self.assertEqual(request["think"], think)
+            self.assertEqual(request["options"], {
+                "temperature": 0, "num_ctx": num_ctx, "num_predict": 4_096,
+            })
+            self.assertEqual(request["keep_alive"], "1800s")
+
+    def test_olya_profile_is_source_scoped_and_media_bounded(self):
+        b = self.make(["gemma4:12b"])
+        payload = {"prompt": "x", "images": ["aGVsbG8="], "format": {}}
+        with self.assertRaisesRegex(ValueError, "dedicated source"):
+            b.submit("olya-vision-gemma", "generate", payload, source="olya")
+        with self.assertRaisesRegex(ValueError, "images"):
+            b.submit(
+                "olya-vision-gemma", "generate",
+                {"prompt": "x", "images": ["aGVsbG8="] * 17, "format": {}},
+                source="olya-vision",
+            )
+
+    def test_synchronous_olya_endpoint_returns_result_and_correlation(self):
+        b = self.make(["gemma4:12b"])
+        server = serve(b, port=0)
+        response = {}
+        def client():
+            request = __import__("urllib.request", fromlist=["Request"]).Request(
+                f"http://127.0.0.1:{server.server_port}/v1/olya-vision/generate",
+                data=json.dumps({
+                    "model": "gemma4:12b", "prompt": "classify",
+                    "images": ["aGVsbG8="], "format": {"type": "object"},
+                    "source_item_id": "42", "external_id": "42:asset:1",
+                }).encode(), headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urlopen(request) as result:
+                response["status"] = result.status
+                response["body"] = json.loads(result.read())
+        worker = threading.Thread(target=server.handle_request)
+        caller = threading.Thread(target=client)
+        worker.start(); caller.start()
+        deadline = time.monotonic() + 1
+        while b.health()["queue_depth"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        b.dispatch_once(frozenset({"olya-vision"}))
+        caller.join(timeout=1); worker.join(timeout=1); server.server_close()
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["body"]["done"], True)
+        self.assertEqual(response["body"]["broker"]["source_item_id"], "42")
+        self.assertEqual(response["body"]["broker"]["external_id"], "42:asset:1")

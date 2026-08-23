@@ -1,3 +1,4 @@
+import logging
 import os
 from .adapters import OllamaHTTP, WakeOnLan
 from .http import serve
@@ -35,6 +36,10 @@ def policy_path(value: str | None) -> str | None:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(),
+        format="%(message)s",
+    )
     broker = Broker(
         os.environ.get("BROKER_DB", "broker.sqlite3"),
         OllamaHTTP(

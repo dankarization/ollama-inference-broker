@@ -37,10 +37,14 @@ def submit(broker: Any, kind: str, request: Any) -> dict[str, Any]:
     if priority is not None and (isinstance(priority, bool) or not isinstance(priority, int)):
         raise CompatibilityError("priority must be an integer when supplied")
     payload = {key: value for key, value in request.items() if key not in {
-        "profile", "source", "priority", "model", "keep_alive", "stream"
+        "profile", "source", "priority", "model", "keep_alive", "stream",
+        "source_item_id", "external_id",
     }}
     try:
-        return broker.submit(profile, kind, payload, source, priority)
+        return broker.submit(
+            profile, kind, payload, source, priority,
+            request.get("source_item_id"), request.get("external_id"),
+        )
     except ValueError as exc:
         raise CompatibilityError(str(exc)) from exc
 
@@ -49,7 +53,12 @@ def submit_shutterstock_canary(broker: Any, request: Any) -> dict[str, Any]:
     """Admit the active photo-worker's VLM shape under a distinct canary source."""
     payload = validate_shutterstock_canary_payload(request)
     try:
-        return broker.submit("shutterstock-canary", "generate", payload, source="shutterstock-canary")
+        return broker.submit(
+            "shutterstock-canary", "generate", payload,
+            source="shutterstock-canary",
+            source_item_id=request.get("source_item_id"),
+            external_id=request.get("external_id"),
+        )
     except ValueError as exc:
         raise CompatibilityError(str(exc)) from exc
 
@@ -148,7 +157,82 @@ def submit_shutterstock_video(broker: Any, request: Any) -> dict[str, Any]:
     """Admit one video chunk under the dedicated ``shutterstock-video`` source."""
     payload = validate_shutterstock_video_payload(request)
     try:
-        return broker.submit("shutterstock-video", "generate", payload, source="shutterstock-video")
+        return broker.submit(
+            "shutterstock-video", "generate", payload,
+            source="shutterstock-video",
+            source_item_id=request.get("source_item_id"),
+            external_id=request.get("external_id"),
+        )
+    except ValueError as exc:
+        raise CompatibilityError(str(exc)) from exc
+
+
+OLYA_VISION_PROFILES = {
+    "gemma4:12b": ("olya-vision-gemma", False),
+    "qwen3-vl:30b": ("olya-vision-qwen", "max"),
+}
+
+
+def validate_olya_vision_payload(request: Any) -> tuple[str, dict[str, Any]]:
+    """Validate Olya's existing photos-only VLM call without accepting overrides."""
+    if not isinstance(request, dict):
+        raise CompatibilityError("request must be a JSON object")
+    model = request.get("model")
+    if model not in OLYA_VISION_PROFILES:
+        raise CompatibilityError("model must be an approved Olya vision model")
+    profile_name, think = OLYA_VISION_PROFILES[model]
+    profile = PROFILES[profile_name]
+    prompt = request.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 24_000:
+        raise CompatibilityError("prompt must be a non-empty string up to 24000 characters")
+    images = request.get("images")
+    if not isinstance(images, list) or not 1 <= len(images) <= profile.max_images:
+        raise CompatibilityError(
+            f"images must contain 1 to {profile.max_images} base64 images"
+        )
+    total_bytes = 0
+    for image in images:
+        if not isinstance(image, str):
+            raise CompatibilityError("images must be base64 strings")
+        try:
+            total_bytes += len(base64.b64decode(image, validate=True))
+        except (ValueError, UnicodeEncodeError, binascii.Error):
+            raise CompatibilityError("images must be valid base64") from None
+    if total_bytes > 64 * 1024 * 1024:
+        raise CompatibilityError("decoded images exceed the 64 MiB Olya limit")
+    schema = request.get("format")
+    if not isinstance(schema, dict):
+        raise CompatibilityError("format must be a JSON Schema object")
+    try:
+        schema_bytes = len(json.dumps(schema, separators=(",", ":")).encode())
+    except (TypeError, ValueError):
+        raise CompatibilityError("format must be JSON serializable") from None
+    if schema_bytes > profile.max_schema_bytes:
+        raise CompatibilityError("format exceeds the Olya schema limit")
+    return profile_name, {
+        "prompt": prompt,
+        "images": images,
+        "format": schema,
+        "think": think,
+        "options": {
+            "temperature": 0,
+            "num_ctx": profile.max_context,
+            "num_predict": profile.max_output,
+        },
+    }
+
+
+def submit_olya_vision(broker: Any, request: Any) -> dict[str, Any]:
+    profile_name, payload = validate_olya_vision_payload(request)
+    try:
+        return broker.submit(
+            profile_name,
+            "generate",
+            payload,
+            source="olya-vision",
+            source_item_id=request.get("source_item_id"),
+            external_id=request.get("external_id"),
+        )
     except ValueError as exc:
         raise CompatibilityError(str(exc)) from exc
 

@@ -32,6 +32,19 @@ PROFILES = {
     # `olya` is intentionally only a source/profile key. Do not infer an
     # integration from this name; its model can be changed in broker config.
     "olya": Profile("olya", "nemotron3:33b", 8_192, 1_024, 120),
+    # Photos-only Olya keeps its verified two-model routing. Both profiles use
+    # one dedicated weighted source; callers may select only these exact
+    # server-owned profiles via the bounded synchronous VLM endpoint.
+    "olya-vision-gemma": Profile(
+        "olya-vision-gemma", "gemma4:12b", 245_760, 4_096, 1_800,
+        max_concurrency=1, request_timeout_seconds=600,
+        max_images=16, max_schema_bytes=65_536,
+    ),
+    "olya-vision-qwen": Profile(
+        "olya-vision-qwen", "qwen3-vl:30b", 212_992, 4_096, 1_800,
+        max_concurrency=1, request_timeout_seconds=600,
+        max_images=16, max_schema_bytes=65_536,
+    ),
     "batch-video": Profile("batch-video", "nemotron3:33b", 8_192, 512, 120),
     # This is an intentionally separate source from the active Shutterstock
     # worker.  It is the only VLM/media contract eligible for a future canary.
@@ -49,6 +62,7 @@ FIXED_SOURCE_PRIORITIES = {
     "cron": 2,         # OpenClaw cron
     "shutterstock-video": 5,
     "olya": 8,
+    "olya-vision": 8,
     "shutterstock-canary": 5,
 }
 MIN_PRIORITY = 1

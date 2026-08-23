@@ -1,9 +1,11 @@
 from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 from .compat import (CompatibilityError, stream_frames, submit as submit_compatibility,
-                     submit_shutterstock_canary, submit_shutterstock_video)
+                     submit_olya_vision, submit_shutterstock_canary,
+                     submit_shutterstock_video)
 from .profiles import PROFILES
 
 def serve(broker, host="127.0.0.1", port=8088, policy=None):
@@ -14,19 +16,25 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
             encoded=b"".join(frames); self.send_response(status); self.send_header("Content-Type","application/x-ndjson"); self.send_header("Content-Length",str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
         def do_POST(self):
             size=int(self.headers.get("Content-Length", 0)); body=json.loads(self.rfile.read(size) or b"{}")
-            if self.path == "/v1/jobs":
+            path = urlsplit(self.path).path
+            if path == "/v1/jobs":
                 try: self._json(202, broker.submit(body["profile"], body["kind"], body.get("payload", {}),
-                                                  body.get("source"), body.get("priority")))
+                                                  body.get("source"), body.get("priority"),
+                                                  body.get("source_item_id"), body.get("external_id")))
                 except (KeyError, ValueError) as e: self._json(400, {"error": str(e)})
-            elif self.path.startswith("/v1/jobs/") and self.path.endswith("/cancel"):
-                result=broker.cancel(self.path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
-            elif self.path in {"/api/chat", "/api/generate"}:
+            elif path.startswith("/v1/jobs/") and path.endswith("/cancel"):
+                result=broker.cancel(path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
+            elif path.startswith("/v1/jobs/") and path.endswith("/retry"):
                 try:
-                    job=submit_compatibility(broker, self.path.rsplit("/", 1)[-1], body)
+                    result=broker.retry(path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
+                except ValueError as e: self._json(409, {"error":str(e)})
+            elif path in {"/api/chat", "/api/generate"}:
+                try:
+                    job=submit_compatibility(broker, path.rsplit("/", 1)[-1], body)
                     if body.get("stream", True): self._stream(202, stream_frames(job))
                     else: self._json(202, job)
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
-            elif self.path == "/v1/shutterstock-canary/generate":
+            elif path == "/v1/shutterstock-canary/generate":
                 try:
                     job = submit_shutterstock_canary(broker, body)
                     result = broker.wait_for_terminal(
@@ -43,7 +51,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                     else:
                         self._json(504, {"error": "broker job timed out", "job_id": job["id"]})
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
-            elif self.path == "/v1/shutterstock-video/generate":
+            elif path == "/v1/shutterstock-video/generate":
                 try:
                     job = submit_shutterstock_video(broker, body)
                     result = broker.wait_for_terminal(
@@ -60,17 +68,80 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                     else:
                         self._json(504, {"error": "broker job timed out", "job_id": job["id"]})
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
+            elif path == "/v1/olya-vision/generate":
+                try:
+                    job = submit_olya_vision(broker, body)
+                    result = broker.wait_for_terminal(
+                        job["id"], PROFILES[job["profile"]].request_timeout_seconds + 5,
+                    )
+                    if result is None:
+                        self._json(500, {"error": "submitted job disappeared"})
+                    elif result["state"] == "completed":
+                        response = dict(result["result"])
+                        response["broker"] = {
+                            "job_id": job["id"],
+                            "state": result["state"],
+                            "source_item_id": result.get("source_item_id"),
+                            "external_id": result.get("external_id"),
+                            "created": result["created"],
+                            "started": result.get("started"),
+                            "finished": result.get("finished"),
+                        }
+                        self._json(200, response)
+                    elif result["state"] == "failed":
+                        self._json(502, {"error": "broker job failed", "job_id": job["id"]})
+                    else:
+                        self._json(504, {"error": "broker job timed out", "job_id": job["id"]})
+                except CompatibilityError as e: self._json(400, {"error":str(e)})
             else: self._json(404, {"error":"not found"})
         def do_GET(self):
-            if self.path == "/healthz": self._json(200, broker.health())
-            elif self.path == "/v1/metrics": self._json(200, broker.metrics())
-            elif self.path == "/v1/sources":
+            parsed = urlsplit(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            if path == "/healthz": self._json(200, broker.health())
+            elif path == "/v1/metrics": self._json(200, broker.metrics())
+            elif path == "/v1/analytics":
+                try:
+                    windows = tuple(
+                        int(value) for item in query.get("window", [])
+                        for value in item.split(",") if value
+                    ) or (300, 1_800, 10_800, 86_400)
+                    if any(value <= 0 or value > 31_536_000 for value in windows):
+                        raise ValueError
+                    self._json(200, broker.analytics(policy, windows))
+                except ValueError:
+                    self._json(400, {"error":"window must be positive seconds up to one year"})
+            elif path == "/v1/audit-events":
+                try:
+                    limit = int(query.get("limit", ["100"])[0])
+                    since = query.get("since", [None])[0]
+                    self._json(200, {"events": broker.audit_events(
+                        limit=limit,
+                        job_id=query.get("job_id", [None])[0],
+                        source=query.get("source", [None])[0],
+                        since=float(since) if since is not None else None,
+                    )})
+                except ValueError:
+                    self._json(400, {"error":"limit and since must be numeric"})
+            elif path == "/v1/correlations":
+                try:
+                    self._json(200, {"jobs": broker.correlations(
+                        source=query.get("source", [None])[0],
+                        source_item_id=query.get("source_item_id", [None])[0],
+                        external_id=query.get("external_id", [None])[0],
+                        limit=int(query.get("limit", ["100"])[0]),
+                    )})
+                except ValueError as error:
+                    self._json(400, {"error":str(error)})
+            elif path == "/v1/sources":
                 if policy is None:
                     self._json(200, {"policy": None})
                 else:
                     self._json(200, {"policy": policy.snapshot()})
-            elif self.path.startswith("/v1/jobs/"):
-                result=broker.status(self.path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
+            elif path.startswith("/v1/jobs/") and path.endswith("/attempts"):
+                result=broker.attempts(path.split("/")[3]); self._json(200 if result is not None else 404, {"attempts":result} if result is not None else {"error":"not found"})
+            elif path.startswith("/v1/jobs/"):
+                result=broker.status(path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
             else: self._json(404, {"error":"not found"})
         def log_message(self, *_): pass
     return ThreadingHTTPServer((host, port), Handler)

@@ -58,6 +58,10 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
 
 - `POST /v1/jobs` принимает `{ "profile":"interactive", "kind":"chat|generate", "payload":{...} }` и возвращает сохранённое задание (`202`).
 - `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel` и `GET /v1/metrics` дают доступ к жизненному циклу и данным MAIN-PC `/api/ps`.
+- `GET /v1/analytics`, `/v1/audit-events`, `/v1/jobs/{id}/attempts` и
+  `/v1/correlations` дают payload-free историю очереди, попыток, correlation и
+  scheduler fairness. Определения метрик и пример 8:3 — в
+  [docs/ANALYTICS.md](docs/ANALYTICS.md).
 - `GET /healthz` проверяет только локальное состояние broker: очередь, активную lease и timestamp. Он не отправляет WOL и не обращается к MAIN-PC/Ollama.
 - `/api/chat` и `/api/generate` реализуют локальный compatibility contract:
   обязателен server-side `profile`, а `stream=true` возвращает NDJSON admission
@@ -73,6 +77,11 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
 Переданные caller значения `model`, `num_ctx`, `num_predict` и `keep_alive` не
 могут повысить эти лимиты. SQLite использует WAL. Dispatch выполняется строго
 по приоритету, затем FIFO; старение очереди намеренно не применяется.
+
+Каждое принятое задание и scheduler decision сохраняются в durable
+audit/attempt history. `POST /v1/jobs` опционально принимает
+`source_item_id`/`external_id`; private payload и значения correlation не
+копируются в structured logs. Существующие request/response поля не удалены.
 
 ## Действующая политика приоритетов
 
@@ -144,6 +153,13 @@ env. `GET /v1/sources` отдаёт текущий снапшот политик
 base64 `images` (до 12 кадров, 32 MiB) и JSON Schema в `format` (до 32 KiB),
 возвращает результат Ollama плюс `broker.job_id`. Dispatch источника включается
 только через policy/allowlist; без этого job остаётся durable `queued`.
+
+`POST /v1/olya-vision/generate` — синхронный photos-only контракт источника
+`olya-vision`: принимает только `gemma4:12b` или `qwen3-vl:30b`, до 16
+base64-изображений (64 MiB), JSON Schema (64 KiB) и correlation
+`source_item_id`/`external_id`. Повтор того же `external_id` возвращает
+существующий durable job; результат и attempt history переживают restart.
+Runtime-параметры моделей задаёт broker, caller не может их расширить.
 
 ## Проверка и разработка
 

@@ -29,6 +29,17 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(job["payload"]["options"], {"num_ctx": 999999, "num_predict": 999999})
         self.assertNotIn("model", job["payload"]); self.assertNotIn("keep_alive", job["payload"])
 
+    def test_correlation_metadata_is_not_copied_into_inference_payload(self):
+        broker = self.make()
+        job = submit(broker, "generate", {
+            "profile": "olya", "prompt": "test",
+            "source_item_id": "photo-42", "external_id": "batch-7",
+        })
+        self.assertEqual(job["source_item_id"], "photo-42")
+        self.assertEqual(job["external_id"], "batch-7")
+        self.assertNotIn("source_item_id", job["payload"])
+        self.assertNotIn("external_id", job["payload"])
+
     def test_request_validation_rejects_unknown_profile_and_model_override(self):
         broker = self.make()
         with self.assertRaisesRegex(CompatibilityError, "server-side profile"): submit(broker, "generate", {"prompt": "x"})
