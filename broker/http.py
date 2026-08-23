@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from .compat import (CompatibilityError, stream_frames, submit as submit_compatibility,
-                     submit_olya_vision, submit_shutterstock_canary,
+                     submit_olya_decision, submit_olya_vision, submit_shutterstock_canary,
                      submit_shutterstock_video)
 from .profiles import PROFILES
 
@@ -86,6 +86,27 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                             "created": result["created"],
                             "started": result.get("started"),
                             "finished": result.get("finished"),
+                        }
+                        self._json(200, response)
+                    elif result["state"] == "failed":
+                        self._json(502, {"error": "broker job failed", "job_id": job["id"]})
+                    else:
+                        self._json(504, {"error": "broker job timed out", "job_id": job["id"]})
+                except CompatibilityError as e: self._json(400, {"error":str(e)})
+            elif path == "/v1/olya-decision/generate":
+                try:
+                    job = submit_olya_decision(broker, body)
+                    result = broker.wait_for_terminal(
+                        job["id"], PROFILES["olya-decision-qwen38"].request_timeout_seconds + 5,
+                    )
+                    if result is None:
+                        self._json(500, {"error": "submitted job disappeared"})
+                    elif result["state"] == "completed":
+                        response = dict(result["result"])
+                        response["broker"] = {
+                            "job_id": job["id"], "state": result["state"],
+                            "created": result["created"], "started": result["started"],
+                            "finished": result["finished"],
                         }
                         self._json(200, response)
                     elif result["state"] == "failed":

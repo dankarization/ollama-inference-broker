@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
-from .compat import (CompatibilityError, validate_olya_vision_payload,
+from .compat import (CompatibilityError, validate_olya_decision_payload,
+                     validate_olya_vision_payload,
                      validate_shutterstock_canary_payload,
                      validate_shutterstock_video_payload)
 from .profiles import FIXED_SOURCE_PRIORITIES, MAX_PRIORITY, MIN_PRIORITY, PROFILES
@@ -216,6 +217,11 @@ class Broker:
                 "ON jobs(source,external_id) WHERE source='olya-vision' "
                 "AND external_id IS NOT NULL"
             )
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS jobs_olya_decision_external "
+                "ON jobs(source,external_id) WHERE source='olya-decision' "
+                "AND external_id IS NOT NULL"
+            )
 
     def _audit(
         self,
@@ -318,12 +324,22 @@ class Broker:
                 })
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
+        if profile == "olya-decision-qwen38":
+            if source != "olya-decision":
+                raise ValueError("Olya decision profile must use its dedicated source")
+            try:
+                payload = validate_olya_decision_payload({
+                    **payload,
+                    "model": PROFILES[profile].model,
+                })
+            except CompatibilityError as exc:
+                raise ValueError(str(exc)) from exc
         resolved_priority = self._resolve_priority(source, priority)
         source_item_id = self._correlation_value("source_item_id", source_item_id)
         external_id = self._correlation_value("external_id", external_id)
         job_id, now = str(uuid.uuid4()), self.clock()
         with self.lock, self.db:
-            if source == "olya-vision" and external_id is not None:
+            if source in {"olya-vision", "olya-decision"} and external_id is not None:
                 existing = self.db.execute(
                     "SELECT id FROM jobs WHERE source=? AND external_id=? "
                     "ORDER BY created DESC,id DESC LIMIT 1",

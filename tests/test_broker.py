@@ -475,3 +475,75 @@ class OlyaVisionEndpointTests(unittest.TestCase):
         self.assertEqual(response["body"]["done"], True)
         self.assertEqual(response["body"]["broker"]["source_item_id"], "42")
         self.assertEqual(response["body"]["broker"]["external_id"], "42:asset:1")
+
+
+class OlyaDecisionEndpointTests(unittest.TestCase):
+    def make(self, loaded=None):
+        self.calls=[]; self.tmp=tempfile.NamedTemporaryFile(); self.ol=FakeOllama(self.calls, loaded)
+        return Broker(self.tmp.name, self.ol, FakeWol(self.calls), clock=__import__("time").time)
+
+    def test_qwen38_profile_is_text_only_source_scoped_and_idempotent(self):
+        model = "qwen3.8:ad-iq2-xs"
+        broker = self.make([model])
+        payload = {"prompt": "decide", "format": {"type": "object"}}
+        job = broker.submit(
+            "olya-decision-qwen38", "generate", payload,
+            source="olya-decision", source_item_id="recommendation-42",
+            external_id="decision-input-hash-42",
+        )
+        duplicate = broker.submit(
+            "olya-decision-qwen38", "generate", payload,
+            source="olya-decision", source_item_id="recommendation-42",
+            external_id="decision-input-hash-42",
+        )
+        self.assertEqual(duplicate["id"], job["id"])
+        self.assertEqual(job["priority"], 6)
+        with self.assertRaisesRegex(ValueError, "dedicated source"):
+            broker.submit(
+                "olya-decision-qwen38", "generate", payload, source="olya-vision"
+            )
+        with self.assertRaisesRegex(ValueError, "text-only"):
+            broker.submit(
+                "olya-decision-qwen38", "generate",
+                {**payload, "images": ["aGVsbG8="]}, source="olya-decision",
+            )
+        broker.dispatch_once(frozenset({"olya-decision"}))
+        request = [
+            call[2] for call in self.calls
+            if isinstance(call, tuple) and call[0] == "run"
+            and call[2].get("prompt") == "decide"
+        ][0]
+        self.assertEqual(request["model"], model)
+        self.assertEqual(request["think"], "low")
+        self.assertEqual(request["options"], {
+            "temperature": 0, "num_ctx": 32_768, "num_predict": 4_096,
+        })
+        self.assertEqual(request["keep_alive"], "1800s")
+
+    def test_synchronous_decision_endpoint_returns_result_and_identity(self):
+        broker = self.make(["qwen3.8:ad-iq2-xs"])
+        server = serve(broker, port=0)
+        response = {}
+        def client():
+            request = __import__("urllib.request", fromlist=["Request"]).Request(
+                f"http://127.0.0.1:{server.server_port}/v1/olya-decision/generate",
+                data=json.dumps({
+                    "model": "qwen3.8:ad-iq2-xs", "prompt": "decide",
+                    "format": {"type": "object"},
+                    "source_item_id": "42", "external_id": "hash-42",
+                }).encode(), headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urlopen(request) as result:
+                response["status"] = result.status
+                response["body"] = json.loads(result.read())
+        worker = threading.Thread(target=server.handle_request)
+        caller = threading.Thread(target=client)
+        worker.start(); caller.start()
+        deadline = time.monotonic() + 1
+        while broker.health()["queue_depth"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        broker.dispatch_once(frozenset({"olya-decision"}))
+        caller.join(timeout=1); worker.join(timeout=1); server.server_close()
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["body"]["done"], True)
+        self.assertEqual(response["body"]["broker"]["state"], "completed")

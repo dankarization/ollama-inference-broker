@@ -237,6 +237,54 @@ def submit_olya_vision(broker: Any, request: Any) -> dict[str, Any]:
         raise CompatibilityError(str(exc)) from exc
 
 
+def validate_olya_decision_payload(request: Any) -> dict[str, Any]:
+    """Validate the text-only Olya decision contract for pinned Qwen 3.8."""
+    if not isinstance(request, dict):
+        raise CompatibilityError("request must be a JSON object")
+    profile = PROFILES["olya-decision-qwen38"]
+    if request.get("model") != profile.model:
+        raise CompatibilityError("model must match the Olya decision profile")
+    prompt = request.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 96_000:
+        raise CompatibilityError("prompt must be a non-empty string up to 96000 characters")
+    if request.get("images") not in (None, []):
+        raise CompatibilityError("Olya decision is text-only")
+    schema = request.get("format")
+    if not isinstance(schema, dict):
+        raise CompatibilityError("format must be a JSON Schema object")
+    try:
+        schema_bytes = len(json.dumps(schema, separators=(",", ":")).encode())
+    except (TypeError, ValueError):
+        raise CompatibilityError("format must be JSON serializable") from None
+    if schema_bytes > profile.max_schema_bytes:
+        raise CompatibilityError("format exceeds the Olya decision schema limit")
+    return {
+        "prompt": prompt,
+        "format": schema,
+        "think": "low",
+        "options": {
+            "temperature": 0,
+            "num_ctx": profile.max_context,
+            "num_predict": profile.max_output,
+        },
+    }
+
+
+def submit_olya_decision(broker: Any, request: Any) -> dict[str, Any]:
+    payload = validate_olya_decision_payload(request)
+    try:
+        return broker.submit(
+            "olya-decision-qwen38",
+            "generate",
+            payload,
+            source="olya-decision",
+            source_item_id=request.get("source_item_id"),
+            external_id=request.get("external_id"),
+        )
+    except ValueError as exc:
+        raise CompatibilityError(str(exc)) from exc
+
+
 def stream_frames(job: dict[str, Any]) -> list[bytes]:
     """Return persisted job state as NDJSON without polling an executor."""
     model = PROFILES[job["profile"]].model

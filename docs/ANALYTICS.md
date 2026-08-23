@@ -78,24 +78,31 @@ Expected share рассчитывается на каждом решении т�
 rate limit или disabled source. `fairness_ratio=1` и малый
 `absolute_share_error` означают близость actual share к доступной weighted цели.
 
-Пример после 11 dispatch opportunities при постоянно заполненных очередях и
-weights `olya-vision=8`, `shutterstock-video=3`:
+Пример после 17 dispatch opportunities при постоянно заполненных очередях и
+weights `olya-vision=8`, `olya-decision=6`, `shutterstock-video=3`:
 
 ```json
 {
-  "selections": 11,
+  "selections": 17,
   "sources": {
     "olya-vision": {
       "selected": 8,
-      "actual_share": 0.727273,
-      "expected_share": 0.727273,
+      "actual_share": 0.470588,
+      "expected_share": 0.470588,
+      "fairness_ratio": 1.0,
+      "absolute_share_error": 0.0
+    },
+    "olya-decision": {
+      "selected": 6,
+      "actual_share": 0.352941,
+      "expected_share": 0.352941,
       "fairness_ratio": 1.0,
       "absolute_share_error": 0.0
     },
     "shutterstock-video": {
       "selected": 3,
-      "actual_share": 0.272727,
-      "expected_share": 0.272727,
+      "actual_share": 0.176471,
+      "expected_share": 0.176471,
       "fairness_ratio": 1.0,
       "absolute_share_error": 0.0
     }

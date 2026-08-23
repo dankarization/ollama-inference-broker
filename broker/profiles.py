@@ -45,6 +45,13 @@ PROFILES = {
         max_concurrency=1, request_timeout_seconds=600,
         max_images=16, max_schema_bytes=65_536,
     ),
+    # Text-only apartment decision lane. The exact local model is pinned
+    # server-side; callers cannot replace it or expand its runtime limits.
+    "olya-decision-qwen38": Profile(
+        "olya-decision-qwen38", "qwen3.8:ad-iq2-xs", 32_768, 4_096, 1_800,
+        max_concurrency=1, request_timeout_seconds=300,
+        max_schema_bytes=16_384,
+    ),
     "batch-video": Profile("batch-video", "nemotron3:33b", 8_192, 512, 120),
     # This is an intentionally separate source from the active Shutterstock
     # worker.  It is the only VLM/media contract eligible for a future canary.
@@ -63,6 +70,7 @@ FIXED_SOURCE_PRIORITIES = {
     "shutterstock-video": 5,
     "olya": 8,
     "olya-vision": 8,
+    "olya-decision": 6,
     "shutterstock-canary": 5,
 }
 MIN_PRIORITY = 1

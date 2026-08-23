@@ -161,6 +161,12 @@ base64-изображений (64 MiB), JSON Schema (64 KiB) и correlation
 существующий durable job; результат и attempt history переживают restart.
 Runtime-параметры моделей задаёт broker, caller не может их расширить.
 
+`POST /v1/olya-decision/generate` — отдельный синхронный text-only contract
+`olya-decision`. Он принимает fixed decision prompt и JSON Schema, но запускает
+только server-owned `qwen3.8:ad-iq2-xs` с bounded context/output и `think=low`.
+`source_item_id` связывает recommendation с broker job, стабильный `external_id`
+обеспечивает idempotent resume. Этот source независим от `olya-vision`.
+
 ## Проверка и разработка
 
 Безопасная canary-проверка использует mock или staging задания `interactive`,

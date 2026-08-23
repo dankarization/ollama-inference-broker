@@ -213,11 +213,12 @@ class AnalyticsTests(unittest.TestCase):
         self.assertNotIn("payload", matches[0])
         self.assertNotIn("result", matches[0])
 
-    def test_weight_8_to_3_report_tracks_actual_and_expected_share(self):
+    def test_weight_8_to_6_to_3_report_tracks_actual_and_expected_share(self):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock)
         policy = self.policy({
             "olya-vision": {"enabled": True, "weight": 8},
+            "olya-decision": {"enabled": True, "weight": 6},
             "shutterstock-video": {"enabled": True, "weight": 3},
         })
         for index in range(20):
@@ -232,16 +233,25 @@ class AnalyticsTests(unittest.TestCase):
                 source="olya-vision",
                 external_id=f"o-{index}",
             )
+            broker.submit(
+                "olya-decision-qwen38", "generate",
+                {"prompt": f"d-{index}", "format": {"type": "object"}},
+                source="olya-decision", external_id=f"d-{index}",
+            )
             broker.submit("shutterstock-video", "generate", {"prompt": f"v-{index}"})
-        for _ in range(11):
+        for _ in range(17):
             self.assertTrue(broker.dispatch_once(policy=policy))
         snapshot = broker.analytics(policy, windows=(3_600,))
         scheduler = snapshot["scheduler"]["windows"]["3600"]
-        self.assertEqual(scheduler["selections"], 11)
+        self.assertEqual(scheduler["selections"], 17)
         self.assertEqual(scheduler["sources"]["olya-vision"]["selected"], 8)
+        self.assertEqual(scheduler["sources"]["olya-decision"]["selected"], 6)
         self.assertEqual(scheduler["sources"]["shutterstock-video"]["selected"], 3)
         self.assertAlmostEqual(
-            scheduler["sources"]["olya-vision"]["expected_share"], 8 / 11, places=5
+            scheduler["sources"]["olya-vision"]["expected_share"], 8 / 17, places=5
+        )
+        self.assertAlmostEqual(
+            scheduler["sources"]["olya-decision"]["expected_share"], 6 / 17, places=5
         )
         self.assertEqual(
             snapshot["scheduler"]["active_policy"]["sources"]["olya-vision"]["weight"],
