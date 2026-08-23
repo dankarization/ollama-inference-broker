@@ -95,6 +95,10 @@ GPU MAIN-PC. `shutterstock-video` — отдельный локальный work
 запускает задание. Просроченная running lease возвращается в очередь при
 перезапуске broker.
 
+`OLLAMA_TIMEOUT_SECONDS` задаёт предел одного вызова Ollama; production unit
+использует 300 секунд, чтобы холодная загрузка большой модели не превращалась в
+ложную terminal failure через короткий HTTP timeout.
+
 Если `BROKER_DISPATCH_ENABLED=true`, обязательно задаётся непустой
 `BROKER_DISPATCH_SOURCES` с точными именами источников через запятую. Dispatcher
 берёт lease только у заданий из этого allowlist; все остальные задания остаются

@@ -20,14 +20,19 @@ class WakeOnLan:
 
 
 class OllamaHTTP:
-    def __init__(self, base_url: str = "http://192.168.2.5:11434"):
+    def __init__(
+        self, base_url: str = "http://192.168.2.5:11434", timeout_seconds: float = 300
+    ):
         self.base_url = base_url.rstrip("/")
+        if timeout_seconds <= 0:
+            raise ValueError("Ollama timeout must be positive")
+        self.timeout_seconds = timeout_seconds
 
     def _request(self, path: str, body: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(self.base_url + path, data=data,
             headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
             return json.loads(response.read() or b"{}")
 
     def ps(self) -> dict:

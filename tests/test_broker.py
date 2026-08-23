@@ -5,6 +5,7 @@ from urllib.request import urlopen
 
 from broker.http import serve
 from broker.__main__ import dispatch_enabled, dispatch_sources
+from broker.adapters import OllamaHTTP
 from broker.service import Broker
 
 
@@ -44,6 +45,10 @@ class BrokerTests(unittest.TestCase):
             dispatch_sources(None)
         with self.assertRaisesRegex(ValueError, "at least one source"):
             dispatch_sources(" , ")
+
+    def test_ollama_timeout_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            OllamaHTTP(timeout_seconds=0)
     def test_fixed_source_priorities_then_fifo(self):
         b=self.make(["nemotron3:33b"], clock=iter(range(1_000)).__next__)
         cron=b.submit("cron", "generate", {"prompt":"cron"})["id"]

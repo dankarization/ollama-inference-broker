@@ -29,7 +29,10 @@ def dispatch_sources(value: str | None) -> frozenset[str]:
 def main() -> None:
     broker = Broker(
         os.environ.get("BROKER_DB", "broker.sqlite3"),
-        OllamaHTTP(os.environ.get("OLLAMA_URL", "http://192.168.2.5:11434")),
+        OllamaHTTP(
+            os.environ.get("OLLAMA_URL", "http://192.168.2.5:11434"),
+            float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "300")),
+        ),
         WakeOnLan(os.environ["MAINPC_MAC"]),
     )
     if dispatch_enabled(os.environ.get("BROKER_DISPATCH_ENABLED")):
