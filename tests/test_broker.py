@@ -4,7 +4,7 @@ import unittest
 from urllib.request import urlopen
 
 from broker.http import serve
-from broker.__main__ import dispatch_enabled
+from broker.__main__ import dispatch_enabled, dispatch_sources
 from broker.service import Broker
 
 
@@ -34,6 +34,16 @@ class BrokerTests(unittest.TestCase):
         self.assertFalse(dispatch_enabled("false"))
         with self.assertRaisesRegex(ValueError, "must be true or false"):
             dispatch_enabled("later")
+
+    def test_dispatch_source_allowlist_requires_a_non_empty_value(self):
+        self.assertEqual(
+            dispatch_sources("pilot-mainpc, pilot-secondary"),
+            {"pilot-mainpc", "pilot-secondary"},
+        )
+        with self.assertRaisesRegex(ValueError, "is required"):
+            dispatch_sources(None)
+        with self.assertRaisesRegex(ValueError, "at least one source"):
+            dispatch_sources(" , ")
     def test_fixed_source_priorities_then_fifo(self):
         b=self.make(["nemotron3:33b"], clock=iter(range(1_000)).__next__)
         cron=b.submit("cron", "generate", {"prompt":"cron"})["id"]
@@ -67,6 +77,14 @@ class BrokerTests(unittest.TestCase):
         for bad in (None, 0, 11, True, "3"):
             with self.assertRaisesRegex(ValueError, "integer from 1 to 10"):
                 b.submit("batch-video", "generate", {"prompt":"x"}, source="another-submitters", priority=bad)
+
+    def test_dispatch_allowlist_leaves_non_pilot_work_queued(self):
+        b=self.make(["nemotron3:33b"])
+        blocked=b.submit("interactive", "generate", {"prompt":"do not run"})["id"]
+        pilot=b.submit("interactive", "generate", {"prompt":"pilot"}, source="pilot-mainpc", priority=1)["id"]
+        self.assertTrue(b.dispatch_once(frozenset({"pilot-mainpc"})))
+        self.assertEqual(b.status(pilot)["state"], "completed")
+        self.assertEqual(b.status(blocked)["state"], "queued")
     def test_wol_readiness_unload_and_server_limits(self):
         b=self.make(["incompatible-model:1"])
         job=b.submit("interactive", "generate", {"model":"evil", "prompt":"x", "keep_alive":"forever", "options":{"num_ctx":999999,"num_predict":999999}})["id"]

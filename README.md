@@ -95,6 +95,12 @@ GPU MAIN-PC. `shutterstock-video` — отдельный локальный work
 запускает задание. Просроченная running lease возвращается в очередь при
 перезапуске broker.
 
+Если `BROKER_DISPATCH_ENABLED=true`, обязательно задаётся непустой
+`BROKER_DISPATCH_SOURCES` с точными именами источников через запятую. Dispatcher
+берёт lease только у заданий из этого allowlist; все остальные задания остаются
+durable `queued`. Это позволяет включить обратимый pilot без миграции либо
+активации других callers.
+
 ## Проверка и разработка
 
 Безопасная canary-проверка использует mock или staging задания `interactive`,

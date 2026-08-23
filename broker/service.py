@@ -99,16 +99,27 @@ class Broker:
                 self.db.execute("UPDATE jobs SET state='cancel_requested' WHERE id=?", (job_id,))
         return self.status(job_id)
 
-    def _next(self):
+    def _next(self, allowed_sources: frozenset[str] | None = None):
         # Strict priority is deliberate: no aging can promote lower-priority
         # work ahead of a waiting higher-priority job.
-        return self.db.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY priority, created, id LIMIT 1").fetchone()
+        if allowed_sources is None:
+            return self.db.execute(
+                "SELECT * FROM jobs WHERE state='queued' ORDER BY priority, created, id LIMIT 1"
+            ).fetchone()
+        if not allowed_sources:
+            return None
+        placeholders = ",".join("?" for _ in allowed_sources)
+        return self.db.execute(
+            f"SELECT * FROM jobs WHERE state='queued' AND source IN ({placeholders}) "
+            "ORDER BY priority, created, id LIMIT 1",
+            tuple(sorted(allowed_sources)),
+        ).fetchone()
 
-    def dispatch_once(self) -> bool:
+    def dispatch_once(self, allowed_sources: frozenset[str] | None = None) -> bool:
         with self.lock, self.db:
             if self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested')").fetchone():
                 return False
-            row = self._next()
+            row = self._next(allowed_sources)
             if not row: return False
             now = self.clock()
             self.db.execute("UPDATE jobs SET state='running',started=?,lease_until=? WHERE id=?", (now, now+self.lease_seconds, row["id"]))
@@ -173,8 +184,16 @@ class Broker:
 
 
 class Dispatcher(threading.Thread):
-    def __init__(self, broker: Broker, interval=0.25):
-        super().__init__(daemon=True); self.broker, self.interval, self.stop_event = broker, interval, threading.Event()
+    def __init__(
+        self, broker: Broker, interval=0.25, allowed_sources: frozenset[str] | None = None
+    ):
+        super().__init__(daemon=True)
+        self.broker, self.interval, self.allowed_sources, self.stop_event = (
+            broker,
+            interval,
+            allowed_sources,
+            threading.Event(),
+        )
     def run(self):
         while not self.stop_event.is_set():
-            self.broker.dispatch_once(); self.stop_event.wait(self.interval)
+            self.broker.dispatch_once(self.allowed_sources); self.stop_event.wait(self.interval)

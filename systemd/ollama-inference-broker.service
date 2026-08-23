@@ -1,5 +1,5 @@
 [Unit]
-Description=Local Ollama inference broker (admission-only)
+Description=Local Ollama inference broker (source-scoped pilot dispatch)
 After=default.target
 
 [Service]
@@ -10,7 +10,8 @@ Environment=MAINPC_MAC=2c:f0:5d:74:6a:44
 Environment=BROKER_BIND=127.0.0.1
 Environment=BROKER_PORT=8088
 Environment=BROKER_DB=%h/.local/state/ollama-inference-broker/broker.sqlite3
-Environment=BROKER_DISPATCH_ENABLED=false
+Environment=BROKER_DISPATCH_ENABLED=true
+Environment=BROKER_DISPATCH_SOURCES=pilot-mainpc
 ExecStartPre=/usr/bin/mkdir -p %h/.local/state/ollama-inference-broker
 ExecStart=/usr/bin/python3 -m broker
 Restart=on-failure
