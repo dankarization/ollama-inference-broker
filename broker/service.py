@@ -130,6 +130,8 @@ class Broker:
         }
         self._init_db()
         self.recover()
+        with self.lock:
+            self._refresh_health_cache_locked()
 
     def _refresh_health_cache_locked(self) -> None:
         queued = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0]
@@ -308,7 +310,8 @@ class Broker:
                     attempt_no=attempt_no, from_state=row["state"],
                     to_state="failed", reason="expired lease recovery is fail-closed", occurred=now,
                 )
-            self._refresh_health_cache_locked()
+            if expired:
+                self._refresh_health_cache_locked()
             self.completed.notify_all()
 
     def submit(self, profile: str, kind: str, payload: dict, source: str | None = None,
@@ -815,14 +818,10 @@ class Broker:
 
     def health(self) -> dict:
         """Return a local broker probe without waking or querying MAIN-PC."""
-        # Keep the local probe responsive if a database mutation is slow.
-        if not self.lock.acquire(blocking=False):
-            return {**self._health_cache, "stale": True}
-        try:
-            self._refresh_health_cache_locked()
-            return dict(self._health_cache)
-        finally:
-            self.lock.release()
+        # Do not touch SQLite or wait for the dispatcher here.  Assignment of
+        # the small immutable replacement mapping is atomic under CPython, so
+        # this local probe remains available while a large DB transaction runs.
+        return dict(self._health_cache)
 
 
 class Dispatcher(threading.Thread):
