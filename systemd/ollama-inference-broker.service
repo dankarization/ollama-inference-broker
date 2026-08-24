@@ -4,7 +4,7 @@ After=default.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/.openclaw/workspace/.worktrees/ollama-inference-broker-main.NHyaee
+WorkingDirectory=%h/.openclaw/workspace/.deploy/ollama-inference-broker-current
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=MAINPC_MAC=2c:f0:5d:74:6a:44
 Environment=BROKER_BIND=127.0.0.1
