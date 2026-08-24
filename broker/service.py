@@ -124,8 +124,25 @@ class Broker:
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
         self.completed = threading.Condition(self.lock)
+        self._health_cache = {
+            "status": "starting", "resource": "mainpc-gpu", "queue_depth": 0,
+            "active_job_id": None, "timestamp": self.clock(),
+        }
         self._init_db()
         self.recover()
+
+    def _refresh_health_cache_locked(self) -> None:
+        queued = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0]
+        active = self.db.execute(
+            "SELECT id FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1"
+        ).fetchone()
+        self._health_cache = {
+            "status": "busy" if active else "ready",
+            "resource": "mainpc-gpu",
+            "queue_depth": queued,
+            "active_job_id": active["id"] if active else None,
+            "timestamp": self.clock(),
+        }
 
     def _init_db(self):
         with self.db:
@@ -256,8 +273,9 @@ class Broker:
         }, sort_keys=True))
 
     def recover(self):
-        # A prior process cannot own the remote GPU after its lease. Requeue stale
-        # work (rather than falsely claiming success) and retain cancellation.
+        # The remote outcome of an expired lease is ambiguous.  Do not submit it
+        # again automatically: failure releases the scheduler while preserving
+        # a durable request for an explicit, audited retry.
         now = self.clock()
         with self.lock, self.db:
             expired = list(self.db.execute(
@@ -277,19 +295,20 @@ class Broker:
                 self._audit(
                     "lease.expired", job_id=row["id"], source=row["source"],
                     attempt_no=attempt_no, from_state=row["state"],
-                    reason="broker restart found an expired lease", occurred=now,
+                    reason="expired lease; remote outcome is unknown", occurred=now,
                 )
                 self.db.execute(
-                    "UPDATE jobs SET state='queued',queued_at=?,started=NULL,"
-                    "lease_until=NULL,error='requeued after broker restart',"
-                    "requeue_count=requeue_count+1 WHERE id=?",
+                    "UPDATE jobs SET state='failed',finished=?,lease_until=NULL,"
+                    "error='lease expired; remote outcome unknown; explicit retry required' "
+                    "WHERE id=?",
                     (now, row["id"]),
                 )
                 self._audit(
-                    "job.requeued", job_id=row["id"], source=row["source"],
+                    "job.failed", job_id=row["id"], source=row["source"],
                     attempt_no=attempt_no, from_state=row["state"],
-                    to_state="queued", reason="expired lease recovery", occurred=now,
+                    to_state="failed", reason="expired lease recovery is fail-closed", occurred=now,
                 )
+            self._refresh_health_cache_locked()
             self.completed.notify_all()
 
     def submit(self, profile: str, kind: str, payload: dict, source: str | None = None,
@@ -364,6 +383,7 @@ class Broker:
                     "has_external_id": external_id is not None,
                 },
             )
+            self._refresh_health_cache_locked()
         return self.status(job_id)
 
     @staticmethod
@@ -431,6 +451,7 @@ class Broker:
                     attempt_no=row["attempt_count"] or None,
                     from_state="running", to_state="cancel_requested",
                 )
+            self._refresh_health_cache_locked()
             self.completed.notify_all()
         return self.status(job_id)
 
@@ -462,6 +483,7 @@ class Broker:
                 from_state=row["state"], to_state="queued",
                 reason="explicit retry", occurred=now,
             )
+            self._refresh_health_cache_locked()
             self.completed.notify_all()
         return self.status(job_id)
 
@@ -654,7 +676,14 @@ class Broker:
             if not row: return False
             now = self.clock()
             attempt_no = int(row["attempt_count"] or 0) + 1
-            lease_until = now + self.lease_seconds
+            # A lease covers the server-owned remote deadline, not just a
+            # scheduler tick.  That prevents a healthy VLM request from being
+            # recovered while its bounded executor call is still active.
+            lease_seconds = max(
+                float(self.lease_seconds),
+                float(PROFILES[row["profile"]].request_timeout_seconds) + 15.0,
+            )
+            lease_until = now + lease_seconds
             decision = dict(self._last_scheduler_decision or {})
             self.db.execute(
                 "UPDATE jobs SET state='running',started=?,lease_until=?,"
@@ -687,6 +716,7 @@ class Broker:
                     "ON CONFLICT(source) DO UPDATE SET next_allowed=excluded.next_allowed",
                     (row["source"], now + interval),
                 )
+            self._refresh_health_cache_locked()
         try:
             self._execute(row)
         except Exception as exc:
@@ -703,6 +733,7 @@ class Broker:
                     attempt_no=attempt_no, from_state="running", to_state="failed",
                     reason=str(exc), occurred=finished,
                 )
+                self._refresh_health_cache_locked()
                 self.completed.notify_all()
         return True
 
@@ -758,6 +789,7 @@ class Broker:
                 attempt_no=attempt_no, from_state=state, to_state=final,
                 reason=reason, occurred=finished,
             )
+            self._refresh_health_cache_locked()
             self.completed.notify_all()
 
     def wait_for_terminal(self, job_id: str, timeout_seconds: float) -> dict | None:
@@ -783,18 +815,14 @@ class Broker:
 
     def health(self) -> dict:
         """Return a local broker probe without waking or querying MAIN-PC."""
-        with self.lock:
-            queued = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0]
-            active = self.db.execute(
-                "SELECT * FROM jobs WHERE state IN ('running','cancel_requested')"
-            ).fetchone()
-        return {
-            "status": "busy" if active else "ready",
-            "resource": "mainpc-gpu",
-            "queue_depth": queued,
-            "active_job_id": active["id"] if active else None,
-            "timestamp": self.clock(),
-        }
+        # Keep the local probe responsive if a database mutation is slow.
+        if not self.lock.acquire(blocking=False):
+            return {**self._health_cache, "stale": True}
+        try:
+            self._refresh_health_cache_locked()
+            return dict(self._health_cache)
+        finally:
+            self.lock.release()
 
 
 class Dispatcher(threading.Thread):
@@ -821,5 +849,6 @@ class Dispatcher(threading.Thread):
             if policy is not None:
                 enabled = policy.enabled_sources()
                 allowed = enabled if enabled else frozenset()
+            self.broker.recover()
             self.broker.dispatch_once(allowed, policy)
             self.stop_event.wait(self.interval)

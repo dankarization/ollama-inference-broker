@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 import time
-import urllib.request
 
 
 class WakeOnLan:
@@ -30,11 +30,40 @@ class OllamaHTTP:
         self.timeout_seconds = timeout_seconds
 
     def _request(self, path: str, body: dict | None = None, timeout_seconds: float | None = None):
-        data = None if body is None else json.dumps(body).encode()
-        request = urllib.request.Request(self.base_url + path, data=data,
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=timeout_seconds or self.timeout_seconds) as response:
-            return json.loads(response.read() or b"{}")
+        """Make an executor request with an enforceable wall-clock deadline."""
+        timeout = float(timeout_seconds or self.timeout_seconds)
+        if timeout <= 0:
+            raise ValueError("Ollama request timeout must be positive")
+        command = [
+            "curl", "--silent", "--show-error", "--fail-with-body",
+            "--max-time", str(timeout),
+            "--connect-timeout", str(min(timeout, 30.0)),
+            "--header", "Content-Type: application/json",
+            "--request", "POST" if body is not None else "GET",
+            self.base_url + path,
+        ]
+        if body is not None:
+            command.extend(["--data-binary", "@-"])
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE if body is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        payload = None if body is None else json.dumps(body).encode()
+        try:
+            stdout, stderr = process.communicate(payload, timeout=timeout + 2.0)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            process.communicate()
+            raise TimeoutError(f"Ollama request exceeded {timeout:g}s deadline") from exc
+        if process.returncode != 0:
+            detail = stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(f"Ollama request failed (curl exit {process.returncode}): {detail[:300]}")
+        try:
+            return json.loads(stdout or b"{}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Ollama returned invalid JSON") from exc
 
     def ps(self) -> dict:
         return self._request("/api/ps")

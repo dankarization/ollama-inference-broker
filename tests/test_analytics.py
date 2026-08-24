@@ -144,7 +144,7 @@ class AnalyticsTests(unittest.TestCase):
         self.assertNotIn("item-42", logs)
         self.assertNotIn("external-7", logs)
 
-    def test_expired_lease_is_durably_requeued_across_restart(self):
+    def test_expired_lease_is_durably_failed_across_restart(self):
         fd, path = tempfile.mkstemp(suffix=".sqlite3")
         os.close(fd)
         self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
@@ -167,15 +167,16 @@ class AnalyticsTests(unittest.TestCase):
         clock.value = 200
         recovered = self.make(path=path, clock=clock)
         status = recovered.status(job_id)
-        self.assertEqual(status["state"], "queued")
-        self.assertEqual(status["requeue_count"], 1)
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["requeue_count"], 0)
+        self.assertIn("explicit retry required", status["error"])
         self.assertEqual(recovered.attempts(job_id)[0]["outcome"], "lease_expired")
         types = [event["event_type"] for event in recovered.audit_events(job_id=job_id)]
         self.assertIn("lease.expired", types)
-        self.assertIn("job.requeued", types)
+        self.assertIn("job.failed", types)
         recovered.db.close()
         restarted = self.make(path=path, clock=clock)
-        self.assertEqual(restarted.status(job_id)["requeue_count"], 1)
+        self.assertEqual(restarted.status(job_id)["state"], "failed")
 
     def test_lease_renewal_updates_attempt_and_audit(self):
         clock = MutableClock(100)

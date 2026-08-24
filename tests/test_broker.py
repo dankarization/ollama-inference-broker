@@ -180,15 +180,15 @@ class BrokerTests(unittest.TestCase):
         request=[x[2] for x in self.calls if isinstance(x,tuple) and x[0]=="run" and x[2].get("prompt")=="video"][0]
         self.assertEqual(request["model"], "nemotron3:33b")
         self.assertEqual(request["options"], {"num_ctx":16384,"num_predict":1024})
-    def test_cancel_queued_and_recover_expired_lease(self):
+    def test_cancel_queued_and_recover_expired_lease_fail_closed(self):
         b=self.make(["nemotron3:33b"])
         queued=b.submit("cron", "generate", {"prompt":"x"})["id"]
         self.assertEqual(b.cancel(queued)["state"], "cancelled")
         running=b.submit("interactive", "generate", {"prompt":"y"})["id"]
         with b.db: b.db.execute("UPDATE jobs SET state='running', lease_until=0 WHERE id=?", (running,))
         b.recover()
-        self.assertEqual(b.status(running)["state"], "queued")
-        b.dispatch_once(); self.assertEqual(b.status(running)["state"], "completed")
+        self.assertEqual(b.status(running)["state"], "failed")
+        self.assertIn("explicit retry required", b.status(running)["error"])
     def test_metrics_include_queue_and_vram_source(self):
         b=self.make(["nemotron3:33b"]); b.submit("cron", "generate", {"prompt":"x"})
         data=b.metrics(); self.assertEqual(data["resource"], "mainpc-gpu"); self.assertEqual(data["queue_depth"], 1); self.assertEqual(data["loaded_models"][0]["size_vram"], 1)
