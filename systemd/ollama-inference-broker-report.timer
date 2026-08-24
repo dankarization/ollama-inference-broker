@@ -1,0 +1,10 @@
+[Unit]
+Description=Run local-video broker status report after every closed hour
+
+[Timer]
+OnCalendar=*-*-* *:00:30 Asia/Tbilisi
+Persistent=true
+Unit=ollama-inference-broker-report.service
+
+[Install]
+WantedBy=timers.target

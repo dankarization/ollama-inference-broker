@@ -135,3 +135,44 @@ starvation (максимальный wait), actual-vs-expected share и смен
 БД, проверка новых GET endpoints, затем restart service в отдельном
 авторизованном окне. Откат к старому бинарнику безопасен: он игнорирует новые
 таблицы/колонки; удалять их при rollback не нужно.
+
+## Почасовой Telegram-статус очереди
+
+`ollama-inference-broker-report.timer` запускает отдельный one-shot процесс в
+`*:00:30 Asia/Tbilisi`. Каждый запуск формирует отчёт **строго за предыдущий
+закрытый wall-clock час** `[HH:00, HH+1:00)` в `Asia/Tbilisi` и отправляет его,
+включая нулевые часы. Текст имеет фиксированный русский шаблон: он читает
+`jobs`, `audit_events`, `job_attempts` и текущий `sources.json` непосредственно,
+показывает Shutterstock (`shutterstock-video`) и Olya (`olya-vision` +
+`olya-decision`), их эффективные веса/enablement/fixed priority, bounded IDs,
+через-hour terminal outcomes и persisted processing durations.
+
+Размеры файлов не выводятся: в broker SQLite отсутствует надёжное поле размера.
+Изменение очереди также не вычисляется без исторического snapshot. Health
+состоит только из `systemctl is-active`, локального `/healthz` и Ollama
+`/api/ps`; эти probes не посылают WOL и не запускают model inference.
+
+Доставка идёт через `openclaw message send`, поэтому Telegram credential не
+попадает в unit, argv приложения, SQLite или логи. Target/account/thread
+задаются только в reporter unit. `status_report_outbox` — additive durable
+outbox: подтверждённый Telegram `message_id` делает закрытый час идемпотентным.
+Pre-flight failure можно безопасно повторить. Если CLI timeout/error произошёл
+после начала отправки или не вернул `message_id`, исход delivery неоднозначен:
+outbox помечается `uncertain` и автоматически **не** отправляется повторно,
+чтобы не создать второй Telegram пост. Это намеренная граница exactly-once при
+отсутствии idempotency key у Telegram Bot API; оператор сначала сверяет target,
+а затем при необходимости меняет outbox вручную в отдельной авторизованной
+операции.
+
+Перед первым rollout обязателен согласованный SQLite backup, потому что
+`status_report_outbox` создаётся в production БД. Проверка:
+
+```bash
+systemctl --user enable --now ollama-inference-broker-report.timer
+systemctl --user start ollama-inference-broker-report.service
+systemctl --user status ollama-inference-broker-report.service --no-pager
+systemctl --user list-timers ollama-inference-broker-report.timer --all
+```
+
+В reporting path нет импорта `OllamaHTTP`, compatibility endpoints или
+`/api/generate`; regression test закрепляет это ограничение.
