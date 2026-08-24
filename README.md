@@ -20,6 +20,35 @@ KV cache и буферы генерации либо изображений. П�
                                                    WOL при dispatch задания
 ```
 
+```mermaid
+flowchart LR
+    classDef alwaysOn fill:#e3f2fd,stroke:#1976d2,color:#0d47a1
+    classDef wakeable fill:#fff3e0,stroke:#ef6c00,color:#e65100
+    classDef gpu fill:#fce4ec,stroke:#c2185b,color:#880e4f
+
+    subgraph HOST["Постоянный хост OpenClaw"]
+        broker["broker + SQLite WAL"]:::alwaysOn
+    end
+
+    jobs["Задания OpenClaw / M101"]
+    queue["очередь, policy, API"]:::alwaysOn
+    resource["resource: mainpc-gpu"]:::wakeable
+    wol["WOL при dispatch задания"]:::wakeable
+
+    subgraph MAINPC["MAIN-PC: executor (пробуждаемый)"]
+        ollama["Ollama"]:::wakeable
+        gpu["один GPU / VRAM"]:::gpu
+    end
+
+    jobs --> queue
+    broker --> queue
+    queue --> resource
+    resource -->|dispatch| wol
+    wol -.->|WOL| MAINPC
+    resource --> ollama
+    ollama --> gpu
+```
+
 Cloud-routed нагрузки, CPU-задачи и существующие GPU-workers Whisper остаются
 вне этого пути. Брокер запускается вне MAIN-PC, поэтому его очередь переживает
 WOL cycle; MAIN-PC не хранит состояние очереди.
