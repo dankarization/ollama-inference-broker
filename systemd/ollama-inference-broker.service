@@ -12,6 +12,9 @@ Environment=BROKER_PORT=8088
 Environment=BROKER_DB=%h/.local/state/ollama-inference-broker/broker.sqlite3
 Environment=OLLAMA_TIMEOUT_SECONDS=300
 Environment=BROKER_DISPATCH_ENABLED=true
+Environment=BROKER_SOURCES_POLICY=%h/.local/state/ollama-inference-broker/sources.json
+# Legacy allowlist is intentionally retained for policy-less rollback only.
+# With the policy above, dispatcher sources/weights are loaded at runtime.
 Environment=BROKER_DISPATCH_SOURCES=pilot-mainpc
 ExecStartPre=/usr/bin/mkdir -p %h/.local/state/ollama-inference-broker
 ExecStart=/usr/bin/python3 -m broker
