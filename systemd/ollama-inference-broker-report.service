@@ -13,7 +13,6 @@ Environment=BROKER_OLLAMA_URL=http://192.168.2.5:11434
 Environment=BROKER_REPORT_TELEGRAM_ACCOUNT=default
 Environment=BROKER_REPORT_TELEGRAM_TARGET=5775112073
 Environment=BROKER_REPORT_TELEGRAM_THREAD_ID=471305
-Environment=OPENCLAW_CLI=%h/.npm-global/bin/openclaw
 ExecStart=/usr/bin/python3 -m broker.status_reporter
 UMask=0077
 NoNewPrivileges=true

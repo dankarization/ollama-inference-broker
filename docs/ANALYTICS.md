@@ -141,28 +141,37 @@ starvation (максимальный wait), actual-vs-expected share и смен
 `ollama-inference-broker-report.timer` запускает отдельный one-shot процесс в
 `*:00:30 Asia/Tbilisi`. Каждый запуск формирует отчёт **строго за предыдущий
 закрытый wall-clock час** `[HH:00, HH+1:00)` в `Asia/Tbilisi` и отправляет его,
-включая нулевые часы. Текст имеет фиксированный русский шаблон: он читает
-`jobs`, `audit_events`, `job_attempts` и текущий `sources.json` непосредственно,
-показывает Shutterstock (`shutterstock-video`) и Olya (`olya-vision` +
-`olya-decision`), их эффективные веса/enablement/fixed priority, bounded IDs,
-через-hour terminal outcomes и persisted processing durations.
+включая нулевые часы. Текст имеет короткий фиксированный русский HTML-шаблон:
+он читает `jobs`, `audit_events` и текущий `sources.json` непосредственно.
+`<tg-time>` даёт нативные активные Telegram даты/время; динамические
+идентификаторы HTML-экранируются и ограничены тремя компактными значениями.
 
-Размеры файлов не выводятся: в broker SQLite отсутствует надёжное поле размера.
-Изменение очереди также не вычисляется без исторического snapshot. Health
-состоит только из `systemctl is-active`, локального `/healthz` и Ollama
-`/api/ps`; эти probes не посылают WOL и не запускают model inference.
+В отчёте есть только одна операторская шкала: **приоритет 1–10** (1 выше, 10
+ниже): Shutterstock 3, Olya Vision 8, Olya Decision 6. Это представление
+текущих чисел source policy, а не второй конфигурационный параметр. Внутри
+broker эти числа по-прежнему являются коэффициентами существующего weighted
+round-robin между source (при заполненных очередях 3:8:6); отдельный job
+priority упорядочивает задачи *внутри* выбранного source. Менять эту семантику
+в reporting rollout нельзя: это потребовало бы отдельной миграции allocation и
+проверки throughput. Поэтому отчёт не печатает внутренние weight/job-priority и
+не меняет scheduler.
 
-Доставка идёт через `openclaw message send`, поэтому Telegram credential не
-попадает в unit, argv приложения, SQLite или логи. Target/account/thread
-задаются только в reporter unit. `status_report_outbox` — additive durable
-outbox: подтверждённый Telegram `message_id` делает закрытый час идемпотентным.
-Pre-flight failure можно безопасно повторить. Если CLI timeout/error произошёл
-после начала отправки или не вернул `message_id`, исход delivery неоднозначен:
-outbox помечается `uncertain` и автоматически **не** отправляется повторно,
-чтобы не создать второй Telegram пост. Это намеренная граница exactly-once при
-отсутствии idempotency key у Telegram Bot API; оператор сначала сверяет target,
-а затем при необходимости меняет outbox вручную в отдельной авторизованной
-операции.
+Размеры файлов и queue delta не выводятся: в broker SQLite нет надёжного
+поля размера и почасового baseline snapshot. Health состоит только из
+`systemctl is-active`, локального `/healthz` и Ollama `/api/ps`; эти probes не
+посылают WOL и не запускают model inference.
+
+Доставка следует используемой Airfare monitor схеме Telegram Bot API:
+`parse_mode=HTML`, `message_thread_id` и `disable_web_page_preview=true`.
+Учётная запись читается из локальной OpenClaw configuration внутри процесса;
+credential не попадает в unit, argv приложения, SQLite или логи. Target,
+account и thread задаются только в reporter unit. `status_report_outbox` —
+additive durable outbox: подтверждённый Telegram `message_id` делает закрытый
+час идемпотентным. `status_report_manual_outbox` отделяет явно авторизованный
+ручной resend (`--manual-key`) от hourly dedupe. Pre-flight failure можно
+безопасно повторить. Ошибка сети после начала HTTP-запроса помечается
+`uncertain` и автоматически **не** повторяется, чтобы не создать второй пост
+без idempotency key Telegram Bot API.
 
 Перед первым rollout обязателен согласованный SQLite backup, потому что
 `status_report_outbox` создаётся в production БД. Проверка:

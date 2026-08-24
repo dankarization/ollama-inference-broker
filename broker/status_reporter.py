@@ -1,13 +1,15 @@
 """Deterministic, non-LLM hourly status report for the local-video broker.
 
-This module deliberately reads the broker SQLite database and runtime policy
-directly.  It never imports the inference adapter and never calls an Ollama
-generation endpoint.  Delivery goes through the existing OpenClaw CLI so the
-Telegram credential remains in OpenClaw's secret store/configuration.
+The report reads broker SQLite and the live source policy directly.  Its
+Telegram transport follows the local Airfare monitor convention: Telegram Bot
+API with HTML parse mode and the configured OpenClaw account credential.  It
+never imports inference code or requests model generation.
 """
 from __future__ import annotations
 
 import argparse
+import html
+import http.client
 import json
 import os
 import sqlite3
@@ -20,17 +22,15 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
-
-from .profiles import FIXED_SOURCE_PRIORITIES
-
 
 TBILISI = ZoneInfo("Asia/Tbilisi")
 REPORT_SOURCES = {
     "Shutterstock": ("shutterstock-video",),
     "Olya": ("olya-vision", "olya-decision"),
 }
-MAX_IDENTIFIERS = 6
+MAX_IDENTIFIERS = 3
 
 
 @dataclass(frozen=True)
@@ -76,6 +76,18 @@ def _ensure_outbox(db: sqlite3.Connection) -> None:
         message_id TEXT,
         error TEXT
     )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS status_report_manual_outbox (
+        manual_key TEXT PRIMARY KEY,
+        interval_start TEXT NOT NULL,
+        interval_end TEXT NOT NULL,
+        report_text TEXT NOT NULL,
+        state TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created REAL NOT NULL,
+        updated REAL NOT NULL,
+        message_id TEXT,
+        error TEXT
+    )""")
 
 
 def _policy(path: str | Path | None) -> dict[str, dict[str, Any]]:
@@ -107,34 +119,38 @@ def _identifier(row: sqlite3.Row) -> str:
     return str(row["external_id"] or row["source_item_id"] or row["id"])
 
 
+def _compact_identifier(value: str) -> str:
+    """Use a human-useful, bounded identifier without exposing full UUIDs."""
+    marker = value.rfind("asset:")
+    if marker >= 0:
+        return value[marker:marker + 40]
+    if len(value) > 12:
+        return "…" + value[-8:]
+    return value
+
+
 def _bounded_identifiers(rows: list[sqlite3.Row]) -> str:
-    values = [_identifier(row) for row in rows]
+    values = [_compact_identifier(_identifier(row)) for row in rows]
     shown = values[:MAX_IDENTIFIERS]
-    text = ", ".join(shown) if shown else "—"
+    text = ", ".join(f"<code>{html.escape(value)}</code>" for value in shown) if shown else ""
     if len(values) > len(shown):
         text += f" …(+{len(values) - len(shown)})"
     return text
 
 
-def _age(seconds: float | None) -> str:
-    if seconds is None:
-        return "—"
-    rounded = max(0, int(seconds))
-    if rounded < 60:
-        return f"{rounded} с"
-    if rounded < 3_600:
-        return f"{rounded // 60} мин"
-    return f"{rounded // 3_600} ч {(rounded % 3_600) // 60} мин"
+def _tg_time(value: datetime, display: str) -> str:
+    return f'<tg-time unix="{int(value.timestamp())}" format="">{display}</tg-time>'
 
 
-def _duration(values: list[float]) -> str:
-    if not values:
+def _public_priority(policy: dict[str, dict[str, Any]], source: str) -> str:
+    """Return the single operator-facing 1--10 scale from current policy."""
+    configured = policy.get(source)
+    if configured is None or not configured["enabled"]:
         return "н/д"
-    ordered = sorted(values)
-    p50 = ordered[(len(ordered) - 1) // 2]
-    p95 = ordered[min(len(ordered) - 1, (95 * len(ordered) + 99) // 100 - 1)]
-    average = sum(ordered) / len(ordered)
-    return f"ср {average:.1f} с / p50 {p50:.1f} с / p95 {p95:.1f} с"
+    value = configured["weight"]
+    if not 1 <= value <= 10:
+        return "н/д"
+    return f"{value:g}/10"
 
 
 def _probe_url(url: str, timeout: float = 2.0) -> bool:
@@ -179,11 +195,12 @@ def build_report(
     """Render one fixed Russian report from persisted state only."""
     generated = generated_at.astimezone(TBILISI)
     start_ts, end_ts = interval.start.timestamp(), interval.end.timestamp()
-    now_ts = generated.timestamp()
     parts = [
-        "Статус локальной video-очереди",
-        f"Закрытый час (Asia/Tbilisi): {interval.start:%d.%m.%Y %H:00}–{interval.end:%H:00}",
-        f"Снимок сформирован: {generated:%d.%m.%Y %H:%M:%S %Z}",
+        "📼 <b>Локальная video-очередь</b>",
+        "<i>Закрытый час, Asia/Tbilisi:</i> "
+        f"{_tg_time(interval.start, interval.start.strftime('%d.%m %H:00'))}–"
+        f"{_tg_time(interval.end, interval.end.strftime('%H:00'))}",
+        f"Снимок: {_tg_time(generated, generated.strftime('%d.%m.%Y %H:%M:%S'))}",
     ]
     producer_completed: dict[str, int] = {}
 
@@ -207,126 +224,122 @@ def build_report(
             "AND state='queued' ORDER BY priority,created,id",
             values,
         ))
-        oldest = db.execute(
-            f"SELECT min(queued_at) FROM jobs WHERE source IN ({placeholders}) AND state='queued'",
-            values,
-        ).fetchone()[0]
         terminal = dict(db.execute(
             f"SELECT event_type,count(*) AS n FROM audit_events WHERE source IN ({placeholders}) "
             "AND occurred>=? AND occurred<? AND event_type IN ('job.completed','job.failed','job.cancelled','lease.expired','job.requeued') GROUP BY event_type",
             (*values, start_ts, end_ts),
         ))
-        completed_rows = list(db.execute(
-            f"SELECT j.id,j.source_item_id,j.external_id FROM audit_events e JOIN jobs j ON j.id=e.job_id "
-            f"WHERE e.source IN ({placeholders}) AND e.occurred>=? AND e.occurred<? "
-            "AND e.event_type='job.completed' ORDER BY e.occurred,j.id",
-            (*values, start_ts, end_ts),
-        ))
-        failed_rows = list(db.execute(
-            f"SELECT j.id,j.source_item_id,j.external_id FROM audit_events e JOIN jobs j ON j.id=e.job_id "
-            f"WHERE e.source IN ({placeholders}) AND e.occurred>=? AND e.occurred<? "
-            "AND e.event_type='job.failed' ORDER BY e.occurred,j.id",
-            (*values, start_ts, end_ts),
-        ))
-        durations = [row[0] for row in db.execute(
-            f"SELECT finished-started FROM job_attempts WHERE source IN ({placeholders}) "
-            "AND finished>=? AND finished<? AND outcome='completed' AND started IS NOT NULL",
-            (*values, start_ts, end_ts),
-        ) if row[0] is not None]
         completed = int(terminal.get("job.completed", 0))
         producer_completed[producer] = completed
-
-        lanes = []
-        for source in sources:
-            configured = policy.get(source)
-            if configured is None:
-                lanes.append(f"{source}: выключен/не задан, приоритет {FIXED_SOURCE_PRIORITIES.get(source, 'н/д')}")
-            else:
-                state = "включен" if configured["enabled"] else "выключен"
-                lanes.append(
-                    f"{source}: вес {configured['weight']:g}, {state}, приоритет {FIXED_SOURCE_PRIORITIES.get(source, 'н/д')}"
-                )
+        if producer == "Shutterstock":
+            priority = _public_priority(policy, "shutterstock-video")
+            priority_line = f"<b>Приоритет {priority}</b>"
+        else:
+            priority_line = (
+                "<b>Приоритет: Vision " + _public_priority(policy, "olya-vision")
+                + " · Decision " + _public_priority(policy, "olya-decision") + "</b>"
+            )
+        identifiers = _bounded_identifiers(active_rows)
+        identifier_label = "Активно"
+        if not identifiers:
+            identifiers = _bounded_identifiers(queued_rows)
+            identifier_label = "Очередь"
+        identifier_line = f"\n{identifier_label}: {identifiers}" if identifiers else ""
         parts.extend((
             "",
-            f"{producer}",
-            "Планировщик: " + "; ".join(lanes),
+            f"<u>{producer}</u> · {priority_line}",
             "Сейчас: "
-            f"в очереди {current.get('queued', 0)}; в работе/lease {current.get('running', 0) + current.get('cancel_requested', 0)}; "
-            f"повтор/отложено {retry_queued}/0; terminal failed/dead {current.get('failed', 0)}/0; отменено {current.get('cancelled', 0)}.",
-            f"Активные: {_bounded_identifiers(active_rows)}.",
-            f"Очередь: {_bounded_identifiers(queued_rows)}; самый старый: {_age(now_ts - oldest if oldest is not None else None)}.",
-            "За закрытый час: "
-            f"завершено {completed}; failed {terminal.get('job.failed', 0)}; lease-expired {terminal.get('lease.expired', 0)}; "
-            f"requeue {terminal.get('job.requeued', 0)}; отменено {terminal.get('job.cancelled', 0)}.",
-            f"Длительность обработки (completed): {_duration(durations)}.",
-            f"Прошли: {_bounded_identifiers(completed_rows)}.",
-            f"Ошибки: {_bounded_identifiers(failed_rows)}.",
+            f"очередь {current.get('queued', 0)} · в работе {current.get('running', 0) + current.get('cancel_requested', 0)} "
+            f"· повтор {retry_queued} · ошибки {current.get('failed', 0)}",
+            f"Час: завершено {completed} · ошибок {terminal.get('job.failed', 0)} "
+            f"· lease-expired {terminal.get('lease.expired', 0)}" + identifier_line,
         ))
 
     total_completed = sum(producer_completed.values())
-    shares = "; ".join(
-        f"{name} {producer_completed[name]}/{total_completed} "
-        f"({(100 * producer_completed[name] / total_completed) if total_completed else 0:.1f}%)"
-        for name in REPORT_SOURCES
-    )
     all_placeholders, all_sources = _source_clause(source for sources in REPORT_SOURCES.values() for source in sources)
     current_queued = db.execute(
         f"SELECT count(*) FROM jobs WHERE source IN ({all_placeholders}) AND state='queued'", all_sources
     ).fetchone()[0]
     parts.extend((
         "",
-        "Итого",
-        f"Пропускная способность: {total_completed} completed/ч. Фактическая доля completed: {shares}.",
-        f"Текущая очередь по этим producer: {current_queued}. Δ очереди: не определяется (почасовой snapshot не хранится).",
-        "Размеры файлов: не показаны — в broker DB не хранятся надёжно.",
+        "<b>Итого</b>: "
+        f"{total_completed} completed/ч · очередь {current_queued}",
         "Здоровье: "
-        f"broker-service {'OK' if health['broker_service'] else 'FAIL'}; "
-        f"broker-HTTP {'OK' if health['broker_http'] else 'FAIL'}; "
-        f"Ollama /api/ps {'OK' if health['ollama_http'] else 'FAIL'}.",
-        "Источник: SQLite jobs/audit_events/job_attempts + sources.json + локальные health probes. LLM/генерация текста не используются.",
+        f"service {'✓' if health['broker_service'] else '✕'} · "
+        f"broker {'✓' if health['broker_http'] else '✕'} · "
+        f"Ollama {'✓' if health['ollama_http'] else '✕'}",
     ))
     return "\n".join(parts)
 
 
-def _extract_message_id(output: str) -> str | None:
+def _telegram_account() -> tuple[str, str]:
+    """Read only the selected Telegram account; never log its credential."""
+    config_path = Path(os.environ.get("OPENCLAW_CONFIG_PATH", Path.home() / ".openclaw" / "openclaw.json"))
+    account_name = os.environ.get("BROKER_REPORT_TELEGRAM_ACCOUNT", "default")
     try:
-        parsed = json.loads(output)
-    except ValueError:
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    for key in ("messageId", "message_id"):
-        if parsed.get(key) not in (None, ""):
-            return str(parsed[key])
-    result = parsed.get("result")
-    if isinstance(result, dict):
-        for key in ("messageId", "message_id"):
-            if result.get(key) not in (None, ""):
-                return str(result[key])
-    return None
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        telegram = config["channels"]["telegram"]
+        account = telegram["accounts"][account_name]
+        token = account.get("botToken") or account.get("token")
+        api_root = account.get("apiRoot") or telegram.get("apiRoot") or "https://api.telegram.org"
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise DeliveryError("Telegram account configuration is unavailable", retryable=True) from exc
+    if not isinstance(token, str) or not token or not isinstance(api_root, str) or not api_root:
+        raise DeliveryError("Telegram account configuration is incomplete", retryable=True)
+    return token, api_root.rstrip("/")
 
 
-def deliver_via_openclaw(text: str) -> str:
-    """Deliver through OpenClaw; a started CLI call is ambiguity-safe, not retried."""
+def _multipart(fields: dict[str, str]) -> tuple[bytes, str]:
+    boundary = "----broker-status-report-boundary"
+    body = bytearray()
+    for name, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        body.extend(value.encode("utf-8"))
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode())
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+def deliver_via_telegram_html(text: str) -> str:
+    """Send HTML in the same Telegram Bot API shape as the Airfare monitor."""
     target = os.environ["BROKER_REPORT_TELEGRAM_TARGET"]
     thread_id = os.environ["BROKER_REPORT_TELEGRAM_THREAD_ID"]
-    account = os.environ.get("BROKER_REPORT_TELEGRAM_ACCOUNT", "default")
-    command = [
-        os.environ.get("OPENCLAW_CLI", "openclaw"), "message", "send", "--channel", "telegram", "--account", account,
-        "--target", target, "--thread-id", thread_id, "--message", text, "--json",
-    ]
+    token, api_root = _telegram_account()
+    parsed = urlsplit(api_root)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise DeliveryError("Telegram API endpoint configuration is invalid", retryable=True)
+    body, content_type = _multipart({
+        "chat_id": target,
+        "message_thread_id": thread_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    })
+    path = f"{parsed.path.rstrip('/')}/bot{quote(token, safe=':-_')}/sendMessage"
+    connection: http.client.HTTPConnection
+    connection = (http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection)(
+        parsed.hostname, parsed.port, timeout=45,
+    )
     try:
-        completed = subprocess.run(command, check=False, text=True, capture_output=True, timeout=45)
-    except OSError as exc:
-        raise DeliveryError("OpenClaw CLI is unavailable before delivery", retryable=True) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise DeliveryError("delivery outcome unknown after OpenClaw timeout", retryable=False) from exc
-    if completed.returncode != 0:
-        raise DeliveryError("delivery outcome unknown after OpenClaw error", retryable=False)
-    message_id = _extract_message_id(completed.stdout)
-    if message_id is None:
-        raise DeliveryError("delivery outcome unknown: OpenClaw returned no message id", retryable=False)
-    return message_id
+        connection.request("POST", path, body=body, headers={"Content-Type": content_type, "Content-Length": str(len(body))})
+        response = connection.getresponse()
+        payload = response.read()
+    except (OSError, http.client.HTTPException) as exc:
+        raise DeliveryError("Telegram delivery outcome is unknown", retryable=False) from exc
+    finally:
+        connection.close()
+    try:
+        parsed_payload = json.loads(payload)
+    except ValueError as exc:
+        raise DeliveryError("Telegram delivery outcome is unknown", retryable=False) from exc
+    if response.status < 200 or response.status >= 300 or not isinstance(parsed_payload, dict) or not parsed_payload.get("ok"):
+        raise DeliveryError("Telegram rejected the report before delivery", retryable=True)
+    result = parsed_payload.get("result")
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+    if message_id in (None, ""):
+        raise DeliveryError("Telegram delivery outcome is unknown", retryable=False)
+    return str(message_id)
 
 
 def run_report(
@@ -335,8 +348,9 @@ def run_report(
     interval: ClosedHour | None = None,
     now: datetime | None = None,
     policy_path: str | Path | None = None,
-    delivery: Callable[[str], str] = deliver_via_openclaw,
+    delivery: Callable[[str], str] = deliver_via_telegram_html,
     health: dict[str, bool] | None = None,
+    manual_key: str | None = None,
 ) -> dict[str, Any]:
     """Persist one hourly outbox item and deliver it at most once when known."""
     generated = (now or datetime.now(TBILISI)).astimezone(TBILISI)
@@ -347,9 +361,11 @@ def run_report(
         db.commit()
         timestamp = time.time()
         db.execute("BEGIN IMMEDIATE")
+        table = "status_report_manual_outbox" if manual_key else "status_report_outbox"
+        key_column = "manual_key" if manual_key else "interval_start"
+        key = manual_key or closed.key
         row = db.execute(
-            "SELECT report_text,state,attempts,message_id FROM status_report_outbox WHERE interval_start=?",
-            (closed.key,),
+            f"SELECT report_text,state,attempts,message_id FROM {table} WHERE {key_column}=?", (key,)
         ).fetchone()
         if row is not None and row["state"] == "sent":
             db.commit()
@@ -362,30 +378,37 @@ def run_report(
                 db, closed, generated_at=generated, policy=_policy(policy_path),
                 health=health if health is not None else health_snapshot(),
             )
-            db.execute(
-                "INSERT INTO status_report_outbox(interval_start,interval_end,report_text,state,attempts,created,updated) "
-                "VALUES(?,?,?,'sending',1,?,?)",
-                (closed.key, closed.end.isoformat(), report_text, timestamp, timestamp),
-            )
+            if manual_key:
+                db.execute(
+                    "INSERT INTO status_report_manual_outbox(manual_key,interval_start,interval_end,report_text,state,attempts,created,updated) "
+                    "VALUES(?,?,?,?, 'sending',1,?,?)",
+                    (manual_key, closed.key, closed.end.isoformat(), report_text, timestamp, timestamp),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO status_report_outbox(interval_start,interval_end,report_text,state,attempts,created,updated) "
+                    "VALUES(?,?,?,'sending',1,?,?)",
+                    (closed.key, closed.end.isoformat(), report_text, timestamp, timestamp),
+                )
         else:
             report_text = row["report_text"]
             db.execute(
-                "UPDATE status_report_outbox SET state='sending',attempts=attempts+1,updated=?,error=NULL WHERE interval_start=?",
-                (timestamp, closed.key),
+                f"UPDATE {table} SET state='sending',attempts=attempts+1,updated=?,error=NULL WHERE {key_column}=?",
+                (timestamp, key),
             )
         db.commit()
         try:
             message_id = delivery(report_text)
         except DeliveryError as exc:
             db.execute(
-                "UPDATE status_report_outbox SET state=?,updated=?,error=? WHERE interval_start=?",
-                ("failed" if exc.retryable else "uncertain", time.time(), str(exc)[:300], closed.key),
+                f"UPDATE {table} SET state=?,updated=?,error=? WHERE {key_column}=?",
+                ("failed" if exc.retryable else "uncertain", time.time(), str(exc)[:300], key),
             )
             db.commit()
             return {"state": "failed" if exc.retryable else "uncertain", "message_id": None, "text": report_text}
         db.execute(
-            "UPDATE status_report_outbox SET state='sent',message_id=?,updated=?,error=NULL WHERE interval_start=?",
-            (message_id, time.time(), closed.key),
+            f"UPDATE {table} SET state='sent',message_id=?,updated=?,error=NULL WHERE {key_column}=?",
+            (message_id, time.time(), key),
         )
         db.commit()
         return {"state": "sent", "message_id": message_id, "text": report_text}
@@ -397,8 +420,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", default=os.environ.get("BROKER_DB", "broker.sqlite3"))
     parser.add_argument("--policy", default=os.environ.get("BROKER_SOURCES_POLICY"))
+    parser.add_argument("--manual-key", help="one authorized manual resend key; does not affect hourly dedupe")
     args = parser.parse_args()
-    result = run_report(args.database, policy_path=args.policy)
+    result = run_report(args.database, policy_path=args.policy, manual_key=args.manual_key)
     # Keep structured service logs payload-free; the durable outbox retains the
     # exact rendered text for an authorized operational inspection.
     print(json.dumps({key: result[key] for key in ("state", "message_id")}, ensure_ascii=False, sort_keys=True))
