@@ -8,7 +8,7 @@
 - [x] Определены API broker, workload profiles, server-owned priority classes,
   отмена и локальная SQLite WAL очередь.
 - [x] Зафиксирована политика: `interactive` — 1, `cron` — 2,
-  `shutterstock-video` — 5, `olya` — 8. Меньшее число означает более высокий
+  `shutterstock-video` — 3, `olya` — 8. Меньшее число означает более высокий
   приоритет; Shutterstock photo остаётся cloud/OmniRoute вне broker, а другие
   источники передают целое число от 1 до 10.
 - [ ] Инвентаризация всех прямых callers локального Ollama, владельцев их
@@ -24,7 +24,7 @@
 - [x] Server-owned profile limits, readiness check, controlled unload/switch и
   ограниченный keepalive в коде broker.
 - [x] Отделён local-GPU профиль `shutterstock-video` (`nemotron3:33b`,
-  приоритет 5) от cloud Shutterstock photo: фото не имеет broker profile и не
+  приоритет 3) от cloud Shutterstock photo: фото не имеет broker profile и не
   может получить MAIN-PC GPU.
 - [x] Локальный `GET /healthz`: состояние очереди и активной lease без WOL,
   запроса к MAIN-PC или обращения к Ollama.

@@ -120,7 +120,7 @@ audit/attempt history. `POST /v1/jobs` опционально принимает
 | --- | ---: |
 | Интерактивная сессия OpenClaw (`interactive`) | 1 |
 | OpenClaw cron (`cron`) | 2 |
-| Локальное Shutterstock video (`shutterstock-video`) | 5 |
+| Локальное Shutterstock video (`shutterstock-video`) | 3 |
 | Изолированный VLM canary (`shutterstock-canary`) | 5 |
 | Olya (`olya`) | 8 |
 
@@ -130,7 +130,7 @@ audit/attempt history. `POST /v1/jobs` опционально принимает
 `qwen3-vl:30b` с максимум четырьмя изображениями, суммарно 8 MiB decoded,
 JSON Schema до 16 KiB, concurrency `1`, не чаще одного job в 60 секунд и
 server-side timeout 300 секунд. `shutterstock-video` — отдельный локальный workload на
-`nemotron3:33b`; только он получает приоритет 5. Ключ `olya` — только имя
+`nemotron3:33b`; только он получает приоритет 3. Ключ `olya` — только имя
 источника, а не интеграция. Эти четыре значения
 принадлежат broker: caller может не передавать `priority` либо повторить
 фиксированное значение, но не может его переопределить. Остальные источники

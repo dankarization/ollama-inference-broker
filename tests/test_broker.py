@@ -82,7 +82,7 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(b.submit("interactive", "generate", {"prompt":"x"})["priority"], 1)
         self.assertEqual(b.submit("cron", "generate", {"prompt":"x"})["priority"], 2)
         video = b.submit("shutterstock-video", "generate", {"prompt":"x"})
-        self.assertEqual(video["priority"], 5)
+        self.assertEqual(video["priority"], 3)
         self.assertEqual(video["profile"], "shutterstock-video")
         with self.assertRaisesRegex(ValueError, "unknown profile"):
             b.submit("shutterstock", "generate", {"prompt":"photo"})
@@ -328,7 +328,7 @@ class WeightedDispatchTests(unittest.TestCase):
         video_id = b.submit("shutterstock-video", "generate", {"prompt": "v"})["id"]
         interactive_id = b.submit("interactive", "generate", {"prompt": "i"})["id"]
         b.dispatch_once()
-        # interactive has priority 1 and must win over video priority 5.
+        # interactive has priority 1 and must win over video priority 3.
         self.assertEqual(b.status(interactive_id)["state"], "completed")
         self.assertEqual(b.status(video_id)["state"], "queued")
 
@@ -345,7 +345,7 @@ class VideoEndpointTests(unittest.TestCase):
             "format": {"type": "object"},
         })
         self.assertEqual(job["source"], "shutterstock-video")
-        self.assertEqual(job["priority"], 5)
+        self.assertEqual(job["priority"], 3)
         b.dispatch_once()
         self.assertEqual(b.status(job["id"])["state"], "completed")
         request = [x[2] for x in self.calls if isinstance(x, tuple) and x[0] == "run" and "classify" in x[2].get("prompt", "")]

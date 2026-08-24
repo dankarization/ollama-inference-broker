@@ -41,7 +41,9 @@ class StatusReporterTests(unittest.TestCase):
         self.start = datetime(2026, 8, 24, 12, 0, tzinfo=TBILISI)
         self.interval = previous_closed_hour(datetime(2026, 8, 24, 13, 10, tzinfo=TBILISI))
         self.policy = {
-            "shutterstock-video": {"enabled": True, "weight": 3.0},
+            # Source policy weights are scheduler-private and deliberately do
+            # not define the operator-facing broker priority.
+            "shutterstock-video": {"enabled": True, "weight": 9.0},
             "olya-vision": {"enabled": True, "weight": 8.0},
             "olya-decision": {"enabled": True, "weight": 6.0},
         }

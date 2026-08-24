@@ -147,14 +147,12 @@ starvation (максимальный wait), actual-vs-expected share и смен
 идентификаторы HTML-экранируются и ограничены тремя компактными значениями.
 
 В отчёте есть только одна операторская шкала: **приоритет 1–10** (1 выше, 10
-ниже): Shutterstock 3, Olya Vision 8, Olya Decision 6. Это представление
-текущих чисел source policy, а не второй конфигурационный параметр. Внутри
-broker эти числа по-прежнему являются коэффициентами существующего weighted
-round-robin между source (при заполненных очередях 3:8:6); отдельный job
-priority упорядочивает задачи *внутри* выбранного source. Менять эту семантику
-в reporting rollout нельзя: это потребовало бы отдельной миграции allocation и
-проверки throughput. Поэтому отчёт не печатает внутренние weight/job-priority и
-не меняет scheduler.
+ниже): Shutterstock 3, Olya Vision 8, Olya Decision 6. Это фактический
+server-owned `job.priority`, а не число из source policy. Внутри broker
+runtime policy всё ещё хранит отдельные private weights для weighted
+round-robin между sources; priority упорядочивает jobs *внутри* выбранного
+source. Репорт их не печатает, а это изменение не меняет текущие weights,
+allocation или throughput.
 
 Размеры файлов и queue delta не выводятся: в broker SQLite нет надёжного
 поля размера и почасового baseline snapshot. Health состоит только из

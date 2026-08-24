@@ -25,6 +25,8 @@ from typing import Any, Callable, Iterable
 from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
+from .profiles import FIXED_SOURCE_PRIORITIES
+
 TBILISI = ZoneInfo("Asia/Tbilisi")
 REPORT_SOURCES = {
     "Shutterstock": ("shutterstock-video",),
@@ -143,14 +145,14 @@ def _tg_time(value: datetime, display: str) -> str:
 
 
 def _public_priority(policy: dict[str, dict[str, Any]], source: str) -> str:
-    """Return the single operator-facing 1--10 scale from current policy."""
+    """Return the source's actual broker job priority on the public 1--10 scale."""
     configured = policy.get(source)
     if configured is None or not configured["enabled"]:
         return "н/д"
-    value = configured["weight"]
-    if not 1 <= value <= 10:
+    value = FIXED_SOURCE_PRIORITIES.get(source)
+    if value is None:
         return "н/д"
-    return f"{value:g}/10"
+    return f"{value}/10"
 
 
 def _probe_url(url: str, timeout: float = 2.0) -> bool:

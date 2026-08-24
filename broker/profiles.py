@@ -67,7 +67,7 @@ PROFILES = {
 FIXED_SOURCE_PRIORITIES = {
     "interactive": 1,  # OpenClaw interactive/open session
     "cron": 2,         # OpenClaw cron
-    "shutterstock-video": 5,
+    "shutterstock-video": 3,
     "olya": 8,
     "olya-vision": 8,
     "olya-decision": 6,
