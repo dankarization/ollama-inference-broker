@@ -93,7 +93,7 @@ class StatusReporterTests(unittest.TestCase):
         self.assertEqual(interval.end.strftime("%H:%M"), "09:00")
         self.assertEqual(interval.key, "2026-08-24T08:00:00+0400")
 
-    def test_concise_priority_scale_and_closed_hour_breakdown(self):
+    def test_exact_html_presentation_contract(self):
         self.add_job("stock-ok", "shutterstock-video", "completed", started_offset=10, finished_offset=30)
         self.add_job("olya-v-ok", "olya-vision", "completed", started_offset=20, finished_offset=50)
         self.add_job("olya-d-fail", "olya-decision", "failed", started_offset=25, finished_offset=55)
@@ -102,22 +102,36 @@ class StatusReporterTests(unittest.TestCase):
             (self.start.timestamp() + 56, "lease.expired", "olya-d-fail", "olya-decision"),
         )
         text = self.report()
-        self.assertIn("<u>Shutterstock</u> · <b>Приоритет 3/10</b>", text)
-        self.assertIn("<u>Olya</u> · <b>Приоритет: Vision 8/10 · Decision 6/10</b>", text)
-        self.assertIn("Час: завершено 1 · ошибок 0 · lease-expired 0", text)
-        self.assertIn("Час: завершено 1 · ошибок 1 · lease-expired 1", text)
-        self.assertIn("<b>Итого</b>: 2 completed/ч", text)
+        self.assertEqual(text, "\n".join((
+            "📼 <b>Локальная очередь</b>",
+            '<b><i>Закрытый час</i></b>: <tg-time unix="1787558400" format="">12:00</tg-time>–<tg-time unix="1787562000" format="">13:00</tg-time>',
+            'Снимок: <tg-time unix="1787562600" format="">24.08.2026 13:10:00</tg-time>',
+            "",
+            "<u>Shutterstock</u> · <b>Приоритет 3/10</b>",
+            "Сейчас: очередь 0 · в работе 0 · повтор 0 · ошибки 0",
+            "<b><u>Час: завершено 1 · ошибок 0 · lease-expired 0</u></b>",
+            "",
+            "<u>Olya</u> · <b>Приоритет: Vision 8/10 · Decision 6/10</b>",
+            "Сейчас: очередь 0 · в работе 0 · повтор 0 · ошибки 1",
+            "<b><u>Час: завершено 1 · ошибок 1 · lease-expired 1</u></b>",
+            "",
+            "<b><u>Итого: 2 completed/ч · очередь 0</u></b>",
+            "Здоровье: service ✓ · broker ✓ · Ollama ✓",
+        )))
         self.assertNotIn("вес", text.lower())
         self.assertNotIn("p95", text)
+        self.assertNotIn("video-очередь", text)
         self.assertLess(len(text), 1_100)
 
     def test_zero_hour_is_rendered_with_zero_counts_and_active_timestamps(self):
         text = self.report()
-        self.assertIn("Час: завершено 0 · ошибок 0 · lease-expired 0", text)
-        self.assertIn("<b>Итого</b>: 0 completed/ч", text)
-        self.assertIn('<tg-time unix="1787558400" format="">24.08 12:00</tg-time>', text)
+        self.assertIn("<b><u>Час: завершено 0 · ошибок 0 · lease-expired 0</u></b>", text)
+        self.assertIn("<b><u>Итого: 0 completed/ч · очередь 0</u></b>", text)
+        self.assertIn('<tg-time unix="1787558400" format="">12:00</tg-time>', text)
         self.assertIn('<tg-time unix="1787562000" format="">13:00</tg-time>', text)
-        self.assertIn("<i>Закрытый час, Asia/Tbilisi:</i>", text)
+        self.assertIn('<b><i>Закрытый час</i></b>:', text)
+        self.assertIn('<tg-time unix="1787562600" format="">24.08.2026 13:10:00</tg-time>', text)
+        self.assertNotIn("Локальная video-очередь", text)
 
     def test_identifier_truncation_is_compact_bounded_and_escaped(self):
         for number in range(4):

@@ -198,10 +198,10 @@ def build_report(
     generated = generated_at.astimezone(TBILISI)
     start_ts, end_ts = interval.start.timestamp(), interval.end.timestamp()
     parts = [
-        "📼 <b>Локальная video-очередь</b>",
-        "<i>Закрытый час, Asia/Tbilisi:</i> "
-        f"{_tg_time(interval.start, interval.start.strftime('%d.%m %H:00'))}–"
-        f"{_tg_time(interval.end, interval.end.strftime('%H:00'))}",
+        "📼 <b>Локальная очередь</b>",
+        "<b><i>Закрытый час</i></b>: "
+        f"{_tg_time(interval.start, interval.start.strftime('%H:%M'))}–"
+        f"{_tg_time(interval.end, interval.end.strftime('%H:%M'))}",
         f"Снимок: {_tg_time(generated, generated.strftime('%d.%m.%Y %H:%M:%S'))}",
     ]
     producer_completed: dict[str, int] = {}
@@ -253,8 +253,10 @@ def build_report(
             "Сейчас: "
             f"очередь {current.get('queued', 0)} · в работе {current.get('running', 0) + current.get('cancel_requested', 0)} "
             f"· повтор {retry_queued} · ошибки {current.get('failed', 0)}",
+            "<b><u>"
             f"Час: завершено {completed} · ошибок {terminal.get('job.failed', 0)} "
-            f"· lease-expired {terminal.get('lease.expired', 0)}" + identifier_line,
+            f"· lease-expired {terminal.get('lease.expired', 0)}"
+            "</u></b>" + identifier_line,
         ))
 
     total_completed = sum(producer_completed.values())
@@ -264,8 +266,8 @@ def build_report(
     ).fetchone()[0]
     parts.extend((
         "",
-        "<b>Итого</b>: "
-        f"{total_completed} completed/ч · очередь {current_queued}",
+        "<b><u>Итого: "
+        f"{total_completed} completed/ч · очередь {current_queued}</u></b>",
         "Здоровье: "
         f"service {'✓' if health['broker_service'] else '✕'} · "
         f"broker {'✓' if health['broker_http'] else '✕'} · "
