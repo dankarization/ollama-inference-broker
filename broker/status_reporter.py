@@ -30,7 +30,8 @@ from .profiles import FIXED_SOURCE_PRIORITIES
 TBILISI = ZoneInfo("Asia/Tbilisi")
 REPORT_SOURCES = {
     "Shutterstock": ("shutterstock-video",),
-    "Olya": ("olya-vision", "olya-decision"),
+    "Olya Vision": ("olya-vision",),
+    "Olya Decision": ("olya-decision",),
 }
 MAX_IDENTIFIERS = 3
 
@@ -233,14 +234,7 @@ def build_report(
         ))
         completed = int(terminal.get("job.completed", 0))
         producer_completed[producer] = completed
-        if producer == "Shutterstock":
-            priority = _public_priority(policy, "shutterstock-video")
-            priority_line = f"<b>Приоритет {priority}</b>"
-        else:
-            priority_line = (
-                "<b>Приоритет: Vision " + _public_priority(policy, "olya-vision")
-                + " · Decision " + _public_priority(policy, "olya-decision") + "</b>"
-            )
+        priority_line = f"<b>Приоритет {_public_priority(policy, sources[0])}</b>"
         identifiers = _bounded_identifiers(active_rows)
         identifier_label = "Активно"
         if not identifiers:
