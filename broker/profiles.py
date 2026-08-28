@@ -52,6 +52,14 @@ PROFILES = {
         max_concurrency=1, request_timeout_seconds=300,
         max_schema_bytes=16_384,
     ),
+    # Phase-2 Telegram-memory extraction is a separate text-only source.  The
+    # 64k context and low thinking mode are enforced again by its compatibility
+    # contract; callers cannot borrow the Olya lane or widen either limit.
+    "syncopia-memory-qwen38": Profile(
+        "syncopia-memory-qwen38", "qwen3.8:ad-iq2-xs", 65_536, 4_096, 1_800,
+        max_concurrency=1, request_timeout_seconds=300,
+        max_schema_bytes=65_536,
+    ),
     "batch-video": Profile("batch-video", "nemotron3:33b", 8_192, 512, 120),
     # This is an intentionally separate source from the active Shutterstock
     # worker.  It is the only VLM/media contract eligible for a future canary.
@@ -71,6 +79,7 @@ FIXED_SOURCE_PRIORITIES = {
     "olya": 8,
     "olya-vision": 8,
     "olya-decision": 6,
+    "syncopia-telegram-memory": 4,
     "shutterstock-canary": 5,
 }
 MIN_PRIORITY = 1

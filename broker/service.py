@@ -13,7 +13,8 @@ from .analytics import analytics_snapshot, attempt_history, audit_history
 from .compat import (CompatibilityError, validate_olya_decision_payload,
                      validate_olya_vision_payload,
                      validate_shutterstock_canary_payload,
-                     validate_shutterstock_video_payload)
+                     validate_shutterstock_video_payload,
+                     validate_syncopia_memory_payload)
 from .profiles import FIXED_SOURCE_PRIORITIES, MAX_PRIORITY, MIN_PRIORITY, PROFILES
 
 
@@ -75,6 +76,11 @@ class SourcePolicy:
                     raise SourcePolicyError("source names must be non-empty strings")
                 if not isinstance(entry, dict):
                     raise SourcePolicyError(f"source {name!r} must be an object")
+                unknown = set(entry) - {"enabled", "weight"}
+                if unknown:
+                    raise SourcePolicyError(
+                        f"source {name!r} has unknown keys: {', '.join(sorted(unknown))}"
+                    )
                 enabled = entry.get("enabled", True)
                 weight = entry.get("weight", 1.0)
                 if not isinstance(enabled, bool):
@@ -241,6 +247,11 @@ class Broker:
                 "ON jobs(source,external_id) WHERE source='olya-decision' "
                 "AND external_id IS NOT NULL"
             )
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS jobs_syncopia_memory_external "
+                "ON jobs(source,external_id) WHERE source='syncopia-telegram-memory' "
+                "AND external_id IS NOT NULL"
+            )
 
     def _audit(
         self,
@@ -356,12 +367,24 @@ class Broker:
                 })
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
+        if profile == "syncopia-memory-qwen38":
+            if source != "syncopia-telegram-memory":
+                raise ValueError("Syncopia memory profile must use its dedicated source")
+            try:
+                payload = validate_syncopia_memory_payload({
+                    **payload,
+                    "model": PROFILES[profile].model,
+                    "tools": [],
+                    "stream": False,
+                })
+            except CompatibilityError as exc:
+                raise ValueError(str(exc)) from exc
         resolved_priority = self._resolve_priority(source, priority)
         source_item_id = self._correlation_value("source_item_id", source_item_id)
         external_id = self._correlation_value("external_id", external_id)
         job_id, now = str(uuid.uuid4()), self.clock()
         with self.lock, self.db:
-            if source in {"olya-vision", "olya-decision"} and external_id is not None:
+            if source in {"olya-vision", "olya-decision", "syncopia-telegram-memory"} and external_id is not None:
                 existing = self.db.execute(
                     "SELECT id FROM jobs WHERE source=? AND external_id=? "
                     "ORDER BY created DESC,id DESC LIMIT 1",

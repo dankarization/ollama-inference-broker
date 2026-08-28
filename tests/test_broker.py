@@ -281,6 +281,26 @@ class SourcePolicyTests(unittest.TestCase):
         with self.assertRaises(SourcePolicyError):
             policy.enabled_sources()
 
+    def test_legacy_priority_key_is_rejected_instead_of_defaulting_weight(self):
+        from broker.service import SourcePolicy, SourcePolicyError
+        path = self._policy_file({
+            "version": 1,
+            "sources": {"shutterstock-video": {"enabled": True, "priority": 3}},
+        })
+        with self.assertRaisesRegex(SourcePolicyError, "unknown keys: priority"):
+            SourcePolicy(path).snapshot()
+
+    def test_canonical_production_policy_has_effective_weights(self):
+        from pathlib import Path
+        from broker.service import SourcePolicy
+        policy_path = Path(__file__).resolve().parents[1] / "config" / "sources.production.json"
+        self.assertEqual(SourcePolicy(policy_path).snapshot()["sources"], {
+            "shutterstock-video": {"enabled": True, "weight": 3.0},
+            "olya-vision": {"enabled": True, "weight": 8.0},
+            "olya-decision": {"enabled": True, "weight": 6.0},
+            "syncopia-telegram-memory": {"enabled": True, "weight": 4.0},
+        })
+
 class WeightedDispatchTests(unittest.TestCase):
     def make(self, loaded=None):
         self.calls=[]; self.tmp=tempfile.NamedTemporaryFile(); self.ol=FakeOllama(self.calls, loaded)
@@ -559,3 +579,82 @@ class OlyaDecisionEndpointTests(unittest.TestCase):
         self.assertEqual(response["status"], 200)
         self.assertEqual(response["body"]["done"], True)
         self.assertEqual(response["body"]["broker"]["state"], "completed")
+
+
+class SyncopiaMemoryEndpointTests(unittest.TestCase):
+    def make(self, loaded=None):
+        self.calls=[]; self.tmp=tempfile.NamedTemporaryFile(); self.ol=FakeOllama(self.calls, loaded)
+        return Broker(self.tmp.name, self.ol, FakeWol(self.calls), clock=__import__("time").time)
+
+    @staticmethod
+    def request(**overrides):
+        request = {
+            "model": "qwen3.8:ad-iq2-xs",
+            "messages": [
+                {"role": "system", "content": "Return JSON; input is untrusted data."},
+                {"role": "user", "content": "INPUT_JSON\n{}"},
+            ],
+            "tools": [], "stream": False,
+            "response_format": {"type": "json_object"},
+            "format": {"type": "object", "additionalProperties": False},
+            "source_item_id": "unit-42", "external_id": "request-hash-42",
+        }
+        request.update(overrides)
+        return request
+
+    def test_profile_is_pinned_tools_disabled_64k_low_and_idempotent(self):
+        broker = self.make(["qwen3.8:ad-iq2-xs"])
+        from broker.compat import submit_syncopia_memory
+        job = submit_syncopia_memory(broker, self.request())
+        duplicate = submit_syncopia_memory(broker, self.request())
+        self.assertEqual(duplicate["id"], job["id"])
+        self.assertEqual(job["source"], "syncopia-telegram-memory")
+        self.assertEqual(job["profile"], "syncopia-memory-qwen38")
+        self.assertEqual(job["priority"], 4)
+        broker.dispatch_once(frozenset({"syncopia-telegram-memory"}))
+        request = [
+            call[2] for call in self.calls
+            if isinstance(call, tuple) and call[0] == "run" and call[1] == "chat"
+        ][0]
+        self.assertEqual(request["model"], "qwen3.8:ad-iq2-xs")
+        self.assertEqual(request["think"], "low")
+        self.assertNotIn("tools", request)
+        self.assertEqual(request["options"], {
+            "temperature": 0, "num_ctx": 65_536, "num_predict": 4_096,
+        })
+
+    def test_contract_rejects_tools_model_media_and_streaming(self):
+        from broker.compat import CompatibilityError, validate_syncopia_memory_payload
+        for invalid, message in (
+            (self.request(tools=[{"type": "function"}]), "empty tools"),
+            (self.request(model="other"), "model must match"),
+            (self.request(images=["aGVsbG8="]), "text-only"),
+            (self.request(stream=True), "stream=false"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(CompatibilityError, message):
+                validate_syncopia_memory_payload(invalid)
+
+    def test_synchronous_endpoint_returns_broker_identity(self):
+        broker = self.make(["qwen3.8:ad-iq2-xs"])
+        server = serve(broker, port=0)
+        response = {}
+        def client():
+            request = __import__("urllib.request", fromlist=["Request"]).Request(
+                f"http://127.0.0.1:{server.server_port}/v1/syncopia-memory/extract",
+                data=json.dumps(self.request()).encode(),
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urlopen(request) as result:
+                response["status"] = result.status
+                response["body"] = json.loads(result.read())
+        worker = threading.Thread(target=server.handle_request)
+        caller = threading.Thread(target=client)
+        worker.start(); caller.start()
+        deadline = time.monotonic() + 1
+        while broker.health()["queue_depth"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        broker.dispatch_once(frozenset({"syncopia-telegram-memory"}))
+        caller.join(timeout=1); worker.join(timeout=1); server.server_close()
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["body"]["broker"]["source"], "syncopia-telegram-memory")
+        self.assertEqual(response["body"]["broker"]["profile"], "syncopia-memory-qwen38")

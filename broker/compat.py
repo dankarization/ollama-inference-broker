@@ -285,6 +285,66 @@ def submit_olya_decision(broker: Any, request: Any) -> dict[str, Any]:
         raise CompatibilityError(str(exc)) from exc
 
 
+def validate_syncopia_memory_payload(request: Any) -> dict[str, Any]:
+    """Validate the tools-disabled Phase-2 Telegram-memory extraction shape."""
+    if not isinstance(request, dict):
+        raise CompatibilityError("request must be a JSON object")
+    profile = PROFILES["syncopia-memory-qwen38"]
+    if request.get("model") != profile.model:
+        raise CompatibilityError("model must match the Syncopia memory profile")
+    messages = request.get("messages")
+    if not _valid_messages(messages):
+        raise CompatibilityError("messages must be a non-empty role/content array")
+    if [message["role"] for message in messages] != ["system", "user"]:
+        raise CompatibilityError("Syncopia memory requires exactly system then user messages")
+    message_bytes = len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")).encode())
+    if message_bytes > 196_608:
+        raise CompatibilityError("messages exceed the Syncopia memory input limit")
+    if request.get("tools") != []:
+        raise CompatibilityError("Syncopia memory requires an explicit empty tools array")
+    if request.get("stream") is not False:
+        raise CompatibilityError("Syncopia memory requires stream=false")
+    if request.get("images") not in (None, []):
+        raise CompatibilityError("Syncopia memory is text-only")
+    response_format = request.get("response_format")
+    if response_format not in (None, {"type": "json_object"}):
+        raise CompatibilityError("response_format must request one JSON object")
+    schema = request.get("format")
+    if not isinstance(schema, dict):
+        raise CompatibilityError("format must be a JSON Schema object")
+    try:
+        schema_bytes = len(json.dumps(schema, separators=(",", ":")).encode())
+    except (TypeError, ValueError):
+        raise CompatibilityError("format must be JSON serializable") from None
+    if schema_bytes > profile.max_schema_bytes:
+        raise CompatibilityError("format exceeds the Syncopia memory schema limit")
+    return {
+        "messages": messages,
+        "format": schema,
+        "think": "low",
+        "options": {
+            "temperature": 0,
+            "num_ctx": profile.max_context,
+            "num_predict": profile.max_output,
+        },
+    }
+
+
+def submit_syncopia_memory(broker: Any, request: Any) -> dict[str, Any]:
+    payload = validate_syncopia_memory_payload(request)
+    try:
+        return broker.submit(
+            "syncopia-memory-qwen38",
+            "chat",
+            payload,
+            source="syncopia-telegram-memory",
+            source_item_id=request.get("source_item_id"),
+            external_id=request.get("external_id"),
+        )
+    except ValueError as exc:
+        raise CompatibilityError(str(exc)) from exc
+
+
 def stream_frames(job: dict[str, Any]) -> list[bytes]:
     """Return persisted job state as NDJSON without polling an executor."""
     model = PROFILES[job["profile"]].model

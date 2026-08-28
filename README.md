@@ -121,6 +121,7 @@ audit/attempt history. `POST /v1/jobs` опционально принимает
 | Интерактивная сессия OpenClaw (`interactive`) | 1 |
 | OpenClaw cron (`cron`) | 2 |
 | Локальное Shutterstock video (`shutterstock-video`) | 3 |
+| Phase-2 Syncopia Telegram memory (`syncopia-telegram-memory`) | 4 |
 | Изолированный VLM canary (`shutterstock-canary`) | 5 |
 | Olya (`olya`) | 8 |
 
@@ -177,6 +178,14 @@ backpressure. Итоговый allowlist берётся из `enabled`-запи�
 env. `GET /v1/sources` отдаёт текущий снапшот политики (без секретов). При
 отсутствии policy поведение прежнее: env-allowlist + strict priority.
 
+Канонический production policy хранится в `config/sources.production.json`:
+веса Shutterstock Video / Olya Vision / Olya Decision остаются `3/8/6`, а
+отдельный source `syncopia-telegram-memory` имеет scheduler weight ровно `4`.
+`priority` и `weight` — разные параметры: первый упорядочивает jobs внутри
+выбранного source, второй задаёт долю source в weighted scheduler. Policy с
+неизвестным ключом (включая ошибочный `priority` вместо `weight`) отклоняется,
+чтобы значение больше не могло молча стать default `1.0`.
+
 `POST /v1/shutterstock-video/generate` — синхронный bounded контракт локального
 видео-чанка (profile `shutterstock-video`, `nemotron3:33b`): принимает `prompt`,
 base64 `images` (до 12 кадров, 32 MiB) и JSON Schema в `format` (до 32 KiB),
@@ -195,6 +204,13 @@ Runtime-параметры моделей задаёт broker, caller не мо�
 только server-owned `qwen3.8:ad-iq2-xs` с bounded context/output и `think=low`.
 `source_item_id` связывает recommendation с broker job, стабильный `external_id`
 обеспечивает idempotent resume. Этот source независим от `olya-vision`.
+
+`POST /v1/syncopia-memory/extract` — отдельный синхронный text-only contract
+для локального Phase-2 extractor. Он требует `tools=[]`, `stream=false`, ровно
+system+user messages и JSON Schema, запускает только
+`qwen3.8:ad-iq2-xs` с `num_ctx=65536`, `think=low` и source
+`syncopia-telegram-memory`. Request hash используется caller как idempotency
+key; Olya/Shutterstock endpoints и profiles не переиспользуются.
 
 ## Проверка и разработка
 
