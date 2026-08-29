@@ -3,6 +3,7 @@ import threading
 import time
 import json
 import os
+import sqlite3
 import unittest
 from unittest.mock import patch
 from urllib.request import urlopen
@@ -180,6 +181,23 @@ class BrokerTests(unittest.TestCase):
         self.assertNotIn("ps", self.calls)
         b.dispatch_once()
         self.assertEqual(b.metrics()["loaded_models"][0]["size_vram"], 1)
+
+    def test_locked_observer_returns_stale_data_or_unavailable_not_fake_zeros(self):
+        b = self.make()
+        b.submit("cron", "generate", {"prompt": "queued"})
+        live_dashboard = b.dashboard()
+        self.assertEqual(live_dashboard["observation"]["state"], "live")
+        self.assertEqual(live_dashboard["overall"]["states"]["queued"], 1)
+
+        with patch(
+            "broker.service.sqlite3.connect",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            started = time.monotonic()
+            stale_dashboard = b.dashboard()
+        self.assertLess(time.monotonic() - started, 0.1)
+        self.assertEqual(stale_dashboard["observation"]["state"], "stale")
+        self.assertEqual(stale_dashboard["overall"]["states"]["queued"], 1)
 
     def test_dashboard_and_metrics_stay_local_while_dispatch_is_waiting_on_ollama(self):
         class BlockingOllama(FakeOllama):

@@ -113,6 +113,8 @@ def snapshot(
 
 def render(data: dict[str, Any]) -> bytes:
     """Render a self-contained, intentionally local-only dashboard."""
+    observation = data.get("observation", {"state": "live"})
+
     def cell(value: Any) -> str:
         if value is None:
             return "—"
@@ -126,6 +128,16 @@ def render(data: dict[str, Any]) -> bytes:
             return f"<{tag}>—</{tag}>"
         title = html.escape(timestamp_title(value) or "", quote=True)
         return f'<{tag} title="{title}">{html.escape(display)}</{tag}>'
+
+    if observation["state"] == "unavailable":
+        reason = html.escape(str(observation.get("reason", "dashboard data unavailable")))
+        observed_at = timestamp_cell(observation.get("observed_at"), tag="code")
+        return f"""<!doctype html><html lang=en><meta charset=utf-8>
+<meta http-equiv=refresh content=15><title>Ollama broker queue unavailable</title>
+<style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}.error{{color:#a00}}</style>
+<h1>Ollama inference broker queue</h1><p class=error>Dashboard data unavailable: {reason}.</p>
+<p>Observed at: {observed_at} · refreshes every 15 seconds.</p>
+</html>""".encode("utf-8")
 
     def weight_cell(source: str, value: float | None) -> str:
         if value is None:
@@ -174,6 +186,7 @@ def render(data: dict[str, Any]) -> bytes:
 <meta http-equiv=refresh content=15><title>Ollama broker queue</title>
 <style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}.weight-form{{display:flex;gap:.35rem;align-items:center;justify-content:flex-end}}.weight-feedback{{min-width:4rem;text-align:left}}.weight-feedback.error{{color:#a00}}</style>
 <h1>Ollama inference broker queue</h1><p>Snapshot timestamp: {timestamp_cell(data['timestamp'], tag='code')} · refreshes every 15 seconds.</p>
+{('<p class=error>Showing stale data: ' + html.escape(str(observation.get('reason', 'database observer read unavailable'))) + '.</p>') if observation['state'] == 'stale' else ''}
 <p class=summary>Completed: <b>{overall['states']['completed']}</b> total · <b>{overall['completed_last_hour']}</b> last hour · <b>{overall['completed_last_24_hours']}</b> last 24 hours.</p>
 <h2>Sources</h2><table><thead><tr><th>Source</th><th>Enabled</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=13>None</td></tr>'}</tbody></table>
 <p><small>Delayed queued jobs are blocked by a source min-interval.</small></p>

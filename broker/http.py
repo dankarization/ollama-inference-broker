@@ -163,9 +163,13 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
             path = parsed.path
             query = parse_qs(parsed.query)
             if path == "/dashboard":
-                encoded = render_dashboard(broker.dashboard(policy))
-                self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
-            elif path == "/v1/dashboard": self._json(200, broker.dashboard(policy))
+                dashboard = broker.dashboard(policy)
+                encoded = render_dashboard(dashboard)
+                status = 503 if dashboard["observation"]["state"] == "unavailable" else 200
+                self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
+            elif path == "/v1/dashboard":
+                dashboard = broker.dashboard(policy)
+                self._json(503 if dashboard["observation"]["state"] == "unavailable" else 200, dashboard)
             elif path == "/healthz": self._json(200, broker.health())
             elif path == "/v1/metrics": self._json(200, broker.metrics())
             elif path == "/v1/analytics":

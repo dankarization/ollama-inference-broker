@@ -96,7 +96,10 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
   состояния, lease, retry/delay, активные jobs и completed total/1h/24h.
   Машинный payload-free снимок доступен как `GET /v1/dashboard`. После запуска
   broker откройте `http://127.0.0.1:8088/dashboard` (или его настроенный host
-  и port). `dead` всегда ноль: в текущей модели broker исчерпанная работа —
+  и port). Снимок содержит `observation.state`: `live` — текущие данные,
+  `stale` — последний успешный снимок при временно недоступном observer-read,
+  `unavailable` — HTTP 503 без вымышленных нулевых счётчиков. `dead` всегда
+  ноль: в текущей модели broker исчерпанная работа —
   terminal `failed`, отдельного state `dead` нет.
 - `GET /healthz` проверяет только локальное состояние broker: очередь, активную lease и timestamp. Он не отправляет WOL и не обращается к MAIN-PC/Ollama.
 - `/api/chat` и `/api/generate` реализуют локальный compatibility contract:

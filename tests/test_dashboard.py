@@ -1,10 +1,12 @@
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from unittest.mock import patch
 
 from broker.dashboard import render
 from broker.http import serve
@@ -23,6 +25,47 @@ class FakeWol:
 
 
 class DashboardTests(unittest.TestCase):
+    def test_dashboard_endpoints_report_unavailable_observer_instead_of_empty_queue(self):
+        db = tempfile.NamedTemporaryFile()
+        self.addCleanup(db.close)
+        broker = Broker(db.name, FakeOllama(), FakeWol())
+        broker.submit("interactive", "generate", {"prompt": "must not become zero"})
+        server = serve(broker, port=0)
+        self.addCleanup(server.server_close)
+
+        def get(path):
+            worker = threading.Thread(target=server.handle_request)
+            worker.start()
+            try:
+                with urlopen(f"http://127.0.0.1:{server.server_port}{path}") as response:
+                    status, body = response.status, response.read()
+            except HTTPError as error:
+                status, body = error.code, error.read()
+            worker.join(timeout=1)
+            return status, body
+
+        with patch(
+            "broker.service.sqlite3.connect",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            api_status, api_body = get("/v1/dashboard")
+            html_status, html_body = get("/dashboard")
+
+        data = json.loads(api_body)
+        self.assertEqual(api_status, 503)
+        self.assertEqual(data["observation"]["state"], "unavailable")
+        self.assertNotIn("overall", data)
+        self.assertNotIn("sources", data)
+        self.assertEqual(html_status, 503)
+        self.assertIn(b"Dashboard data unavailable", html_body)
+        self.assertNotIn(b"Completed:", html_body)
+
+        empty_db = tempfile.NamedTemporaryFile()
+        self.addCleanup(empty_db.close)
+        empty = Broker(empty_db.name, FakeOllama(), FakeWol()).dashboard()
+        self.assertEqual(empty["observation"]["state"], "live")
+        self.assertEqual(empty["overall"]["states"]["queued"], 0)
+
     def test_html_renders_active_timestamps_in_tbilisi_and_nulls_as_dash(self):
         timestamp = datetime(2026, 8, 29, 8, 30, tzinfo=timezone.utc).timestamp()
         html = render({

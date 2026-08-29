@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import logging
 import os
@@ -625,60 +626,41 @@ class Broker:
             connection.set_progress_handler(
                 lambda: int(time.monotonic() >= deadline), 1_000,
             )
-            return reader(connection)
+            return reader(connection), None
         except sqlite3.Error:
-            return None
+            # Lock and storage details are intentionally not exposed through
+            # the local HTTP API.
+            return None, "database observer read unavailable"
         finally:
             if connection is not None:
                 connection.close()
 
     @staticmethod
-    def _empty_dashboard(now: float, policy_snapshot: dict[str, Any] | None) -> dict:
-        sources = []
-        for source, configured in sorted((policy_snapshot or {}).get("sources", {}).items()):
-            sources.append({
-                "source": source,
-                "scheduler": {
-                    "enabled": configured.get("enabled"),
-                    "weight": configured.get("weight"),
-                    "next_allowed": None,
-                },
-                "states": {
-                    "queued": 0, "running": 0, "lease": 0, "retry": 0,
-                    "delayed": 0, "completed": 0, "failed": 0, "dead": 0,
-                    "cancelled": 0,
-                },
-                "completed_last_hour": 0,
-                "completed_last_24_hours": 0,
-            })
-        return {
-            "timestamp": now, "sources": sources,
-            "active_jobs": [],
-            "overall": {
-                "states": {
-                    "queued": 0, "running": 0, "lease": 0, "retry": 0,
-                    "delayed": 0, "completed": 0, "failed": 0, "dead": 0,
-                    "cancelled": 0,
-                },
-                "completed_last_hour": 0, "completed_last_24_hours": 0,
-            },
-        }
+    def _observation(state: str, now: float, reason: str | None = None) -> dict[str, Any]:
+        observation: dict[str, Any] = {"state": state, "observed_at": now}
+        if reason is not None:
+            observation["reason"] = reason
+        return observation
 
     def dashboard(self, policy: SourcePolicy | None = None) -> dict:
         """Payload-free live queue data for the local operational dashboard."""
         policy_snapshot = policy.snapshot() if policy is not None else None
         now = self.clock()
-        snapshot = self._observer_read(
+        snapshot, error = self._observer_read(
             lambda db: dashboard_snapshot(
                 db, now=now, policy_snapshot=policy_snapshot,
             )
         )
         if snapshot is not None:
+            snapshot["observation"] = self._observation("live", now)
             self._dashboard_cache = snapshot
             return snapshot
         if self._dashboard_cache is not None:
-            return self._dashboard_cache
-        return self._empty_dashboard(now, policy_snapshot)
+            stale = deepcopy(self._dashboard_cache)
+            stale["observation"] = self._observation("stale", now, error)
+            return stale
+        # An observer timeout or lock is not evidence that the queue is empty.
+        return {"observation": self._observation("unavailable", now, error)}
 
     def correlations(
         self, *, source: str | None = None, source_item_id: str | None = None,
@@ -938,7 +920,7 @@ class Broker:
                 self.completed.wait(remaining)
 
     def metrics(self) -> dict:
-        snapshot = self._observer_read(lambda db: {
+        snapshot, _ = self._observer_read(lambda db: {
             "queue_depth": db.execute(
                 "SELECT count(*) FROM jobs WHERE state='queued'"
             ).fetchone()[0],
