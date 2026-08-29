@@ -125,14 +125,34 @@ def render(data: dict[str, Any]) -> bytes:
         title = html.escape(timestamp_title(value) or "", quote=True)
         return f'<{tag} title="{title}">{html.escape(display)}</{tag}>'
 
+    def weight_cell(source: str, value: float | None) -> str:
+        if value is None:
+            return "<td>—</td>"
+        selected = int(value)
+        options = "".join(
+            f'<option value="{weight}"{" selected" if weight == selected else ""}>{weight}</option>'
+            for weight in range(1, 11)
+        )
+        source_attribute = html.escape(source, quote=True)
+        return (
+            '<td><form class="weight-form" data-source="'
+            f'{source_attribute}"><select name="weight" aria-label="Weight for '
+            f'{source_attribute}">{options}</select><button type="submit">Save</button>'
+            '<span class="weight-feedback" aria-live="polite"></span></form></td>'
+        )
+
     rows = []
     for item in data["sources"]:
         scheduler, states = item["scheduler"], item["states"]
-        rows.append("<tr>" + "".join(f"<td>{cell(value)}</td>" for value in (
-            item["source"], scheduler["enabled"], scheduler["weight"],
+        rows.append("<tr>" + "".join((
+            f"<td>{cell(item['source'])}</td>",
+            f"<td>{cell(scheduler['enabled'])}</td>",
+            weight_cell(item["source"], scheduler["weight"]),
+            *(f"<td>{cell(value)}</td>" for value in (
             states["queued"], states["running"], states["lease"], states["retry"], states["delayed"],
             states["failed"], states["cancelled"], states["completed"],
             item["completed_last_hour"], item["completed_last_24_hours"],
+            )),
         )) + "</tr>")
     active = data["active_jobs"]
     active_rows = "".join(
@@ -150,11 +170,33 @@ def render(data: dict[str, Any]) -> bytes:
     overall = data["overall"]
     document = f"""<!doctype html><html lang=en><meta charset=utf-8>
 <meta http-equiv=refresh content=15><title>Ollama broker queue</title>
-<style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}</style>
+<style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}.weight-form{{display:flex;gap:.35rem;align-items:center;justify-content:flex-end}}.weight-feedback{{min-width:4rem;text-align:left}}.weight-feedback.error{{color:#a00}}</style>
 <h1>Ollama inference broker queue</h1><p>Snapshot timestamp: {timestamp_cell(data['timestamp'], tag='code')} · refreshes every 15 seconds.</p>
 <p class=summary>Completed: <b>{overall['states']['completed']}</b> total · <b>{overall['completed_last_hour']}</b> last hour · <b>{overall['completed_last_24_hours']}</b> last 24 hours.</p>
 <h2>Sources</h2><table><thead><tr><th>Source</th><th>Enabled</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=13>None</td></tr>'}</tbody></table>
 <p><small>Delayed queued jobs are blocked by a source min-interval.</small></p>
 <h2>Active jobs</h2><table><thead><tr><th>ID</th><th>Source</th><th>State</th><th>Started</th><th>Lease until</th><th>Attempts</th><th>Retries</th></tr></thead><tbody>{active_rows}</tbody></table>
+<script>
+document.querySelectorAll('.weight-form').forEach((form) => {{
+  form.addEventListener('submit', async (event) => {{
+    event.preventDefault();
+    const feedback = form.querySelector('.weight-feedback');
+    const weight = Number(form.elements.weight.value);
+    feedback.className = 'weight-feedback';
+    feedback.textContent = 'Saving…';
+    try {{
+      const response = await fetch('/v1/sources/' + encodeURIComponent(form.dataset.source) + '/weight', {{
+        method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{weight}}),
+      }});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'save failed');
+      feedback.textContent = 'Saved';
+    }} catch (error) {{
+      feedback.className = 'weight-feedback error';
+      feedback.textContent = error.message || 'Save failed';
+    }}
+  }});
+}});
+</script>
 """
     return document.encode("utf-8")

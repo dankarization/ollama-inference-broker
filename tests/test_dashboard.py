@@ -3,7 +3,8 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from broker.dashboard import render
 from broker.http import serve
@@ -73,6 +74,21 @@ class DashboardTests(unittest.TestCase):
             worker.join(timeout=1)
             return body, content_type
 
+        def post(path, payload):
+            request = Request(
+                f"http://127.0.0.1:{server.server_port}{path}",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            worker = threading.Thread(target=server.handle_request); worker.start()
+            try:
+                with urlopen(request) as response:
+                    status, body = response.status, response.read()
+            except HTTPError as error:
+                status, body = error.code, error.read()
+            worker.join(timeout=1)
+            return status, json.loads(body)
+
         body, _ = get("/v1/dashboard")
         data = json.loads(body)
         source = next(item for item in data["sources"] if item["source"] == "dashboard-source")
@@ -92,6 +108,10 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("text/html", content_type)
         self.assertIn(b"Completed 1h", html)
         self.assertIn(b"Weight", html)
+        self.assertIn(b'<select name="weight" aria-label="Weight for dashboard-source">', html)
+        self.assertIn(b'<option value="3" selected>3</option>', html)
+        self.assertNotIn(b">3.0<", html)
+        self.assertIn(b"weight-feedback", html)
         self.assertNotIn(b"Dead", html)
         self.assertIn(b'<tr><td colspan=13>None</td></tr>', render({
             "timestamp": 0,
@@ -104,6 +124,16 @@ class DashboardTests(unittest.TestCase):
             },
         }))
         self.assertNotIn(b"do-not-expose", html)
+        status, result = post("/v1/sources/dashboard-source/weight", {"weight": 7})
+        self.assertEqual((status, result), (200, {"source": "dashboard-source", "weight": 7}))
+        self.assertEqual(SourcePolicy(policy_file.name).weight("dashboard-source"), 7.0)
+        with open(policy_file.name) as handle:
+            self.assertEqual(json.load(handle)["sources"]["dashboard-source"]["weight"], 7)
+        for invalid_weight in (0, 11, 3.5, "3", True):
+            status, result = post("/v1/sources/dashboard-source/weight", {"weight": invalid_weight})
+            self.assertEqual(status, 400)
+            self.assertIn("integer from 1 through 10", result["error"])
+        self.assertEqual(SourcePolicy(policy_file.name).weight("dashboard-source"), 7.0)
 
 
 if __name__ == "__main__":

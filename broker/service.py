@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
@@ -60,6 +62,7 @@ class SourcePolicy:
     def __init__(self, path: str | Path, clock=time.time) -> None:
         self.path = Path(path)
         self.clock = clock
+        self._lock = threading.RLock()
         self._signature: tuple[int, int, int] | None = None
         self._sources: dict[str, dict[str, Any]] = {}
 
@@ -89,22 +92,61 @@ class SourcePolicy:
 
     def snapshot(self) -> dict[str, Any]:
         """Return the current effective policy for observability (no secrets)."""
-        self._load_locked()
-        return {
-            "path": str(self.path),
-            "sources": {name: dict(entry) for name, entry in self._sources.items()},
-        }
+        with self._lock:
+            self._load_locked()
+            return {
+                "path": str(self.path),
+                "sources": {name: dict(entry) for name, entry in self._sources.items()},
+            }
 
     def enabled_sources(self) -> frozenset[str]:
-        self._load_locked()
-        return frozenset(
-            name for name, entry in self._sources.items() if entry["enabled"]
-        )
+        with self._lock:
+            self._load_locked()
+            return frozenset(
+                name for name, entry in self._sources.items() if entry["enabled"]
+            )
 
     def weight(self, source: str) -> float | None:
-        self._load_locked()
-        entry = self._sources.get(source)
-        return entry["weight"] if entry else None
+        with self._lock:
+            self._load_locked()
+            entry = self._sources.get(source)
+            return entry["weight"] if entry else None
+
+    def set_weight(self, source: str, weight: Any) -> int:
+        """Atomically update one configured source with a dashboard-safe weight."""
+        if isinstance(weight, bool) or not isinstance(weight, int) or not 1 <= weight <= 10:
+            raise SourcePolicyError("weight must be an integer from 1 through 10")
+        with self._lock:
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                normalized = normalize_source_policy(raw)
+            except (OSError, ValueError, SourcePolicyError) as error:
+                raise SourcePolicyError("policy is unavailable or invalid") from error
+            if source not in normalized:
+                raise SourcePolicyError(f"source {source!r} is not configured")
+
+            raw["sources"][source]["weight"] = weight
+            try:
+                original_mode = self.path.stat().st_mode & 0o7777
+                descriptor, temporary = tempfile.mkstemp(
+                    prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent,
+                )
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(raw, handle, indent=2, sort_keys=True)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(temporary, original_mode)
+                os.replace(temporary, self.path)
+            except OSError as error:
+                try:
+                    os.unlink(temporary)
+                except (OSError, UnboundLocalError):
+                    pass
+                raise SourcePolicyError("unable to save policy") from error
+            self._signature = None
+            self._load_locked()
+            return weight
 
 
 class Broker:

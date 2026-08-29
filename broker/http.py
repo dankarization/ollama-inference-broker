@@ -1,13 +1,14 @@
 from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .compat import (CompatibilityError, stream_frames, submit as submit_compatibility,
                      submit_olya_decision, submit_olya_vision, submit_shutterstock_canary,
                      submit_shutterstock_video, submit_syncopia_memory)
 from .profiles import PROFILES
 from .dashboard import render as render_dashboard
+from .policy import SourcePolicyError
 
 def serve(broker, host="127.0.0.1", port=8088, policy=None):
     class Handler(BaseHTTPRequestHandler):
@@ -16,7 +17,12 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
         def _stream(self, status, frames):
             encoded=b"".join(frames); self.send_response(status); self.send_header("Content-Type","application/x-ndjson"); self.send_header("Content-Length",str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
         def do_POST(self):
-            size=int(self.headers.get("Content-Length", 0)); body=json.loads(self.rfile.read(size) or b"{}")
+            size=int(self.headers.get("Content-Length", 0))
+            try:
+                body=json.loads(self.rfile.read(size) or b"{}")
+            except (TypeError, ValueError):
+                self._json(400, {"error": "request body must be JSON"})
+                return
             path = urlsplit(self.path).path
             if path == "/v1/jobs":
                 try:
@@ -32,6 +38,17 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                 try:
                     result=broker.retry(path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
                 except ValueError as e: self._json(409, {"error":str(e)})
+            elif path.startswith("/v1/sources/") and path.endswith("/weight"):
+                source = unquote(path[len("/v1/sources/"):-len("/weight")]).strip("/")
+                try:
+                    if not isinstance(body, dict) or set(body) != {"weight"}:
+                        raise SourcePolicyError("request body must contain only weight")
+                    if policy is None:
+                        raise SourcePolicyError("source policy is not configured")
+                    weight = policy.set_weight(source, body["weight"])
+                    self._json(200, {"source": source, "weight": weight})
+                except SourcePolicyError as error:
+                    self._json(400, {"error": str(error)})
             elif path in {"/api/chat", "/api/generate"}:
                 try:
                     job=submit_compatibility(broker, path.rsplit("/", 1)[-1], body)

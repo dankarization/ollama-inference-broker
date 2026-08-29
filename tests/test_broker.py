@@ -278,6 +278,21 @@ class SourcePolicyTests(unittest.TestCase):
         os.replace(new_path, path)
         self.assertEqual(policy.enabled_sources(), frozenset({"a"}))
 
+    def test_dashboard_weight_update_is_atomic_and_persists_for_a_new_policy_instance(self):
+        from broker.service import SourcePolicy, SourcePolicyError
+        path = self._policy_file({
+            "version": 1,
+            "sources": {"a": {"enabled": True, "weight": 1}},
+        })
+        policy = SourcePolicy(path)
+        self.assertEqual(policy.set_weight("a", 10), 10)
+        self.assertEqual(policy.weight("a"), 10.0)
+        self.assertEqual(SourcePolicy(path).weight("a"), 10.0)
+        with self.assertRaisesRegex(SourcePolicyError, "integer from 1 through 10"):
+            policy.set_weight("a", 2.5)
+        with self.assertRaisesRegex(SourcePolicyError, "not configured"):
+            policy.set_weight("missing", 2)
+
     def test_policy_invalid_file_is_ignored_fail_closed(self):
         from broker.service import SourcePolicy
         path = self._policy_file({"version": 1, "sources": {"a": {"enabled": True, "weight": 1.0}}})
