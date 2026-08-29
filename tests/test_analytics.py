@@ -79,6 +79,7 @@ class AnalyticsTests(unittest.TestCase):
             "VALUES('legacy-job','interactive','generate','{\"prompt\":\"x\"}',"
             "'queued',10)"
         )
+        db.execute("CREATE INDEX legacy_jobs_state ON jobs(state)")
         db.commit()
         db.close()
 
@@ -90,6 +91,9 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(job["payload"], {"prompt": "x"})
         self.assertNotIn("priority", {
             row[1] for row in broker.db.execute("PRAGMA table_info(jobs)")
+        })
+        self.assertIn("legacy_jobs_state", {
+            row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")
         })
         tables = {row[0] for row in broker.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
@@ -146,6 +150,20 @@ class AnalyticsTests(unittest.TestCase):
         self.assertNotIn("private-payload-marker", logs)
         self.assertNotIn("item-42", logs)
         self.assertNotIn("external-7", logs)
+
+    def test_retry_uses_latest_enqueue_time_for_fifo(self):
+        clock = MutableClock(100)
+        broker = self.make(clock=clock)
+        retried = broker.submit("interactive", "generate", {"prompt": "old"})["id"]
+        with broker.db:
+            broker.db.execute("UPDATE jobs SET state='failed' WHERE id=?", (retried,))
+        clock.value = 150
+        waiting = broker.submit("interactive", "generate", {"prompt": "new"})["id"]
+        clock.value = 200
+        broker.retry(retried)
+        self.assertTrue(broker.dispatch_once())
+        self.assertEqual(broker.status(waiting)["state"], "completed")
+        self.assertEqual(broker.status(retried)["state"], "queued")
 
     def test_expired_lease_is_durably_failed_across_restart(self):
         fd, path = tempfile.mkstemp(suffix=".sqlite3")
@@ -284,13 +302,16 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(snapshot["scheduler"]["windows"]["3600"]["selections"], 2)
 
     def test_hot_policy_disable_ignores_stale_accumulator_source(self):
-        broker = self.make()
+        clock = MutableClock(100)
+        broker = self.make(clock=clock)
         policy = self.policy({
             "interactive": {"enabled": True, "weight": 1},
             "shutterstock-video": {"enabled": True, "weight": 1},
         })
         first = broker.submit("interactive", "generate", {"prompt": "one"})["id"]
+        clock.value = 101
         second = broker.submit("interactive", "generate", {"prompt": "two"})["id"]
+        clock.value = 102
         broker.submit("shutterstock-video", "generate", {"prompt": "video"})
         self.assertTrue(broker.dispatch_once(policy.enabled_sources(), policy))
         self.assertEqual(

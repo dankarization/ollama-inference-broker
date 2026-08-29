@@ -156,7 +156,7 @@ class Broker:
     def _init_db(self):
         with self.db:
             self.db.execute("PRAGMA journal_mode=WAL")
-            self.db.execute("""CREATE TABLE IF NOT EXISTS jobs (
+            jobs_schema = """CREATE TABLE jobs (
                 id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
                 source TEXT NOT NULL,
                 payload TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
@@ -165,15 +165,16 @@ class Broker:
                 source_item_id TEXT, external_id TEXT, queued_at REAL,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 retry_count INTEGER NOT NULL DEFAULT 0,
-                requeue_count INTEGER NOT NULL DEFAULT 0)""")
+                requeue_count INTEGER NOT NULL DEFAULT 0)"""
+            self.db.execute(jobs_schema.replace(
+                "CREATE TABLE jobs", "CREATE TABLE IF NOT EXISTS jobs", 1
+            ))
             self.db.execute("""CREATE TABLE IF NOT EXISTS source_schedules (
                 source TEXT PRIMARY KEY, next_allowed REAL NOT NULL)""")
             # Compatible with databases created by the first isolated MVP.
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
             if "source" not in columns:
                 self.db.execute("ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'")
-            if "priority" in columns:
-                self.db.execute("ALTER TABLE jobs DROP COLUMN priority")
             if "result_json" not in columns:
                 self.db.execute("ALTER TABLE jobs ADD COLUMN result_json TEXT")
             if "source_item_id" not in columns:
@@ -195,6 +196,33 @@ class Broker:
                     "ALTER TABLE jobs ADD COLUMN requeue_count INTEGER NOT NULL DEFAULT 0"
                 )
             self.db.execute("UPDATE jobs SET queued_at=created WHERE queued_at IS NULL")
+            if "priority" in columns:
+                # SQLite DROP COLUMN arrived in 3.35. Rebuild portably so an
+                # upgrade does not fail on older SQLite builds bundled with a
+                # supported Python runtime. Preserve explicit user indexes.
+                index_sql = [row[0] for row in self.db.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='jobs' "
+                    "AND sql IS NOT NULL"
+                )]
+                self.db.execute("ALTER TABLE jobs RENAME TO jobs_legacy_schedule")
+                indexes = list(self.db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND tbl_name='jobs_legacy_schedule' AND sql IS NOT NULL"
+                ))
+                for row in indexes:
+                    self.db.execute(f'DROP INDEX "{row[0].replace(chr(34), chr(34) * 2)}"')
+                self.db.execute(jobs_schema)
+                self.db.execute(
+                    "INSERT INTO jobs(id,profile,kind,source,payload,state,created,started,"
+                    "finished,lease_until,error,switch_reason,result_json,source_item_id,"
+                    "external_id,queued_at,attempt_count,retry_count,requeue_count) "
+                    "SELECT id,profile,kind,source,payload,state,created,started,finished,"
+                    "lease_until,error,switch_reason,result_json,source_item_id,external_id,"
+                    "queued_at,attempt_count,retry_count,requeue_count FROM jobs_legacy_schedule"
+                )
+                self.db.execute("DROP TABLE jobs_legacy_schedule")
+                for statement in index_sql:
+                    self.db.execute(statement)
             self.db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred REAL NOT NULL,
@@ -437,8 +465,8 @@ class Broker:
 
     def _position(self, row):
         before = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued' AND "
-            "(created < ? OR (created = ? AND id < ?))",
-            (row["created"], row["created"], row["id"])).fetchone()[0]
+            "(queued_at < ? OR (queued_at = ? AND id < ?))",
+            (row["queued_at"], row["queued_at"], row["id"])).fetchone()[0]
         return before + 1
 
     def cancel(self, job_id: str) -> dict | None:
@@ -608,7 +636,7 @@ class Broker:
             placeholders = ",".join("?" for _ in allowed_sources)
             query += f" AND source IN ({placeholders})"
             values = tuple(sorted(allowed_sources))
-        query += " ORDER BY created, id"
+        query += " ORDER BY queued_at, id"
         now = self.clock()
         candidates = []
         for row in self.db.execute(query, values):

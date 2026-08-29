@@ -104,8 +104,8 @@ def _policy(path: str | Path | None) -> dict[str, dict[str, Any]]:
     normalized: dict[str, dict[str, Any]] = {}
     for source, entry in sources.items():
         if isinstance(source, str) and isinstance(entry, dict):
-            enabled = entry.get("enabled")
-            weight = entry.get("weight")
+            enabled = entry.get("enabled", True)
+            weight = entry.get("weight", 1.0)
             if isinstance(enabled, bool) and isinstance(weight, (int, float)) and not isinstance(weight, bool) and weight > 0:
                 normalized[source] = {"enabled": enabled, "weight": float(weight)}
     return normalized
@@ -219,7 +219,7 @@ def build_report(
         ))
         queued_rows = list(db.execute(
             f"SELECT id,source_item_id,external_id FROM jobs WHERE source IN ({placeholders}) "
-            "AND state='queued' ORDER BY created,id",
+            "AND state='queued' ORDER BY queued_at,id",
             values,
         ))
         terminal = dict(db.execute(

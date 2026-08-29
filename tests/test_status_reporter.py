@@ -13,6 +13,7 @@ from broker.service import Broker
 from broker.status_reporter import (
     DeliveryError,
     TBILISI,
+    _policy,
     build_report,
     deliver_via_telegram_html,
     previous_closed_hour,
@@ -49,6 +50,15 @@ class StatusReporterTests(unittest.TestCase):
 
     def tearDown(self):
         self.broker.db.close()
+
+    def test_policy_uses_scheduler_defaults_for_omitted_values(self):
+        handle = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        json.dump({"version": 1, "sources": {"defaulted": {}}}, handle)
+        handle.close()
+        self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
+        self.assertEqual(_policy(handle.name), {
+            "defaulted": {"enabled": True, "weight": 1.0},
+        })
 
     def add_job(self, ident, source, state, *, created_offset=0, started_offset=None,
                 finished_offset=None, retry_count=0):
