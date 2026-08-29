@@ -50,24 +50,33 @@ class DashboardTests(unittest.TestCase):
                 ("history", "interactive", "generate", "history", 10, payload,
                  "completed", 1.0, 99_999.0, 1.0),
             )
+            broker.db.execute(
+                "INSERT INTO audit_events(occurred,event_type,job_id,source) VALUES(?,?,?,?)",
+                (99_999.0, "job.completed", "history", "history"),
+            )
 
         progress_calls = [0]
+        queries: list[str] = []
 
         def stop_full_table_scan():
             progress_calls[0] += 1
             return progress_calls[0] >= 70_000
 
         broker.db.set_progress_handler(stop_full_table_scan, 1)
+        broker.db.set_trace_callback(queries.append)
         try:
             data = snapshot(broker.db, now=100_000, policy_snapshot={"sources": {
                 "history": {"enabled": True, "weight": 1.0},
             }})
         finally:
             broker.db.set_progress_handler(None, 0)
+            broker.db.set_trace_callback(None)
 
         self.assertEqual(data["overall"]["states"]["completed"], 1)
         self.assertEqual(data["overall"]["completed_last_hour"], 1)
         self.assertLess(progress_calls[0], 70_000)
+        self.assertTrue(any("FROM audit_events" in query for query in queries))
+        self.assertFalse(any("finished>=" in query for query in queries))
 
     def test_dashboard_endpoints_report_unavailable_observer_instead_of_empty_queue(self):
         db = tempfile.NamedTemporaryFile()
@@ -152,6 +161,14 @@ class DashboardTests(unittest.TestCase):
             broker.db.execute("UPDATE jobs SET state='completed',finished=? WHERE id=?", (99_000, completed_recent))
             broker.db.execute("UPDATE jobs SET state='completed',finished=? WHERE id=?", (10_000, completed_old))
             broker.db.execute("UPDATE jobs SET state='running',started=?,lease_until=? WHERE id=?", (99_900, 100_300, running))
+            broker.db.execute(
+                "INSERT INTO audit_events(occurred,event_type,job_id,source) VALUES(?,?,?,?)",
+                (99_000, "job.completed", completed_recent, "dashboard-source"),
+            )
+            broker.db.execute(
+                "INSERT INTO audit_events(occurred,event_type,job_id,source) VALUES(?,?,?,?)",
+                (10_000, "job.completed", completed_old, "dashboard-source"),
+            )
         server = serve(broker, port=0, policy=policy)
         self.addCleanup(server.server_close)
 

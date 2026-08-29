@@ -69,13 +69,16 @@ def snapshot(
         queued = state_counts.get("queued", 0)
         next_allowed = schedules.get(source)
         delayed = queued if next_allowed is not None and next_allowed > now else 0
+        # Completion audit records are committed with the terminal job update.
+        # Their source/time index avoids reading every completed job payload to
+        # derive the two recent windows.
         completed_windows = db.execute(
             "SELECT "
-            "coalesce(sum(finished>=?),0) AS completed_1h,"
-            "coalesce(sum(finished>=?),0) AS completed_24h "
-            "FROM jobs INDEXED BY jobs_source_state "
-            "WHERE source=? AND state='completed'",
-            (now - 3_600, now - 86_400, source),
+            "coalesce(sum(occurred>=?),0) AS completed_1h,"
+            "coalesce(sum(occurred>=?),0) AS completed_24h "
+            "FROM audit_events INDEXED BY audit_events_source_time "
+            "WHERE source=? AND occurred>=? AND event_type='job.completed'",
+            (now - 3_600, now - 86_400, source, now - 86_400),
         ).fetchone()
         retry = db.execute(
             "SELECT count(*) FROM jobs INDEXED BY jobs_source_state "
