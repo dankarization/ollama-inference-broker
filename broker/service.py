@@ -24,6 +24,7 @@ from .policy import SourcePolicyError, normalize_source_policy
 
 
 LOGGER = logging.getLogger("ollama_inference_broker.audit")
+OBSERVER_READ_DEADLINE_SECONDS = 0.75
 
 # Used only to keep upgraded databases rollback-compatible.  The current
 # scheduler intentionally does not consult these values.
@@ -614,32 +615,58 @@ class Broker:
                 windows=windows,
             )
 
+    @staticmethod
+    def _observer_error(error: sqlite3.Error) -> dict[str, str]:
+        """Return safe, actionable SQLite observer diagnostics."""
+        sqlite_error = getattr(error, "sqlite_errorname", None)
+        if not sqlite_error:
+            message = str(error).lower()
+            if "interrupted" in message:
+                sqlite_error = "SQLITE_INTERRUPT"
+            elif "locked" in message or "busy" in message:
+                sqlite_error = "SQLITE_BUSY"
+            elif "no such table" in message or "no such index" in message:
+                sqlite_error = "SQLITE_SCHEMA"
+            else:
+                sqlite_error = "SQLITE_ERROR"
+        LOGGER.warning(json.dumps({
+            "event": "observer.read_failed", "sqlite_error": sqlite_error,
+        }, sort_keys=True))
+        return {
+            "reason": "database observer read unavailable",
+            "sqlite_error": sqlite_error,
+        }
+
     def _observer_read(self, reader):
         """Run a bounded read without waiting for the dispatcher connection."""
         connection = None
-        deadline = time.monotonic() + 0.25
+        deadline = time.monotonic() + OBSERVER_READ_DEADLINE_SECONDS
         try:
-            connection = sqlite3.connect(self.database, timeout=0.05)
+            connection = sqlite3.connect(
+                self.database, timeout=OBSERVER_READ_DEADLINE_SECONDS,
+            )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only=ON")
-            connection.execute("PRAGMA busy_timeout=50")
+            connection.execute(
+                f"PRAGMA busy_timeout={int(OBSERVER_READ_DEADLINE_SECONDS * 1_000)}"
+            )
             connection.set_progress_handler(
                 lambda: int(time.monotonic() >= deadline), 1_000,
             )
             return reader(connection), None
-        except sqlite3.Error:
-            # Lock and storage details are intentionally not exposed through
-            # the local HTTP API.
-            return None, "database observer read unavailable"
+        except sqlite3.Error as error:
+            return None, self._observer_error(error)
         finally:
             if connection is not None:
                 connection.close()
 
     @staticmethod
-    def _observation(state: str, now: float, reason: str | None = None) -> dict[str, Any]:
+    def _observation(
+        state: str, now: float, error: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         observation: dict[str, Any] = {"state": state, "observed_at": now}
-        if reason is not None:
-            observation["reason"] = reason
+        if error is not None:
+            observation.update(error)
         return observation
 
     def dashboard(self, policy: SourcePolicy | None = None) -> dict:

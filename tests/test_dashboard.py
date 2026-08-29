@@ -98,6 +98,7 @@ class DashboardTests(unittest.TestCase):
         data = json.loads(api_body)
         self.assertEqual(api_status, 503)
         self.assertEqual(data["observation"]["state"], "unavailable")
+        self.assertEqual(data["observation"]["sqlite_error"], "SQLITE_BUSY")
         self.assertNotIn("overall", data)
         self.assertNotIn("sources", data)
         self.assertEqual(html_status, 503)

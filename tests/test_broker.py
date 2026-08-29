@@ -197,6 +197,7 @@ class BrokerTests(unittest.TestCase):
             stale_dashboard = b.dashboard()
         self.assertLess(time.monotonic() - started, 0.1)
         self.assertEqual(stale_dashboard["observation"]["state"], "stale")
+        self.assertEqual(stale_dashboard["observation"]["sqlite_error"], "SQLITE_BUSY")
         self.assertEqual(stale_dashboard["overall"]["states"]["queued"], 1)
 
     def test_dashboard_and_metrics_stay_local_while_dispatch_is_waiting_on_ollama(self):
