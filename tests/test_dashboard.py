@@ -37,11 +37,18 @@ class DashboardTests(unittest.TestCase):
                 ") VALUES (?,?,?,?,?,?,?,?,?,?)",
                 [
                     (
-                        f"history-{index}", "interactive", "generate", "history", 10,
+                        f"history-{index}", "interactive", "generate", "archive", 10,
                         payload, "completed", float(index), 99_999.0, float(index),
                     )
                     for index in range(2_000)
                 ],
+            )
+            broker.db.execute(
+                "INSERT INTO jobs("
+                "id,profile,kind,source,priority,payload,state,created,finished,queued_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("history", "interactive", "generate", "history", 10, payload,
+                 "completed", 1.0, 99_999.0, 1.0),
             )
 
         progress_calls = [0]
@@ -52,12 +59,14 @@ class DashboardTests(unittest.TestCase):
 
         broker.db.set_progress_handler(stop_full_table_scan, 1)
         try:
-            data = snapshot(broker.db, now=100_000, policy_snapshot=None)
+            data = snapshot(broker.db, now=100_000, policy_snapshot={"sources": {
+                "history": {"enabled": True, "weight": 1.0},
+            }})
         finally:
             broker.db.set_progress_handler(None, 0)
 
-        self.assertEqual(data["overall"]["states"]["completed"], 2_000)
-        self.assertEqual(data["overall"]["completed_last_hour"], 2_000)
+        self.assertEqual(data["overall"]["states"]["completed"], 1)
+        self.assertEqual(data["overall"]["completed_last_hour"], 1)
         self.assertLess(progress_calls[0], 70_000)
 
     def test_dashboard_endpoints_report_unavailable_observer_instead_of_empty_queue(self):

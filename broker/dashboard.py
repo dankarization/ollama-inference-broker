@@ -39,25 +39,33 @@ def snapshot(
     policy_sources = (policy_snapshot or {}).get("sources", {})
     policy_active = policy_snapshot is not None
     schedules = dict(db.execute("SELECT source,next_allowed FROM source_schedules"))
-    # This must stay a covering read.  `jobs` contains request payloads and
-    # can be multiple GiB; the former aggregate referenced fields outside this
-    # index and caused a table lookup for every historical job.  That exceeds
-    # the observer's intentionally short progress deadline even though the
-    # queue itself is healthy.
-    source_stats: dict[str, dict[str, int]] = {}
-    for row in db.execute(
-        "SELECT source,state,count(*) AS count FROM jobs "
-        "INDEXED BY jobs_source_state GROUP BY source,state"
-    ):
-        source_stats.setdefault(row["source"], {})[row["state"]] = row["count"]
-    source_names = set(source_stats)
-    source_names.update(policy_sources)
+    # Do not discover sources by scanning all historical jobs.  `jobs` holds
+    # payloads and can be multiple GiB, so even an index-only global scan can
+    # exceed the observer deadline on a cold cache.  Policy/schedule sources
+    # are known directly; active unconfigured sources remain visible through
+    # the state-leading index.
+    source_names = set(policy_sources)
+    source_names.update(schedules)
+    source_names.update(
+        row["source"]
+        for row in db.execute(
+            "SELECT DISTINCT source FROM jobs INDEXED BY jobs_state_started "
+            "WHERE state IN ('queued','running','cancel_requested')"
+        )
+    )
     sources: list[dict[str, Any]] = []
     overall = {name: 0 for name in ("queued", "running", "lease", "retry", "delayed", "completed", "failed", "dead", "cancelled")}
 
     for source in sorted(source_names):
         configured = policy_sources.get(source)
-        state_counts = source_stats.get(source, {})
+        state_counts = {
+            row["state"]: row["count"]
+            for row in db.execute(
+                "SELECT state,count(*) AS count FROM jobs "
+                "INDEXED BY jobs_source_state WHERE source=? GROUP BY state",
+                (source,),
+            )
+        }
         queued = state_counts.get("queued", 0)
         next_allowed = schedules.get(source)
         delayed = queued if next_allowed is not None and next_allowed > now else 0
