@@ -97,10 +97,16 @@ class AnalyticsTests(unittest.TestCase):
             broker.db.execute("SELECT priority FROM jobs WHERE id='legacy-job'").fetchone()[0], 1
         )
         admitted = broker.submit("interactive", "generate", {"prompt": "new"})
+        cron = broker.submit("cron", "generate", {"prompt": "new"})
         self.assertNotIn("priority", admitted)
+        self.assertNotIn("priority", cron)
         self.assertEqual(
             broker.db.execute("SELECT priority FROM jobs WHERE id=?", (admitted["id"],)).fetchone()[0],
-            10,
+            1,
+        )
+        self.assertEqual(
+            broker.db.execute("SELECT priority FROM jobs WHERE id=?", (cron["id"],)).fetchone()[0],
+            2,
         )
         self.assertIn("legacy_jobs_state", {
             row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")

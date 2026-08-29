@@ -21,6 +21,19 @@ from .profiles import PROFILES
 
 LOGGER = logging.getLogger("ollama_inference_broker.audit")
 
+# Used only to keep upgraded databases rollback-compatible.  The current
+# scheduler intentionally does not consult these values.
+LEGACY_SOURCE_PRIORITIES = {
+    "interactive": 1,
+    "cron": 2,
+    "shutterstock-video": 3,
+    "syncopia-telegram-memory": 4,
+    "shutterstock-canary": 5,
+    "olya-decision": 6,
+    "olya": 8,
+    "olya-vision": 8,
+}
+
 
 class SourcePolicyError(ValueError):
     pass
@@ -203,8 +216,9 @@ class Broker:
             # never read by admission or dispatch, but preserving it makes a
             # rollback to the prior broker binary lossless and avoids SQLite
             # table-rebuild/index compatibility hazards.  Older schemas can
-            # make it NOT NULL without a default, so admissions supply a
-            # neutral legacy placeholder when that retained column exists.
+            # make it NOT NULL without a default, so admissions supply the
+            # former fixed source value (or the neutral legacy default) when
+            # that retained column exists.
             self.db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred REAL NOT NULL,
@@ -403,10 +417,11 @@ class Broker:
                 if existing is not None:
                     return self.status(existing["id"])
             if self._has_legacy_priority:
+                legacy_priority = LEGACY_SOURCE_PRIORITIES.get(source, 10)
                 self.db.execute(
                     "INSERT INTO jobs(id,profile,kind,source,priority,payload,state,created,"
                     "queued_at,source_item_id,external_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (job_id, profile, kind, source, 10, json.dumps(payload), "queued", now,
+                    (job_id, profile, kind, source, legacy_priority, json.dumps(payload), "queued", now,
                      now, source_item_id, external_id),
                 )
             else:
