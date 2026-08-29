@@ -17,6 +17,7 @@ from .compat import (CompatibilityError, validate_olya_decision_payload,
                      validate_shutterstock_video_payload,
                      validate_syncopia_memory_payload)
 from .profiles import PROFILES
+from .policy import SourcePolicyError, normalize_source_policy
 
 
 LOGGER = logging.getLogger("ollama_inference_broker.audit")
@@ -33,38 +34,6 @@ LEGACY_SOURCE_PRIORITIES = {
     "olya": 8,
     "olya-vision": 8,
 }
-
-
-class SourcePolicyError(ValueError):
-    pass
-
-
-def normalize_source_policy(raw: Any) -> dict[str, dict[str, Any]]:
-    """Validate and apply defaults to a source-policy document."""
-    if not isinstance(raw, dict):
-        raise SourcePolicyError("policy must contain an object 'sources'")
-    sources = raw.get("sources")
-    if not isinstance(sources, dict):
-        raise SourcePolicyError("policy must contain an object 'sources'")
-    normalized: dict[str, dict[str, Any]] = {}
-    for name, entry in sources.items():
-        if not isinstance(name, str) or not name:
-            raise SourcePolicyError("source names must be non-empty strings")
-        if not isinstance(entry, dict):
-            raise SourcePolicyError(f"source {name!r} must be an object")
-        unknown = set(entry) - {"enabled", "weight"}
-        if unknown:
-            raise SourcePolicyError(
-                f"source {name!r} has unknown keys: {', '.join(sorted(unknown))}"
-            )
-        enabled = entry.get("enabled", True)
-        weight = entry.get("weight", 1.0)
-        if not isinstance(enabled, bool):
-            raise SourcePolicyError(f"source {name!r} enabled must be a boolean")
-        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0:
-            raise SourcePolicyError(f"source {name!r} weight must be a positive number")
-        normalized[name] = {"enabled": enabled, "weight": float(weight)}
-    return normalized
 
 
 class SourcePolicy:
@@ -173,7 +142,7 @@ class Broker:
             self.db.execute("PRAGMA journal_mode=WAL")
             jobs_schema = """CREATE TABLE jobs (
                 id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
-                source TEXT NOT NULL,
+                source TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 10,
                 payload TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
                 started REAL, finished REAL, lease_until REAL, error TEXT,
                 switch_reason TEXT, result_json TEXT,

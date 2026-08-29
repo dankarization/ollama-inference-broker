@@ -220,6 +220,16 @@ class BrokerTests(unittest.TestCase):
             thread.join(timeout=1)
             server.server_close()
 
+    def test_fresh_database_retains_legacy_priority_for_rollback(self):
+        b = self.make()
+        job = b.submit("interactive", "generate", {"prompt": "x"})
+        columns = {row[1] for row in b.db.execute("PRAGMA table_info(jobs)")}
+        self.assertIn("priority", columns)
+        self.assertEqual(
+            b.db.execute("SELECT priority FROM jobs WHERE id=?", (job["id"],)).fetchone()[0],
+            1,
+        )
+
 if __name__ == "__main__": unittest.main()
 
 class SourcePolicyTests(unittest.TestCase):

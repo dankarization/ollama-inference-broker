@@ -265,6 +265,7 @@ class StatusReporterTests(unittest.TestCase):
         self.assertNotIn("OllamaHTTP", module)
         self.assertNotIn("/api/generate", module)
         self.assertNotIn("broker.compat", module)
+        self.assertNotIn("from .service import", module)
 
 
 if __name__ == "__main__":

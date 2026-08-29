@@ -25,7 +25,7 @@ from typing import Any, Callable, Iterable
 from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
-from .service import SourcePolicyError, normalize_source_policy
+from .policy import SourcePolicyError, normalize_source_policy
 
 TBILISI = ZoneInfo("Asia/Tbilisi")
 REPORT_SOURCES = {
