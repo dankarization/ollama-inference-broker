@@ -320,7 +320,7 @@ def validate_syncopia_memory_payload(request: Any) -> dict[str, Any]:
     return {
         "messages": messages,
         "format": schema,
-        "think": "low",
+        "think": False,
         "options": {
             "temperature": 0,
             "num_ctx": profile.max_context,

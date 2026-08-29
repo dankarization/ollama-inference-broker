@@ -199,7 +199,7 @@ Runtime-параметры моделей задаёт broker, caller не мо�
 `POST /v1/syncopia-memory/extract` — отдельный синхронный text-only contract
 для локального Phase-2 extractor. Он требует `tools=[]`, `stream=false`, ровно
 system+user messages и JSON Schema, запускает только
-`qwen3.8:ad-iq2-xs` с `num_ctx=65536`, `think=low` и source
+`qwen3.8:ad-iq2-xs` с `num_ctx=65536`, `num_predict=8192`, `think=false` и source
 `syncopia-telegram-memory`. Request hash используется caller как idempotency
 key; Olya/Shutterstock endpoints и profiles не переиспользуются.
 

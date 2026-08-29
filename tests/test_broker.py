@@ -603,9 +603,10 @@ class SyncopiaMemoryEndpointTests(unittest.TestCase):
         request.update(overrides)
         return request
 
-    def test_profile_is_pinned_tools_disabled_64k_low_and_idempotent(self):
+    def test_profile_is_pinned_tools_disabled_64k_no_think_8k_and_idempotent(self):
         broker = self.make(["qwen3.8:ad-iq2-xs"])
         from broker.compat import submit_syncopia_memory
+        from broker.profiles import PROFILES
         job = submit_syncopia_memory(broker, self.request())
         duplicate = submit_syncopia_memory(broker, self.request())
         self.assertEqual(duplicate["id"], job["id"])
@@ -617,11 +618,12 @@ class SyncopiaMemoryEndpointTests(unittest.TestCase):
             if isinstance(call, tuple) and call[0] == "run" and call[1] == "chat"
         ][0]
         self.assertEqual(request["model"], "qwen3.8:ad-iq2-xs")
-        self.assertEqual(request["think"], "low")
+        self.assertIs(request["think"], False)
         self.assertNotIn("tools", request)
         self.assertEqual(request["options"], {
-            "temperature": 0, "num_ctx": 65_536, "num_predict": 4_096,
+            "temperature": 0, "num_ctx": 65_536, "num_predict": 8_192,
         })
+        self.assertEqual(PROFILES["syncopia-memory-qwen38"].request_timeout_seconds, 900)
 
     def test_contract_rejects_tools_model_media_and_streaming(self):
         from broker.compat import CompatibilityError, validate_syncopia_memory_payload

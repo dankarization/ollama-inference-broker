@@ -25,7 +25,7 @@
 - [x] Локальный `GET /healthz`: состояние очереди и активной lease без WOL,
   запроса к MAIN-PC или обращения к Ollama.
 - [x] Добавлен отдельный Phase-2 text endpoint `syncopia-telegram-memory`:
-  pinned qwen38, 64k context, `think=low`, tools disabled и production policy
+  pinned qwen38, 64k context, 8k output, `think=false`, tools disabled и production policy
   weight `4`; неизвестные ключи source policy отклоняются fail-closed.
 - [x] Развёрнут loopback-only user-service с durable SQLite и явным
   admission-only guard (`BROKER_DISPATCH_ENABLED=false`). Проверены `/healthz`
