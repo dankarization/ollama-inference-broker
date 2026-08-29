@@ -175,6 +175,7 @@ class Broker:
                 source TEXT PRIMARY KEY, next_allowed REAL NOT NULL)""")
             # Compatible with databases created by the first isolated MVP.
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
+            self._has_legacy_priority = "priority" in columns
             if "source" not in columns:
                 self.db.execute("ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'")
             if "result_json" not in columns:
@@ -201,7 +202,9 @@ class Broker:
             # Keep a legacy ``priority`` column in upgraded databases.  It is
             # never read by admission or dispatch, but preserving it makes a
             # rollback to the prior broker binary lossless and avoids SQLite
-            # table-rebuild/index compatibility hazards.
+            # table-rebuild/index compatibility hazards.  Older schemas can
+            # make it NOT NULL without a default, so admissions supply a
+            # neutral legacy placeholder when that retained column exists.
             self.db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred REAL NOT NULL,
@@ -399,12 +402,20 @@ class Broker:
                 ).fetchone()
                 if existing is not None:
                     return self.status(existing["id"])
-            self.db.execute(
-                "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
-                "queued_at,source_item_id,external_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (job_id, profile, kind, source, json.dumps(payload), "queued", now,
-                 now, source_item_id, external_id),
-            )
+            if self._has_legacy_priority:
+                self.db.execute(
+                    "INSERT INTO jobs(id,profile,kind,source,priority,payload,state,created,"
+                    "queued_at,source_item_id,external_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (job_id, profile, kind, source, 10, json.dumps(payload), "queued", now,
+                     now, source_item_id, external_id),
+                )
+            else:
+                self.db.execute(
+                    "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
+                    "queued_at,source_item_id,external_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (job_id, profile, kind, source, json.dumps(payload), "queued", now,
+                     now, source_item_id, external_id),
+                )
             self._audit(
                 "admission.accepted", job_id=job_id, source=source,
                 from_state=None, to_state="queued", occurred=now,

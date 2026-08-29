@@ -70,7 +70,7 @@ class AnalyticsTests(unittest.TestCase):
         db = sqlite3.connect(path)
         db.execute("""CREATE TABLE jobs (
             id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
-            priority INTEGER NOT NULL DEFAULT 10, payload TEXT NOT NULL,
+            priority INTEGER NOT NULL, payload TEXT NOT NULL,
             state TEXT NOT NULL, created REAL NOT NULL,
             started REAL, finished REAL, lease_until REAL, error TEXT,
             switch_reason TEXT)""")
@@ -95,6 +95,12 @@ class AnalyticsTests(unittest.TestCase):
         })
         self.assertEqual(
             broker.db.execute("SELECT priority FROM jobs WHERE id='legacy-job'").fetchone()[0], 1
+        )
+        admitted = broker.submit("interactive", "generate", {"prompt": "new"})
+        self.assertNotIn("priority", admitted)
+        self.assertEqual(
+            broker.db.execute("SELECT priority FROM jobs WHERE id=?", (admitted["id"],)).fetchone()[0],
+            10,
         )
         self.assertIn("legacy_jobs_state", {
             row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")
