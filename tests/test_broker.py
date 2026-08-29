@@ -201,9 +201,25 @@ class BrokerTests(unittest.TestCase):
         worker = threading.Thread(target=broker.dispatch_once)
         worker.start()
         self.assertTrue(ollama.ps_started.wait(timeout=1))
-        started = time.monotonic()
-        dashboard, metrics = broker.dashboard(), broker.metrics()
-        self.assertLess(time.monotonic() - started, 0.2)
+        observed = {}
+        completed = threading.Event()
+
+        def observe():
+            observed["dashboard"] = broker.dashboard()
+            observed["metrics"] = broker.metrics()
+            completed.set()
+
+        with broker.lock, broker.db:
+            broker.db.execute(
+                "UPDATE jobs SET lease_until=lease_until+1 WHERE id=?", (job["id"],)
+            )
+            started = time.monotonic()
+            observer = threading.Thread(target=observe)
+            observer.start()
+            self.assertTrue(completed.wait(timeout=0.2))
+            self.assertLess(time.monotonic() - started, 0.2)
+        observer.join(timeout=1)
+        dashboard, metrics = observed["dashboard"], observed["metrics"]
         self.assertEqual(dashboard["active_jobs"][0]["id"], job["id"])
         self.assertEqual(metrics["active"]["id"], job["id"])
         self.assertNotIn("payload", metrics["active"])

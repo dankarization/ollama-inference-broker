@@ -153,7 +153,8 @@ class Broker:
     """One-resource scheduler; MAIN-PC remains only the wakeable executor."""
     def __init__(self, database: str | Path, ollama, wol, clock=time.time, lease_seconds=60):
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
-        self.db = sqlite3.connect(str(database), check_same_thread=False)
+        self.database = str(database)
+        self.db = sqlite3.connect(self.database, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
         self.completed = threading.Condition(self.lock)
@@ -162,6 +163,10 @@ class Broker:
             "active_job_id": None, "timestamp": self.clock(),
         }
         self._loaded_models_cache: list[dict[str, Any]] = []
+        self._dashboard_cache: dict[str, Any] | None = None
+        self._metrics_cache: dict[str, Any] = {
+            "resource": "mainpc-gpu", "queue_depth": 0, "active": None,
+        }
         self._init_db()
         self.recover()
         with self.lock:
@@ -608,13 +613,72 @@ class Broker:
                 windows=windows,
             )
 
+    def _observer_read(self, reader):
+        """Run a bounded read without waiting for the dispatcher connection."""
+        connection = None
+        deadline = time.monotonic() + 0.25
+        try:
+            connection = sqlite3.connect(self.database, timeout=0.05)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA busy_timeout=50")
+            connection.set_progress_handler(
+                lambda: int(time.monotonic() >= deadline), 1_000,
+            )
+            return reader(connection)
+        except sqlite3.Error:
+            return None
+        finally:
+            if connection is not None:
+                connection.close()
+
+    @staticmethod
+    def _empty_dashboard(now: float, policy_snapshot: dict[str, Any] | None) -> dict:
+        sources = []
+        for source, configured in sorted((policy_snapshot or {}).get("sources", {}).items()):
+            sources.append({
+                "source": source,
+                "scheduler": {
+                    "enabled": configured.get("enabled"),
+                    "weight": configured.get("weight"),
+                    "next_allowed": None,
+                },
+                "states": {
+                    "queued": 0, "running": 0, "lease": 0, "retry": 0,
+                    "delayed": 0, "completed": 0, "failed": 0, "dead": 0,
+                    "cancelled": 0,
+                },
+                "completed_last_hour": 0,
+                "completed_last_24_hours": 0,
+            })
+        return {
+            "timestamp": now, "sources": sources,
+            "active_jobs": [],
+            "overall": {
+                "states": {
+                    "queued": 0, "running": 0, "lease": 0, "retry": 0,
+                    "delayed": 0, "completed": 0, "failed": 0, "dead": 0,
+                    "cancelled": 0,
+                },
+                "completed_last_hour": 0, "completed_last_24_hours": 0,
+            },
+        }
+
     def dashboard(self, policy: SourcePolicy | None = None) -> dict:
         """Payload-free live queue data for the local operational dashboard."""
         policy_snapshot = policy.snapshot() if policy is not None else None
-        with self.lock:
-            return dashboard_snapshot(
-                self.db, now=self.clock(), policy_snapshot=policy_snapshot
+        now = self.clock()
+        snapshot = self._observer_read(
+            lambda db: dashboard_snapshot(
+                db, now=now, policy_snapshot=policy_snapshot,
             )
+        )
+        if snapshot is not None:
+            self._dashboard_cache = snapshot
+            return snapshot
+        if self._dashboard_cache is not None:
+            return self._dashboard_cache
+        return self._empty_dashboard(now, policy_snapshot)
 
     def correlations(
         self, *, source: str | None = None, source_item_id: str | None = None,
@@ -874,17 +938,23 @@ class Broker:
                 self.completed.wait(remaining)
 
     def metrics(self) -> dict:
-        with self.lock:
-            queued = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0]
-            active = self.db.execute(
+        snapshot = self._observer_read(lambda db: {
+            "queue_depth": db.execute(
+                "SELECT count(*) FROM jobs WHERE state='queued'"
+            ).fetchone()[0],
+            "active": (lambda row: dict(row) if row else None)(db.execute(
                 "SELECT id,source,profile,kind,state,created,started,lease_until,attempt_count,retry_count "
                 "FROM jobs WHERE state IN ('running','cancel_requested') "
                 "ORDER BY started,created,id LIMIT 1"
-            ).fetchone()
-            loaded_models = [dict(model) for model in self._loaded_models_cache]
-        return {"resource": "mainpc-gpu", "queue_depth": queued,
-                "active": dict(active) if active else None,
-                "loaded_models": loaded_models, "timestamp": self.clock()}
+            ).fetchone()),
+        })
+        if snapshot is not None:
+            self._metrics_cache = {"resource": "mainpc-gpu", **snapshot}
+        return {
+            **self._metrics_cache,
+            "loaded_models": [dict(model) for model in self._loaded_models_cache],
+            "timestamp": self.clock(),
+        }
 
     def health(self) -> dict:
         """Return a local broker probe without waking or querying MAIN-PC."""
