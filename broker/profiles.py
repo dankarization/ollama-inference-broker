@@ -69,18 +69,3 @@ PROFILES = {
         max_images=4, max_schema_bytes=16_384,
     ),
 }
-
-# Lower is more important. These classes are policy compiled into the broker,
-# never trusted from a caller-provided priority field.
-FIXED_SOURCE_PRIORITIES = {
-    "interactive": 1,  # OpenClaw interactive/open session
-    "cron": 2,         # OpenClaw cron
-    "shutterstock-video": 3,
-    "olya": 8,
-    "olya-vision": 8,
-    "olya-decision": 6,
-    "syncopia-telegram-memory": 4,
-    "shutterstock-canary": 5,
-}
-MIN_PRIORITY = 1
-MAX_PRIORITY = 10

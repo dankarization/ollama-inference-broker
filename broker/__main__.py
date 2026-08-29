@@ -55,7 +55,7 @@ def main() -> None:
     if dispatch_enabled(os.environ.get("BROKER_DISPATCH_ENABLED")):
         allowed_sources = None
         if policy is None:
-            # Strict-priority mode: env allowlist is required and immutable
+            # FIFO mode: env allowlist is required and immutable
             # until a restart (previous behaviour).
             allowed_sources = dispatch_sources(os.environ.get("BROKER_DISPATCH_SOURCES"))
         Dispatcher(

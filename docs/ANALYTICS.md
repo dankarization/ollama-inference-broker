@@ -1,7 +1,7 @@
 # Аналитика очереди и scheduler
 
 Этот слой нужен для сравнения scheduler algorithms на исторических данных. Он
-не меняет действующий выбор: без runtime policy остаётся strict priority/FIFO,
+не меняет действующий выбор: без runtime policy остаётся global FIFO,
 с policy — существующий weighted round-robin.
 
 ## Что сохраняется
@@ -24,7 +24,7 @@ Correlation identifiers ограничены строкой до 256 симво�
 вымышленные scheduler decisions/attempts; их текущее состояние видно в
 `current`, но historical window counters учитывают только новые audit events.
 
-Каждый `scheduler.selected` сохраняет выбранный source/priority, mode и причину,
+Каждый `scheduler.selected` сохраняет выбранный source, mode и причину,
 реально eligible sources и активные weights из последней hot policy. Поэтому
 atomic reload policy не обнуляет историю и позволяет восстановить условия
 каждого решения.
@@ -123,8 +123,7 @@ weights `olya-vision=8`, `olya-decision=6`, `shutterstock-video=3`:
   надёжная оценка cost;
 - weighted fair queue — полезен при нескольких непрерывно загруженных sources,
   но требует виртуального времени/cost;
-- aging поверх bounded priority — уменьшает starvation, но должен сохранять
-  hard priority constraints.
+- aging — уменьшает starvation, но должен сохранять FIFO-инварианты source.
 
 Основные критерии: p95 wait/e2e по source, throughput, success/retry/requeue,
 starvation (максимальный wait), actual-vs-expected share и смены модели. Нельзя
@@ -146,13 +145,10 @@ starvation (максимальный wait), actual-vs-expected share и смен
 `<tg-time>` даёт нативные активные Telegram даты/время; динамические
 идентификаторы HTML-экранируются и ограничены тремя компактными значениями.
 
-В отчёте есть только одна операторская шкала: **приоритет 1–10** (1 выше, 10
-ниже): Shutterstock 3, Olya Vision 8, Olya Decision 6. Это фактический
-server-owned `job.priority`, а не число из source policy. Внутри broker
-runtime policy всё ещё хранит отдельные private weights для weighted
-round-robin между sources; priority упорядочивает jobs *внутри* выбранного
-source. Репорт их не печатает, а это изменение не меняет текущие weights,
-allocation или throughput.
+В отчёте отображается effective **weight** каждого source: это единственный
+операторский scheduling-параметр. Runtime policy использует weights для
+weighted round-robin между sources, а внутри выбранного source сохраняется
+FIFO.
 
 Размеры файлов и queue delta не выводятся: в broker SQLite нет надёжного
 поля размера и почасового baseline snapshot. Health состоит только из

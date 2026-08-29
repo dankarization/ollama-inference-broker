@@ -10,12 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
+from .dashboard import snapshot as dashboard_snapshot
 from .compat import (CompatibilityError, validate_olya_decision_payload,
                      validate_olya_vision_payload,
                      validate_shutterstock_canary_payload,
                      validate_shutterstock_video_payload,
                      validate_syncopia_memory_payload)
-from .profiles import FIXED_SOURCE_PRIORITIES, MAX_PRIORITY, MIN_PRIORITY, PROFILES
+from .profiles import PROFILES
 
 
 LOGGER = logging.getLogger("ollama_inference_broker.audit")
@@ -157,7 +158,7 @@ class Broker:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("""CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
-                source TEXT NOT NULL, priority INTEGER NOT NULL,
+                source TEXT NOT NULL,
                 payload TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
                 started REAL, finished REAL, lease_until REAL, error TEXT,
                 switch_reason TEXT, result_json TEXT,
@@ -171,8 +172,8 @@ class Broker:
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
             if "source" not in columns:
                 self.db.execute("ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'")
-            if "priority" not in columns:
-                self.db.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 10")
+            if "priority" in columns:
+                self.db.execute("ALTER TABLE jobs DROP COLUMN priority")
             if "result_json" not in columns:
                 self.db.execute("ALTER TABLE jobs ADD COLUMN result_json TEXT")
             if "source_item_id" not in columns:
@@ -326,7 +327,7 @@ class Broker:
             self.completed.notify_all()
 
     def submit(self, profile: str, kind: str, payload: dict, source: str | None = None,
-               priority: int | None = None, source_item_id: str | None = None,
+               source_item_id: str | None = None,
                external_id: str | None = None) -> dict:
         if profile not in PROFILES:
             raise ValueError("unknown profile")
@@ -379,7 +380,6 @@ class Broker:
                 })
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
-        resolved_priority = self._resolve_priority(source, priority)
         source_item_id = self._correlation_value("source_item_id", source_item_id)
         external_id = self._correlation_value("external_id", external_id)
         job_id, now = str(uuid.uuid4()), self.clock()
@@ -393,10 +393,10 @@ class Broker:
                 if existing is not None:
                     return self.status(existing["id"])
             self.db.execute(
-                "INSERT INTO jobs(id,profile,kind,source,priority,payload,state,created,"
-                "queued_at,source_item_id,external_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (job_id, profile, kind, source, resolved_priority, json.dumps(payload),
-                 "queued", now, now, source_item_id, external_id),
+                "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
+                "queued_at,source_item_id,external_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (job_id, profile, kind, source, json.dumps(payload), "queued", now,
+                 now, source_item_id, external_id),
             )
             self._audit(
                 "admission.accepted", job_id=job_id, source=source,
@@ -404,7 +404,6 @@ class Broker:
                 metadata={
                     "profile": profile,
                     "kind": kind,
-                    "priority": resolved_priority,
                     "has_source_item_id": source_item_id is not None,
                     "has_external_id": external_id is not None,
                 },
@@ -419,17 +418,6 @@ class Broker:
         if not isinstance(value, str) or not value.strip() or len(value) > 256:
             raise ValueError(f"{name} must be a non-empty string up to 256 characters")
         return value.strip()
-
-    @staticmethod
-    def _resolve_priority(source: str, priority: int | None) -> int:
-        fixed = FIXED_SOURCE_PRIORITIES.get(source)
-        if fixed is not None:
-            if priority is not None and priority != fixed:
-                raise ValueError(f"source '{source}' has fixed priority {fixed}")
-            return fixed
-        if isinstance(priority, bool) or not isinstance(priority, int) or not MIN_PRIORITY <= priority <= MAX_PRIORITY:
-            raise ValueError(f"priority for non-fixed sources must be an integer from {MIN_PRIORITY} to {MAX_PRIORITY}")
-        return priority
 
     def status(self, job_id: str) -> dict | None:
         with self.lock:
@@ -449,8 +437,8 @@ class Broker:
 
     def _position(self, row):
         before = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued' AND "
-            "(priority < ? OR (priority = ? AND (created < ? OR (created = ? AND id < ?))))",
-            (row["priority"], row["priority"], row["created"], row["created"], row["id"])).fetchone()[0]
+            "(created < ? OR (created = ? AND id < ?))",
+            (row["created"], row["created"], row["id"])).fetchone()[0]
         return before + 1
 
     def cancel(self, job_id: str) -> dict | None:
@@ -570,6 +558,14 @@ class Broker:
                 windows=windows,
             )
 
+    def dashboard(self, policy: SourcePolicy | None = None) -> dict:
+        """Payload-free live queue data for the local operational dashboard."""
+        policy_snapshot = policy.snapshot() if policy is not None else None
+        with self.lock:
+            return dashboard_snapshot(
+                self.db, now=self.clock(), policy_snapshot=policy_snapshot
+            )
+
     def correlations(
         self, *, source: str | None = None, source_item_id: str | None = None,
         external_id: str | None = None, limit: int = 100,
@@ -598,12 +594,11 @@ class Broker:
             return [dict(row) for row in rows]
 
     def _candidates(self, allowed_sources: frozenset[str] | None = None):
-        """Queued rows eligible now, ordered by strict priority then FIFO.
+        """Queued rows eligible now, ordered FIFO.
 
         Per-source concurrency and min-interval backpressure are applied here
         exactly as before; this method returns the full ordered candidate list
-        so a weighted policy can pick a source fairly instead of always taking
-        the highest-priority row.
+        so a weighted policy can pick a source fairly.
         """
         if allowed_sources is not None and not allowed_sources:
             return []
@@ -613,7 +608,7 @@ class Broker:
             placeholders = ",".join("?" for _ in allowed_sources)
             query += f" AND source IN ({placeholders})"
             values = tuple(sorted(allowed_sources))
-        query += " ORDER BY priority, created, id"
+        query += " ORDER BY created, id"
         now = self.clock()
         candidates = []
         for row in self.db.execute(query, values):
@@ -633,8 +628,7 @@ class Broker:
         """Pick a candidate by weighted round-robin across sources.
 
         Weights are relative shares of dispatch opportunities per source; the
-        first candidate of each source is ordered internally by strict
-        priority then FIFO.  A deterministic rotating accumulator keeps the
+        first candidate of each source is ordered FIFO. A deterministic rotating accumulator keeps the
         schedule fair and stable across policy reloads.  When the policy has
         no entry for a source, the source keeps the default weight of 1.
         """
@@ -660,19 +654,16 @@ class Broker:
         return by_source[chosen_source][0]
 
     def _next(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None):
-        # Strict priority is deliberate when no weighted policy is installed:
-        # no aging can promote lower-priority work ahead of a waiting
-        # higher-priority job.  With a policy, sources share the GPU by their
-        # configured weights instead (fairness), preserving per-source
-        # priority/FIFO order inside each source.
+        # With a policy, sources share the GPU by their configured weights.
+        # Without one, the enabled source set is served in global FIFO order.
         candidates = self._candidates(allowed_sources)
         if not candidates:
             self._last_scheduler_decision = None
             return None
         if policy is None:
             selected = candidates[0]
-            mode = "strict_priority_fifo"
-            reason = "lowest priority value, then oldest queued job"
+            mode = "fifo"
+            reason = "oldest queued job"
             active_weights: dict[str, float] = {}
         else:
             selected = self._weighted_pick(candidates, policy)
@@ -690,7 +681,6 @@ class Broker:
             "eligible_sources": sorted({row["source"] for row in candidates}),
             "active_weights": active_weights,
             "selected_source": selected["source"],
-            "selected_priority": selected["priority"],
         }
         return selected
 
@@ -865,7 +855,7 @@ class Dispatcher(threading.Thread):
         while not self.stop_event.is_set():
             # With a runtime policy, the effective allowlist and weights come
             # from the reloaded policy file; without one, the env allowlist is
-            # used with strict priority (previous behaviour).
+            # used with global FIFO ordering.
             policy = self.policy
             allowed = self.allowed_sources
             if policy is not None:

@@ -70,7 +70,8 @@ class AnalyticsTests(unittest.TestCase):
         db = sqlite3.connect(path)
         db.execute("""CREATE TABLE jobs (
             id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
-            payload TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 10, payload TEXT NOT NULL,
+            state TEXT NOT NULL, created REAL NOT NULL,
             started REAL, finished REAL, lease_until REAL, error TEXT,
             switch_reason TEXT)""")
         db.execute(
@@ -85,9 +86,11 @@ class AnalyticsTests(unittest.TestCase):
         job = broker.status("legacy-job")
         self.assertEqual(job["state"], "queued")
         self.assertEqual(job["source"], "legacy")
-        self.assertEqual(job["priority"], 10)
         self.assertEqual(job["queued_at"], 10)
         self.assertEqual(job["payload"], {"prompt": "x"})
+        self.assertNotIn("priority", {
+            row[1] for row in broker.db.execute("PRAGMA table_info(jobs)")
+        })
         tables = {row[0] for row in broker.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
@@ -106,7 +109,7 @@ class AnalyticsTests(unittest.TestCase):
 
         job = broker.submit(
             "batch-video", "generate", {"prompt": "private-payload-marker"},
-            source="analytics-source", priority=7,
+            source="analytics-source",
             source_item_id="item-42", external_id="external-7",
         )
         self.assertEqual(job["source_item_id"], "item-42")
@@ -159,7 +162,7 @@ class AnalyticsTests(unittest.TestCase):
             broker.db.execute(
                 "INSERT INTO job_attempts(job_id,attempt_no,source,queued_at,"
                 "selected_at,started,lease_until,scheduler_mode,selection_reason) "
-                "VALUES(?,1,'interactive',100,100,100,105,'strict_priority_fifo','test')",
+                "VALUES(?,1,'interactive',100,100,100,105,'fifo','test')",
                 (job_id,),
             )
         broker.db.close()
@@ -190,7 +193,7 @@ class AnalyticsTests(unittest.TestCase):
             broker.db.execute(
                 "INSERT INTO job_attempts(job_id,attempt_no,source,queued_at,"
                 "selected_at,started,lease_until,scheduler_mode,selection_reason) "
-                "VALUES(?,1,'interactive',100,100,100,120,'strict_priority_fifo','test')",
+                "VALUES(?,1,'interactive',100,100,100,120,'fifo','test')",
                 (job_id,),
             )
         clock.value = 110
@@ -202,7 +205,7 @@ class AnalyticsTests(unittest.TestCase):
         broker = self.make()
         job = broker.submit(
             "batch-video", "generate", {"prompt": "private-value"},
-            source="lookup-source", priority=7,
+            source="lookup-source",
             source_item_id="item-a", external_id="external-a",
         )
         self.assertEqual(broker.cancel(job["id"])["state"], "cancelled")
@@ -321,7 +324,7 @@ class AnalyticsTests(unittest.TestCase):
         broker = self.make()
         job_id = broker.submit(
             "batch-video", "generate", {"prompt": "not-in-audit"},
-            source="api-source", priority=7, source_item_id="source-1",
+            source="api-source", source_item_id="source-1",
         )["id"]
         broker.dispatch_once()
         server = serve(broker, port=0)

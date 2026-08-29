@@ -64,32 +64,28 @@ class BrokerTests(unittest.TestCase):
         ):
             self.assertTrue(client.wait_ready("gemma4:12b", timeout_seconds=3))
         self.assertEqual(sleep.call_count, 2)
-    def test_fixed_source_priorities_then_fifo(self):
+    def test_global_fifo_without_policy(self):
         b=self.make(["nemotron3:33b"], clock=iter(range(1_000)).__next__)
         cron=b.submit("cron", "generate", {"prompt":"cron"})["id"]
         first=b.submit("interactive", "generate", {"prompt":"one"})["id"]
         second=b.submit("interactive", "generate", {"prompt":"two"})["id"]
         shutterstock_video=b.submit("shutterstock-video", "generate", {"prompt":"video"})["id"]
         olya=b.submit("olya", "generate", {"prompt":"olya"})["id"]
+        b.dispatch_once(); self.assertEqual(b.status(cron)["state"], "completed")
         b.dispatch_once(); self.assertEqual(b.status(first)["state"], "completed")
         b.dispatch_once(); self.assertEqual(b.status(second)["state"], "completed")
-        b.dispatch_once(); self.assertEqual(b.status(cron)["state"], "completed")
         b.dispatch_once(); self.assertEqual(b.status(shutterstock_video)["state"], "completed")
         b.dispatch_once(); self.assertEqual(b.status(olya)["state"], "completed")
 
-    def test_fixed_source_mapping_is_server_owned(self):
+    def test_profiles_and_sources_remain_server_owned(self):
         b=self.make()
-        self.assertEqual(b.submit("interactive", "generate", {"prompt":"x"})["priority"], 1)
-        self.assertEqual(b.submit("cron", "generate", {"prompt":"x"})["priority"], 2)
         video = b.submit("shutterstock-video", "generate", {"prompt":"x"})
-        self.assertEqual(video["priority"], 3)
         self.assertEqual(video["profile"], "shutterstock-video")
         with self.assertRaisesRegex(ValueError, "unknown profile"):
             b.submit("shutterstock", "generate", {"prompt":"photo"})
         canary = b.submit("shutterstock-canary", "generate", {
             "prompt": "photo", "images": ["aGVsbG8="], "format": {"type": "object"},
         })
-        self.assertEqual(canary["priority"], 5)
         self.assertEqual(canary["source"], "shutterstock-canary")
         with self.assertRaisesRegex(ValueError, "images"):
             b.submit("shutterstock-canary", "generate", {"prompt": "unbounded"})
@@ -97,22 +93,11 @@ class BrokerTests(unittest.TestCase):
             b.submit("shutterstock-canary", "generate", {
                 "prompt": "photo", "images": ["aGVsbG8="], "format": {},
             }, source="shutterstock")
-        self.assertEqual(b.submit("olya", "generate", {"prompt":"x"})["priority"], 8)
-        with self.assertRaisesRegex(ValueError, "fixed priority 1"):
-            b.submit("interactive", "generate", {"prompt":"x"}, priority=10)
-
-    def test_dynamic_priority_requires_integer_in_range(self):
-        b=self.make()
-        job=b.submit("batch-video", "generate", {"prompt":"x"}, source="another-submitters", priority=7)
-        self.assertEqual(job["priority"], 7)
-        for bad in (None, 0, 11, True, "3"):
-            with self.assertRaisesRegex(ValueError, "integer from 1 to 10"):
-                b.submit("batch-video", "generate", {"prompt":"x"}, source="another-submitters", priority=bad)
 
     def test_dispatch_allowlist_leaves_non_pilot_work_queued(self):
         b=self.make(["nemotron3:33b"])
         blocked=b.submit("interactive", "generate", {"prompt":"do not run"})["id"]
-        pilot=b.submit("interactive", "generate", {"prompt":"pilot"}, source="pilot-mainpc", priority=1)["id"]
+        pilot=b.submit("interactive", "generate", {"prompt":"pilot"}, source="pilot-mainpc")["id"]
         self.assertTrue(b.dispatch_once(frozenset({"pilot-mainpc"})))
         self.assertEqual(b.status(pilot)["state"], "completed")
         self.assertEqual(b.status(blocked)["state"], "queued")
@@ -215,6 +200,26 @@ class BrokerTests(unittest.TestCase):
             server.server_close()
         self.assertEqual(self.calls, [])
 
+    def test_jobs_endpoint_rejects_removed_per_job_scheduling_field(self):
+        b = self.make()
+        server = serve(b, port=0)
+        thread = threading.Thread(target=server.handle_request)
+        thread.start()
+        try:
+            request = __import__("urllib.request", fromlist=["Request"]).Request(
+                f"http://127.0.0.1:{server.server_port}/v1/jobs",
+                data=json.dumps({
+                    "profile": "interactive", "kind": "generate", "priority": 1,
+                }).encode(), headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with self.assertRaises(__import__("urllib.error", fromlist=["HTTPError"]).HTTPError) as error:
+                urlopen(request)
+            self.assertEqual(error.exception.code, 400)
+            self.assertIn("per-job scheduling", error.exception.read().decode())
+        finally:
+            thread.join(timeout=1)
+            server.server_close()
+
 if __name__ == "__main__": unittest.main()
 
 class SourcePolicyTests(unittest.TestCase):
@@ -281,13 +286,13 @@ class SourcePolicyTests(unittest.TestCase):
         with self.assertRaises(SourcePolicyError):
             policy.enabled_sources()
 
-    def test_legacy_priority_key_is_rejected_instead_of_defaulting_weight(self):
+    def test_unknown_source_policy_key_is_rejected(self):
         from broker.service import SourcePolicy, SourcePolicyError
         path = self._policy_file({
             "version": 1,
-            "sources": {"shutterstock-video": {"enabled": True, "priority": 3}},
+            "sources": {"shutterstock-video": {"enabled": True, "obsolete": 3}},
         })
-        with self.assertRaisesRegex(SourcePolicyError, "unknown keys: priority"):
+        with self.assertRaisesRegex(SourcePolicyError, "unknown keys: obsolete"):
             SourcePolicy(path).snapshot()
 
     def test_canonical_production_policy_has_effective_weights(self):
@@ -343,14 +348,13 @@ class WeightedDispatchTests(unittest.TestCase):
         self.assertEqual(b.status(interactive_id)["state"], "completed")
         self.assertEqual(b.status(video_id)["state"], "queued")
 
-    def test_dispatch_without_policy_uses_strict_priority(self):
+    def test_dispatch_without_policy_uses_global_fifo(self):
         b = self.make(["nemotron3:33b"])
         video_id = b.submit("shutterstock-video", "generate", {"prompt": "v"})["id"]
         interactive_id = b.submit("interactive", "generate", {"prompt": "i"})["id"]
         b.dispatch_once()
-        # interactive has priority 1 and must win over video priority 3.
-        self.assertEqual(b.status(interactive_id)["state"], "completed")
-        self.assertEqual(b.status(video_id)["state"], "queued")
+        self.assertEqual(b.status(video_id)["state"], "completed")
+        self.assertEqual(b.status(interactive_id)["state"], "queued")
 
 class VideoEndpointTests(unittest.TestCase):
     def make(self, loaded=None):
@@ -365,7 +369,6 @@ class VideoEndpointTests(unittest.TestCase):
             "format": {"type": "object"},
         })
         self.assertEqual(job["source"], "shutterstock-video")
-        self.assertEqual(job["priority"], 3)
         b.dispatch_once()
         self.assertEqual(b.status(job["id"])["state"], "completed")
         request = [x[2] for x in self.calls if isinstance(x, tuple) and x[0] == "run" and "classify" in x[2].get("prompt", "")]
@@ -453,7 +456,6 @@ class OlyaVisionEndpointTests(unittest.TestCase):
                 source_item_id="vision-42", external_id=f"vision-42:{model}",
             )
             self.assertEqual(duplicate["id"], job["id"])
-            self.assertEqual(job["priority"], 8)
             b.dispatch_once(frozenset({"olya-vision"}))
             request = [
                 call[2] for call in self.calls
@@ -529,7 +531,6 @@ class OlyaDecisionEndpointTests(unittest.TestCase):
             external_id="decision-input-hash-42",
         )
         self.assertEqual(duplicate["id"], job["id"])
-        self.assertEqual(job["priority"], 6)
         with self.assertRaisesRegex(ValueError, "dedicated source"):
             broker.submit(
                 "olya-decision-qwen38", "generate", payload, source="olya-vision"
@@ -610,7 +611,6 @@ class SyncopiaMemoryEndpointTests(unittest.TestCase):
         self.assertEqual(duplicate["id"], job["id"])
         self.assertEqual(job["source"], "syncopia-telegram-memory")
         self.assertEqual(job["profile"], "syncopia-memory-qwen38")
-        self.assertEqual(job["priority"], 4)
         broker.dispatch_once(frozenset({"syncopia-telegram-memory"}))
         request = [
             call[2] for call in self.calls
