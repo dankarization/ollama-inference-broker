@@ -38,46 +38,48 @@ def snapshot(
     """Return operational data only; request payloads, results and errors are excluded."""
     policy_sources = (policy_snapshot or {}).get("sources", {})
     policy_active = policy_snapshot is not None
-    source_names = {row[0] for row in db.execute("SELECT DISTINCT source FROM jobs")}
-    source_names.update(policy_sources)
     schedules = dict(db.execute("SELECT source,next_allowed FROM source_schedules"))
+    source_stats = {
+        row["source"]: dict(row)
+        for row in db.execute(
+            "SELECT source,"
+            "sum(state='queued') AS queued,"
+            "sum(state IN ('running','cancel_requested')) AS running,"
+            "sum(state IN ('running','cancel_requested') AND lease_until IS NOT NULL) AS lease,"
+            "sum(state='queued' AND retry_count>0) AS retry,"
+            "sum(state='completed') AS completed,"
+            "sum(state='failed') AS failed,"
+            "sum(state='cancelled') AS cancelled,"
+            "sum(state='completed' AND finished>=?) AS completed_1h,"
+            "sum(state='completed' AND finished>=?) AS completed_24h "
+            "FROM jobs GROUP BY source",
+            (now - 3_600, now - 86_400),
+        )
+    }
+    source_names = set(source_stats)
+    source_names.update(policy_sources)
     sources: list[dict[str, Any]] = []
     overall = {name: 0 for name in ("queued", "running", "lease", "retry", "delayed", "completed", "failed", "dead", "cancelled")}
 
     for source in sorted(source_names):
         configured = policy_sources.get(source)
-        counts = dict(db.execute(
-            "SELECT state,count(*) FROM jobs WHERE source=? GROUP BY state", (source,)
-        ))
-        queued = counts.get("queued", 0)
-        lease = db.execute(
-            "SELECT count(*) FROM jobs WHERE source=? AND state IN ('running','cancel_requested') "
-            "AND lease_until IS NOT NULL", (source,)
-        ).fetchone()[0]
-        retry = db.execute(
-            "SELECT count(*) FROM jobs WHERE source=? AND state='queued' AND retry_count>0", (source,)
-        ).fetchone()[0]
+        stats = source_stats.get(source, {})
+        queued = stats.get("queued", 0)
         next_allowed = schedules.get(source)
         delayed = queued if next_allowed is not None and next_allowed > now else 0
-        completed_1h = db.execute(
-            "SELECT count(*) FROM jobs WHERE source=? AND state='completed' AND finished>=?",
-            (source, now - 3_600),
-        ).fetchone()[0]
-        completed_24h = db.execute(
-            "SELECT count(*) FROM jobs WHERE source=? AND state='completed' AND finished>=?",
-            (source, now - 86_400),
-        ).fetchone()[0]
+        completed_1h = stats.get("completed_1h", 0)
+        completed_24h = stats.get("completed_24h", 0)
         states = {
             "queued": queued,
-            "running": counts.get("running", 0) + counts.get("cancel_requested", 0),
-            "lease": lease,
-            "retry": retry,
+            "running": stats.get("running", 0),
+            "lease": stats.get("lease", 0),
+            "retry": stats.get("retry", 0),
             "delayed": delayed,
-            "completed": counts.get("completed", 0),
-            "failed": counts.get("failed", 0),
+            "completed": stats.get("completed", 0),
+            "failed": stats.get("failed", 0),
             # The broker has no separate `dead` state: terminal jobs are failed.
             "dead": 0,
-            "cancelled": counts.get("cancelled", 0),
+            "cancelled": stats.get("cancelled", 0),
         }
         for name, value in states.items():
             overall[name] += value

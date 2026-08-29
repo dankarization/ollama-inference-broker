@@ -161,6 +161,7 @@ class Broker:
             "status": "starting", "resource": "mainpc-gpu", "queue_depth": 0,
             "active_job_id": None, "timestamp": self.clock(),
         }
+        self._loaded_models_cache: list[dict[str, Any]] = []
         self._init_db()
         self.recover()
         with self.lock:
@@ -265,6 +266,10 @@ class Broker:
             )
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_source_state ON jobs(source,state,created)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_state_started "
+                "ON jobs(state,started,created,id)"
             )
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_source_item "
@@ -801,7 +806,9 @@ class Broker:
     def _execute(self, row):
         profile = PROFILES[row["profile"]]
         self.wol.wake()
-        loaded = [m.get("name") for m in self.ollama.ps().get("models", [])]
+        models = self.ollama.ps().get("models", [])
+        self._loaded_models_cache = [dict(model) for model in models if isinstance(model, dict)]
+        loaded = [m.get("name") for m in models]
         others = [m for m in loaded if m != profile.model]
         if others:
             for model in others: self.ollama.unload(model)
@@ -869,10 +876,15 @@ class Broker:
     def metrics(self) -> dict:
         with self.lock:
             queued = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0]
-            active = self.db.execute("SELECT * FROM jobs WHERE state IN ('running','cancel_requested')").fetchone()
-        ps = self.ollama.ps()
-        return {"resource": "mainpc-gpu", "queue_depth": queued, "active": self._job(active) if active else None,
-                "loaded_models": ps.get("models", []), "timestamp": self.clock()}
+            active = self.db.execute(
+                "SELECT id,source,profile,kind,state,created,started,lease_until,attempt_count,retry_count "
+                "FROM jobs WHERE state IN ('running','cancel_requested') "
+                "ORDER BY started,created,id LIMIT 1"
+            ).fetchone()
+            loaded_models = [dict(model) for model in self._loaded_models_cache]
+        return {"resource": "mainpc-gpu", "queue_depth": queued,
+                "active": dict(active) if active else None,
+                "loaded_models": loaded_models, "timestamp": self.clock()}
 
     def health(self) -> dict:
         """Return a local broker probe without waking or querying MAIN-PC."""

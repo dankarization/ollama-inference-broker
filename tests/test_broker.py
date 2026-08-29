@@ -176,7 +176,42 @@ class BrokerTests(unittest.TestCase):
         self.assertIn("explicit retry required", b.status(running)["error"])
     def test_metrics_include_queue_and_vram_source(self):
         b=self.make(["nemotron3:33b"]); b.submit("cron", "generate", {"prompt":"x"})
-        data=b.metrics(); self.assertEqual(data["resource"], "mainpc-gpu"); self.assertEqual(data["queue_depth"], 1); self.assertEqual(data["loaded_models"][0]["size_vram"], 1)
+        data=b.metrics(); self.assertEqual(data["resource"], "mainpc-gpu"); self.assertEqual(data["queue_depth"], 1); self.assertEqual(data["loaded_models"], [])
+        self.assertNotIn("ps", self.calls)
+        b.dispatch_once()
+        self.assertEqual(b.metrics()["loaded_models"][0]["size_vram"], 1)
+
+    def test_dashboard_and_metrics_stay_local_while_dispatch_is_waiting_on_ollama(self):
+        class BlockingOllama(FakeOllama):
+            def __init__(self, calls):
+                super().__init__(calls, ["nemotron3:33b"])
+                self.ps_started, self.release = threading.Event(), threading.Event()
+
+            def ps(self):
+                self.calls.append("ps")
+                self.ps_started.set()
+                self.release.wait(timeout=2)
+                return {"models": [{"name": "nemotron3:33b", "size_vram": 1}]}
+
+        calls, database = [], tempfile.NamedTemporaryFile()
+        self.addCleanup(database.close)
+        ollama = BlockingOllama(calls)
+        broker = Broker(database.name, ollama, FakeWol(calls))
+        job = broker.submit("shutterstock-video", "generate", {"prompt": "x"})
+        worker = threading.Thread(target=broker.dispatch_once)
+        worker.start()
+        self.assertTrue(ollama.ps_started.wait(timeout=1))
+        started = time.monotonic()
+        dashboard, metrics = broker.dashboard(), broker.metrics()
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(dashboard["active_jobs"][0]["id"], job["id"])
+        self.assertEqual(metrics["active"]["id"], job["id"])
+        self.assertNotIn("payload", metrics["active"])
+        ollama.release.set()
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(broker.status(job["id"])["state"], "completed")
+        self.assertEqual(broker.status(job["id"])["attempt_count"], 1)
 
     def test_local_health_never_touches_wol_or_ollama(self):
         b=self.make(); b.submit("cron", "generate", {"prompt":"x"})
