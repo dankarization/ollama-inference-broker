@@ -92,6 +92,17 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("text/html", content_type)
         self.assertIn(b"Completed 1h", html)
         self.assertIn(b"Weight", html)
+        self.assertNotIn(b"Dead", html)
+        self.assertIn(b'<tr><td colspan=13>None</td></tr>', render({
+            "timestamp": 0,
+            "sources": [],
+            "active_jobs": [],
+            "overall": {
+                "states": {"completed": 0},
+                "completed_last_hour": 0,
+                "completed_last_24_hours": 0,
+            },
+        }))
         self.assertNotIn(b"do-not-expose", html)
 
 

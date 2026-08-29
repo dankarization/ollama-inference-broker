@@ -131,7 +131,7 @@ def render(data: dict[str, Any]) -> bytes:
         rows.append("<tr>" + "".join(f"<td>{cell(value)}</td>" for value in (
             item["source"], scheduler["enabled"], scheduler["weight"],
             states["queued"], states["running"], states["lease"], states["retry"], states["delayed"],
-            states["failed"], states["dead"], states["cancelled"], states["completed"],
+            states["failed"], states["cancelled"], states["completed"],
             item["completed_last_hour"], item["completed_last_24_hours"],
         )) + "</tr>")
     active = data["active_jobs"]
@@ -153,8 +153,8 @@ def render(data: dict[str, Any]) -> bytes:
 <style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}</style>
 <h1>Ollama inference broker queue</h1><p>Snapshot timestamp: {timestamp_cell(data['timestamp'], tag='code')} · refreshes every 15 seconds.</p>
 <p class=summary>Completed: <b>{overall['states']['completed']}</b> total · <b>{overall['completed_last_hour']}</b> last hour · <b>{overall['completed_last_24_hours']}</b> last 24 hours.</p>
-<h2>Sources</h2><table><thead><tr><th>Source</th><th>Enabled</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Dead</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=14>None</td></tr>'}</tbody></table>
-<p><small>“Dead” is always zero because this broker represents exhausted work as terminal “failed”; delayed queued jobs are blocked by a source min-interval.</small></p>
+<h2>Sources</h2><table><thead><tr><th>Source</th><th>Enabled</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=13>None</td></tr>'}</tbody></table>
+<p><small>Delayed queued jobs are blocked by a source min-interval.</small></p>
 <h2>Active jobs</h2><table><thead><tr><th>ID</th><th>Source</th><th>State</th><th>Started</th><th>Lease until</th><th>Attempts</th><th>Retries</th></tr></thead><tbody>{active_rows}</tbody></table>
 """
     return document.encode("utf-8")
