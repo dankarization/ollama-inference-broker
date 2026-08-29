@@ -22,6 +22,16 @@ def local_timestamp(value: float | None) -> str | None:
         "(Asia/Tbilisi)"
     )
 
+
+def timestamp_title(value: float | None) -> str | None:
+    """Return an operator-facing raw timestamp for a timestamp cell tooltip."""
+    if value is None:
+        return None
+    utc_timestamp = datetime.fromtimestamp(float(value), tz=timezone.utc)
+    raw_iso = utc_timestamp.isoformat().replace("+00:00", "Z")
+    return f"{raw_iso} (epoch {value})"
+
+
 def snapshot(
     db: sqlite3.Connection, *, now: float, policy_snapshot: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -108,6 +118,13 @@ def render(data: dict[str, Any]) -> bytes:
             return "yes" if value else "no"
         return html.escape(str(value))
 
+    def timestamp_cell(value: float | None, *, tag: str = "td") -> str:
+        display = local_timestamp(value)
+        if display is None:
+            return f"<{tag}>—</{tag}>"
+        title = html.escape(timestamp_title(value) or "", quote=True)
+        return f'<{tag} title="{title}">{html.escape(display)}</{tag}>'
+
     rows = []
     for item in data["sources"]:
         scheduler, states = item["scheduler"], item["states"]
@@ -119,10 +136,14 @@ def render(data: dict[str, Any]) -> bytes:
         )) + "</tr>")
     active = data["active_jobs"]
     active_rows = "".join(
-        "<tr>" + "".join(f"<td>{cell(value)}</td>" for value in (
-            job["id"], job["source"], job["state"],
-            local_timestamp(job["started"]), local_timestamp(job["lease_until"]),
-            job["attempt_count"], job["retry_count"],
+        "<tr>" + "".join((
+            f"<td>{cell(job['id'])}</td>",
+            f"<td>{cell(job['source'])}</td>",
+            f"<td>{cell(job['state'])}</td>",
+            timestamp_cell(job["started"]),
+            timestamp_cell(job["lease_until"]),
+            f"<td>{cell(job['attempt_count'])}</td>",
+            f"<td>{cell(job['retry_count'])}</td>",
         )) + "</tr>"
         for job in active
     ) or "<tr><td colspan=7>None</td></tr>"
@@ -130,7 +151,7 @@ def render(data: dict[str, Any]) -> bytes:
     document = f"""<!doctype html><html lang=en><meta charset=utf-8>
 <meta http-equiv=refresh content=15><title>Ollama broker queue</title>
 <style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}</style>
-<h1>Ollama inference broker queue</h1><p>Snapshot timestamp: <code>{cell(local_timestamp(data['timestamp']))}</code> · refreshes every 15 seconds.</p>
+<h1>Ollama inference broker queue</h1><p>Snapshot timestamp: {timestamp_cell(data['timestamp'], tag='code')} · refreshes every 15 seconds.</p>
 <p class=summary>Completed: <b>{overall['states']['completed']}</b> total · <b>{overall['completed_last_hour']}</b> last hour · <b>{overall['completed_last_24_hours']}</b> last 24 hours.</p>
 <h2>Sources</h2><table><thead><tr><th>Source</th><th>Enabled</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Dead</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=14>None</td></tr>'}</tbody></table>
 <p><small>“Dead” is always zero because this broker represents exhausted work as terminal “failed”; delayed queued jobs are blocked by a source min-interval.</small></p>

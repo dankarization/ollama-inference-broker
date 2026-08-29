@@ -38,7 +38,10 @@ class DashboardTests(unittest.TestCase):
             },
         }).decode()
         self.assertIn("2026-08-29 12:30:00 UTC+04:00 (Asia/Tbilisi)", html)
-        self.assertNotIn(str(timestamp), html)
+        self.assertNotIn(f">{timestamp}<", html)
+        self.assertIn(
+            'title="2026-08-29T08:30:00Z (epoch 1787992200.0)"', html,
+        )
         self.assertIn("<td>—</td>", html)
 
     def test_dashboard_is_payload_free_and_uses_finished_completion_windows(self):
