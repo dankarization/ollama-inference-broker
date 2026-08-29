@@ -39,23 +39,17 @@ def snapshot(
     policy_sources = (policy_snapshot or {}).get("sources", {})
     policy_active = policy_snapshot is not None
     schedules = dict(db.execute("SELECT source,next_allowed FROM source_schedules"))
-    source_stats = {
-        row["source"]: dict(row)
-        for row in db.execute(
-            "SELECT source,"
-            "sum(state='queued') AS queued,"
-            "sum(state IN ('running','cancel_requested')) AS running,"
-            "sum(state IN ('running','cancel_requested') AND lease_until IS NOT NULL) AS lease,"
-            "sum(state='queued' AND retry_count>0) AS retry,"
-            "sum(state='completed') AS completed,"
-            "sum(state='failed') AS failed,"
-            "sum(state='cancelled') AS cancelled,"
-            "sum(state='completed' AND finished>=?) AS completed_1h,"
-            "sum(state='completed' AND finished>=?) AS completed_24h "
-            "FROM jobs GROUP BY source",
-            (now - 3_600, now - 86_400),
-        )
-    }
+    # This must stay a covering read.  `jobs` contains request payloads and
+    # can be multiple GiB; the former aggregate referenced fields outside this
+    # index and caused a table lookup for every historical job.  That exceeds
+    # the observer's intentionally short progress deadline even though the
+    # queue itself is healthy.
+    source_stats: dict[str, dict[str, int]] = {}
+    for row in db.execute(
+        "SELECT source,state,count(*) AS count FROM jobs "
+        "INDEXED BY jobs_source_state GROUP BY source,state"
+    ):
+        source_stats.setdefault(row["source"], {})[row["state"]] = row["count"]
     source_names = set(source_stats)
     source_names.update(policy_sources)
     sources: list[dict[str, Any]] = []
@@ -63,23 +57,40 @@ def snapshot(
 
     for source in sorted(source_names):
         configured = policy_sources.get(source)
-        stats = source_stats.get(source, {})
-        queued = stats.get("queued", 0)
+        state_counts = source_stats.get(source, {})
+        queued = state_counts.get("queued", 0)
         next_allowed = schedules.get(source)
         delayed = queued if next_allowed is not None and next_allowed > now else 0
-        completed_1h = stats.get("completed_1h", 0)
-        completed_24h = stats.get("completed_24h", 0)
+        completed_windows = db.execute(
+            "SELECT "
+            "coalesce(sum(finished>=?),0) AS completed_1h,"
+            "coalesce(sum(finished>=?),0) AS completed_24h "
+            "FROM jobs INDEXED BY jobs_source_state "
+            "WHERE source=? AND state='completed'",
+            (now - 3_600, now - 86_400, source),
+        ).fetchone()
+        retry = db.execute(
+            "SELECT count(*) FROM jobs INDEXED BY jobs_source_state "
+            "WHERE source=? AND state='queued' AND retry_count>0",
+            (source,),
+        ).fetchone()[0]
+        lease = db.execute(
+            "SELECT count(*) FROM jobs INDEXED BY jobs_source_state "
+            "WHERE source=? AND state IN ('running','cancel_requested') "
+            "AND lease_until IS NOT NULL",
+            (source,),
+        ).fetchone()[0]
         states = {
             "queued": queued,
-            "running": stats.get("running", 0),
-            "lease": stats.get("lease", 0),
-            "retry": stats.get("retry", 0),
+            "running": state_counts.get("running", 0) + state_counts.get("cancel_requested", 0),
+            "lease": lease,
+            "retry": retry,
             "delayed": delayed,
-            "completed": stats.get("completed", 0),
-            "failed": stats.get("failed", 0),
+            "completed": state_counts.get("completed", 0),
+            "failed": state_counts.get("failed", 0),
             # The broker has no separate `dead` state: terminal jobs are failed.
             "dead": 0,
-            "cancelled": stats.get("cancelled", 0),
+            "cancelled": state_counts.get("cancelled", 0),
         }
         for name, value in states.items():
             overall[name] += value
@@ -91,8 +102,8 @@ def snapshot(
                 "next_allowed": next_allowed,
             },
             "states": states,
-            "completed_last_hour": completed_1h,
-            "completed_last_24_hours": completed_24h,
+            "completed_last_hour": completed_windows["completed_1h"],
+            "completed_last_24_hours": completed_windows["completed_24h"],
         })
 
     active_jobs = [dict(row) for row in db.execute(

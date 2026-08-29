@@ -8,7 +8,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest.mock import patch
 
-from broker.dashboard import render
+from broker.dashboard import render, snapshot
 from broker.http import serve
 from broker.service import Broker, SourcePolicy
 
@@ -25,6 +25,41 @@ class FakeWol:
 
 
 class DashboardTests(unittest.TestCase):
+    def test_payload_history_uses_the_bounded_observer_index_path(self):
+        db = tempfile.NamedTemporaryFile()
+        self.addCleanup(db.close)
+        broker = Broker(db.name, FakeOllama(), FakeWol(), clock=lambda: 100_000)
+        payload = json.dumps({"prompt": "x" * 16_384})
+        with broker.db:
+            broker.db.executemany(
+                "INSERT INTO jobs("
+                "id,profile,kind,source,priority,payload,state,created,finished,queued_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        f"history-{index}", "interactive", "generate", "history", 10,
+                        payload, "completed", float(index), 99_999.0, float(index),
+                    )
+                    for index in range(2_000)
+                ],
+            )
+
+        progress_calls = [0]
+
+        def stop_full_table_scan():
+            progress_calls[0] += 1
+            return progress_calls[0] >= 70_000
+
+        broker.db.set_progress_handler(stop_full_table_scan, 1)
+        try:
+            data = snapshot(broker.db, now=100_000, policy_snapshot=None)
+        finally:
+            broker.db.set_progress_handler(None, 0)
+
+        self.assertEqual(data["overall"]["states"]["completed"], 2_000)
+        self.assertEqual(data["overall"]["completed_last_hour"], 2_000)
+        self.assertLess(progress_calls[0], 70_000)
+
     def test_dashboard_endpoints_report_unavailable_observer_instead_of_empty_queue(self):
         db = tempfile.NamedTemporaryFile()
         self.addCleanup(db.close)
