@@ -3,7 +3,24 @@ from __future__ import annotations
 
 import html
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+
+
+LOCAL_TIMEZONE = ZoneInfo("Asia/Tbilisi")
+
+
+def local_timestamp(value: float | None) -> str | None:
+    """Format an epoch timestamp for the local-only operator dashboard."""
+    if value is None:
+        return None
+    timestamp = datetime.fromtimestamp(float(value), tz=timezone.utc).astimezone(LOCAL_TIMEZONE)
+    offset = timestamp.strftime("%z")
+    return (
+        f"{timestamp:%Y-%m-%d %H:%M:%S} UTC{offset[:3]}:{offset[3:]} "
+        "(Asia/Tbilisi)"
+    )
 
 def snapshot(
     db: sqlite3.Connection, *, now: float, policy_snapshot: dict[str, Any] | None
@@ -102,15 +119,18 @@ def render(data: dict[str, Any]) -> bytes:
         )) + "</tr>")
     active = data["active_jobs"]
     active_rows = "".join(
-        "<tr>" + "".join(f"<td>{cell(job[key])}</td>" for key in
-        ("id", "source", "state", "started", "lease_until", "attempt_count", "retry_count")) + "</tr>"
+        "<tr>" + "".join(f"<td>{cell(value)}</td>" for value in (
+            job["id"], job["source"], job["state"],
+            local_timestamp(job["started"]), local_timestamp(job["lease_until"]),
+            job["attempt_count"], job["retry_count"],
+        )) + "</tr>"
         for job in active
     ) or "<tr><td colspan=7>None</td></tr>"
     overall = data["overall"]
     document = f"""<!doctype html><html lang=en><meta charset=utf-8>
 <meta http-equiv=refresh content=15><title>Ollama broker queue</title>
 <style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}</style>
-<h1>Ollama inference broker queue</h1><p>Snapshot timestamp: <code>{cell(data['timestamp'])}</code> · refreshes every 15 seconds.</p>
+<h1>Ollama inference broker queue</h1><p>Snapshot timestamp: <code>{cell(local_timestamp(data['timestamp']))}</code> · refreshes every 15 seconds.</p>
 <p class=summary>Completed: <b>{overall['states']['completed']}</b> total · <b>{overall['completed_last_hour']}</b> last hour · <b>{overall['completed_last_24_hours']}</b> last 24 hours.</p>
 <h2>Sources</h2><table><thead><tr><th>Source</th><th>Enabled</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Dead</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=14>None</td></tr>'}</tbody></table>
 <p><small>“Dead” is always zero because this broker represents exhausted work as terminal “failed”; delayed queued jobs are blocked by a source min-interval.</small></p>

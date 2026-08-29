@@ -2,8 +2,10 @@ import json
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from urllib.request import urlopen
 
+from broker.dashboard import render
 from broker.http import serve
 from broker.service import Broker, SourcePolicy
 
@@ -20,6 +22,25 @@ class FakeWol:
 
 
 class DashboardTests(unittest.TestCase):
+    def test_html_renders_active_timestamps_in_tbilisi_and_nulls_as_dash(self):
+        timestamp = datetime(2026, 8, 29, 8, 30, tzinfo=timezone.utc).timestamp()
+        html = render({
+            "timestamp": timestamp,
+            "sources": [],
+            "active_jobs": [{
+                "id": "active-job", "source": "interactive", "state": "running",
+                "started": timestamp, "lease_until": None, "attempt_count": 1, "retry_count": 0,
+            }],
+            "overall": {
+                "states": {"completed": 0},
+                "completed_last_hour": 0,
+                "completed_last_24_hours": 0,
+            },
+        }).decode()
+        self.assertIn("2026-08-29 12:30:00 UTC+04:00 (Asia/Tbilisi)", html)
+        self.assertNotIn(str(timestamp), html)
+        self.assertIn("<td>—</td>", html)
+
     def test_dashboard_is_payload_free_and_uses_finished_completion_windows(self):
         clock = lambda: 100_000
         db = tempfile.NamedTemporaryFile()
