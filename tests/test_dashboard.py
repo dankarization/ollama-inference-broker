@@ -58,6 +58,12 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(source["completed_last_hour"], 1)
         self.assertEqual(source["completed_last_24_hours"], 1)
         self.assertNotIn("payload", json.dumps(data))
+        broker.submit("batch-video", "generate", {}, source="omitted-source")
+        data = broker.dashboard(policy)
+        omitted = next(item for item in data["sources"] if item["source"] == "omitted-source")
+        self.assertEqual(omitted["scheduler"], {
+            "enabled": False, "weight": None, "next_allowed": None,
+        })
         html, content_type = get("/dashboard")
         self.assertIn("text/html", content_type)
         self.assertIn(b"Completed 1h", html)

@@ -26,6 +26,34 @@ class SourcePolicyError(ValueError):
     pass
 
 
+def normalize_source_policy(raw: Any) -> dict[str, dict[str, Any]]:
+    """Validate and apply defaults to a source-policy document."""
+    if not isinstance(raw, dict):
+        raise SourcePolicyError("policy must contain an object 'sources'")
+    sources = raw.get("sources")
+    if not isinstance(sources, dict):
+        raise SourcePolicyError("policy must contain an object 'sources'")
+    normalized: dict[str, dict[str, Any]] = {}
+    for name, entry in sources.items():
+        if not isinstance(name, str) or not name:
+            raise SourcePolicyError("source names must be non-empty strings")
+        if not isinstance(entry, dict):
+            raise SourcePolicyError(f"source {name!r} must be an object")
+        unknown = set(entry) - {"enabled", "weight"}
+        if unknown:
+            raise SourcePolicyError(
+                f"source {name!r} has unknown keys: {', '.join(sorted(unknown))}"
+            )
+        enabled = entry.get("enabled", True)
+        weight = entry.get("weight", 1.0)
+        if not isinstance(enabled, bool):
+            raise SourcePolicyError(f"source {name!r} enabled must be a boolean")
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0:
+            raise SourcePolicyError(f"source {name!r} weight must be a positive number")
+        normalized[name] = {"enabled": enabled, "weight": float(weight)}
+    return normalized
+
+
 class SourcePolicy:
     """Runtime-reloadable per-source weights and enablement.
 
@@ -66,33 +94,7 @@ class SourcePolicy:
         except (OSError, ValueError):
             return  # atomic replace means this is only a transient partial read
         try:
-            if not isinstance(raw, dict):
-                raise SourcePolicyError("policy must contain an object 'sources'")
-            sources = raw.get("sources")
-            if not isinstance(sources, dict):
-                raise SourcePolicyError("policy must contain an object 'sources'")
-            normalized: dict[str, dict[str, Any]] = {}
-            for name, entry in sources.items():
-                if not isinstance(name, str) or not name:
-                    raise SourcePolicyError("source names must be non-empty strings")
-                if not isinstance(entry, dict):
-                    raise SourcePolicyError(f"source {name!r} must be an object")
-                unknown = set(entry) - {"enabled", "weight"}
-                if unknown:
-                    raise SourcePolicyError(
-                        f"source {name!r} has unknown keys: {', '.join(sorted(unknown))}"
-                    )
-                enabled = entry.get("enabled", True)
-                weight = entry.get("weight", 1.0)
-                if not isinstance(enabled, bool):
-                    raise SourcePolicyError(f"source {name!r} enabled must be a boolean")
-                if (
-                    isinstance(weight, bool)
-                    or not isinstance(weight, (int, float))
-                    or weight <= 0
-                ):
-                    raise SourcePolicyError(f"source {name!r} weight must be a positive number")
-                normalized[name] = {"enabled": enabled, "weight": float(weight)}
+            normalized = normalize_source_policy(raw)
         except SourcePolicyError:
             if self._signature is None:
                 raise
@@ -196,33 +198,10 @@ class Broker:
                     "ALTER TABLE jobs ADD COLUMN requeue_count INTEGER NOT NULL DEFAULT 0"
                 )
             self.db.execute("UPDATE jobs SET queued_at=created WHERE queued_at IS NULL")
-            if "priority" in columns:
-                # SQLite DROP COLUMN arrived in 3.35. Rebuild portably so an
-                # upgrade does not fail on older SQLite builds bundled with a
-                # supported Python runtime. Preserve explicit user indexes.
-                index_sql = [row[0] for row in self.db.execute(
-                    "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='jobs' "
-                    "AND sql IS NOT NULL"
-                )]
-                self.db.execute("ALTER TABLE jobs RENAME TO jobs_legacy_schedule")
-                indexes = list(self.db.execute(
-                    "SELECT name FROM sqlite_master WHERE type='index' "
-                    "AND tbl_name='jobs_legacy_schedule' AND sql IS NOT NULL"
-                ))
-                for row in indexes:
-                    self.db.execute(f'DROP INDEX "{row[0].replace(chr(34), chr(34) * 2)}"')
-                self.db.execute(jobs_schema)
-                self.db.execute(
-                    "INSERT INTO jobs(id,profile,kind,source,payload,state,created,started,"
-                    "finished,lease_until,error,switch_reason,result_json,source_item_id,"
-                    "external_id,queued_at,attempt_count,retry_count,requeue_count) "
-                    "SELECT id,profile,kind,source,payload,state,created,started,finished,"
-                    "lease_until,error,switch_reason,result_json,source_item_id,external_id,"
-                    "queued_at,attempt_count,retry_count,requeue_count FROM jobs_legacy_schedule"
-                )
-                self.db.execute("DROP TABLE jobs_legacy_schedule")
-                for statement in index_sql:
-                    self.db.execute(statement)
+            # Keep a legacy ``priority`` column in upgraded databases.  It is
+            # never read by admission or dispatch, but preserving it makes a
+            # rollback to the prior broker binary lossless and avoids SQLite
+            # table-rebuild/index compatibility hazards.
             self.db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred REAL NOT NULL,
@@ -454,6 +433,7 @@ class Broker:
 
     def _job(self, row):
         data = dict(row)
+        data.pop("priority", None)  # legacy storage is not a scheduling input
         data["payload"] = json.loads(data["payload"])
         if data.get("result_json") is not None:
             data["result"] = json.loads(data.pop("result_json"))

@@ -60,6 +60,13 @@ class StatusReporterTests(unittest.TestCase):
             "defaulted": {"enabled": True, "weight": 1.0},
         })
 
+    def test_policy_rejects_unknown_keys_like_the_dispatcher(self):
+        handle = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        json.dump({"version": 1, "sources": {"invalid": {"weight": 2, "priority": 1}}}, handle)
+        handle.close()
+        self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
+        self.assertEqual(_policy(handle.name), {})
+
     def add_job(self, ident, source, state, *, created_offset=0, started_offset=None,
                 finished_offset=None, retry_count=0):
         created = self.start.timestamp() + created_offset

@@ -25,6 +25,8 @@ from typing import Any, Callable, Iterable
 from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
+from .service import SourcePolicyError, normalize_source_policy
+
 TBILISI = ZoneInfo("Asia/Tbilisi")
 REPORT_SOURCES = {
     "Shutterstock": ("shutterstock-video",),
@@ -98,17 +100,12 @@ def _policy(path: str | Path | None) -> dict[str, dict[str, Any]]:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    sources = raw.get("sources") if isinstance(raw, dict) else None
-    if not isinstance(sources, dict):
+    try:
+        return normalize_source_policy(raw)
+    except SourcePolicyError:
+        # Never report an invalid on-disk policy as effective; the dispatcher
+        # keeps its last-known-good snapshot after a bad hot reload.
         return {}
-    normalized: dict[str, dict[str, Any]] = {}
-    for source, entry in sources.items():
-        if isinstance(source, str) and isinstance(entry, dict):
-            enabled = entry.get("enabled", True)
-            weight = entry.get("weight", 1.0)
-            if isinstance(enabled, bool) and isinstance(weight, (int, float)) and not isinstance(weight, bool) and weight > 0:
-                normalized[source] = {"enabled": enabled, "weight": float(weight)}
-    return normalized
 
 
 def _source_clause(sources: Iterable[str]) -> tuple[str, tuple[str, ...]]:

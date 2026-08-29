@@ -10,6 +10,7 @@ def snapshot(
 ) -> dict[str, Any]:
     """Return operational data only; request payloads, results and errors are excluded."""
     policy_sources = (policy_snapshot or {}).get("sources", {})
+    policy_active = policy_snapshot is not None
     source_names = {row[0] for row in db.execute("SELECT DISTINCT source FROM jobs")}
     source_names.update(policy_sources)
     schedules = dict(db.execute("SELECT source,next_allowed FROM source_schedules"))
@@ -56,7 +57,7 @@ def snapshot(
         sources.append({
             "source": source,
             "scheduler": {
-                "enabled": configured.get("enabled") if isinstance(configured, dict) else None,
+                "enabled": configured.get("enabled") if isinstance(configured, dict) else (False if policy_active else None),
                 "weight": configured.get("weight") if isinstance(configured, dict) else None,
                 "next_allowed": next_allowed,
             },

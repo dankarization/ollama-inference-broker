@@ -75,11 +75,12 @@ class AnalyticsTests(unittest.TestCase):
             started REAL, finished REAL, lease_until REAL, error TEXT,
             switch_reason TEXT)""")
         db.execute(
-            "INSERT INTO jobs(id,profile,kind,payload,state,created) "
-            "VALUES('legacy-job','interactive','generate','{\"prompt\":\"x\"}',"
+            "INSERT INTO jobs(id,profile,kind,priority,payload,state,created) "
+            "VALUES('legacy-job','interactive','generate',1,'{\"prompt\":\"x\"}',"
             "'queued',10)"
         )
         db.execute("CREATE INDEX legacy_jobs_state ON jobs(state)")
+        db.execute("CREATE INDEX legacy_jobs_priority ON jobs(priority,created)")
         db.commit()
         db.close()
 
@@ -89,10 +90,16 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(job["source"], "legacy")
         self.assertEqual(job["queued_at"], 10)
         self.assertEqual(job["payload"], {"prompt": "x"})
-        self.assertNotIn("priority", {
+        self.assertIn("priority", {
             row[1] for row in broker.db.execute("PRAGMA table_info(jobs)")
         })
+        self.assertEqual(
+            broker.db.execute("SELECT priority FROM jobs WHERE id='legacy-job'").fetchone()[0], 1
+        )
         self.assertIn("legacy_jobs_state", {
+            row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")
+        })
+        self.assertIn("legacy_jobs_priority", {
             row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")
         })
         tables = {row[0] for row in broker.db.execute(
@@ -100,6 +107,18 @@ class AnalyticsTests(unittest.TestCase):
         )}
         self.assertIn("audit_events", tables)
         self.assertIn("job_attempts", tables)
+
+    def test_retry_rejoins_global_fifo_at_its_latest_enqueue_time(self):
+        clock = MutableClock(10)
+        broker = self.make(clock=clock, fail_once=True)
+        retried = broker.submit("interactive", "generate", {"prompt": "old"})["id"]
+        broker.dispatch_once()
+        self.assertEqual(broker.status(retried)["state"], "failed")
+        clock.value = 20
+        newer = broker.submit("interactive", "generate", {"prompt": "new"})["id"]
+        clock.value = 30
+        broker.retry(retried)
+        self.assertEqual([row["id"] for row in broker._candidates()], [newer, retried])
 
     def test_attempt_retry_correlation_metrics_and_payload_safe_logs(self):
         clock = MutableClock(100)
