@@ -299,9 +299,12 @@ class Broker:
                 "CREATE INDEX IF NOT EXISTS jobs_queued_candidates "
                 "ON jobs(state,source,queued_at,id,profile,created,attempt_count)"
             )
+            # History is globally newest-first across all terminal states.  Keep
+            # its ordering keys first so SQLite can stop at LIMIT without a
+            # temporary sort; the remaining projected columns make it covering.
             self.db.execute(
-                "CREATE INDEX IF NOT EXISTS jobs_terminal_history_v2 "
-                "ON jobs(state,finished,id,source,profile,created,started,attempt_count,retry_count)"
+                "CREATE INDEX IF NOT EXISTS jobs_terminal_history_v3 "
+                "ON jobs(finished DESC,id DESC,state,source,profile,created,started,attempt_count,retry_count)"
             )
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_source_item "
@@ -823,11 +826,13 @@ class Broker:
         values: list[Any] = []
         clause = ""
         if cursor is not None:
-            clause = " AND (finished < ? OR (finished = ? AND id < ?))"
-            values.extend((cursor[0], cursor[0], cursor[1]))
+            # A row-value range follows the index ordering without turning the
+            # keyset predicate into a multi-index OR that needs a temp sort.
+            clause = " AND (finished,id) < (?,?)"
+            values.extend(cursor)
         rows = db.execute(
             "SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count "
-            "FROM jobs INDEXED BY jobs_terminal_history_v2 "
+            "FROM jobs INDEXED BY jobs_terminal_history_v3 "
             "WHERE state IN ('completed','failed','cancelled') AND finished IS NOT NULL" + clause +
             " ORDER BY finished DESC,id DESC LIMIT ?",
             (*values, max(1, min(limit, 30))),

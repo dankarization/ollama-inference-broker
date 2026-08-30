@@ -63,12 +63,21 @@ class DashboardTests(unittest.TestCase):
                     (f"terminal-{index:02d}", "interactive", "generate", "history", payload,
                      "completed", float(index), float(index), index % 3 + 1),
                 )
-        plan = " ".join(row[3] for row in broker.db.execute(
+        first_plan = " ".join(row[3] for row in broker.db.execute(
             "EXPLAIN QUERY PLAN SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count "
-            "FROM jobs INDEXED BY jobs_terminal_history_v2 WHERE state IN ('completed','failed','cancelled') "
+            "FROM jobs INDEXED BY jobs_terminal_history_v3 WHERE state IN ('completed','failed','cancelled') "
             "AND finished IS NOT NULL ORDER BY finished DESC,id DESC LIMIT 30"
         ))
-        self.assertIn("COVERING INDEX jobs_terminal_history_v2", plan)
+        cursor_plan = " ".join(row[3] for row in broker.db.execute(
+            "EXPLAIN QUERY PLAN SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count "
+            "FROM jobs INDEXED BY jobs_terminal_history_v3 WHERE state IN ('completed','failed','cancelled') "
+            "AND finished IS NOT NULL AND (finished,id) < (?,?) "
+            "ORDER BY finished DESC,id DESC LIMIT 30",
+            (30.0, "terminal-30"),
+        ))
+        for plan in (first_plan, cursor_plan):
+            self.assertIn("COVERING INDEX jobs_terminal_history_v3", plan)
+            self.assertNotIn("USE TEMP B-TREE FOR ORDER BY", plan)
         first = broker.terminal_history(limit=10)
         second = broker.terminal_history(limit=30, cursor=tuple(first["next_cursor"]))
         self.assertEqual(len(first["items"]), 10)
