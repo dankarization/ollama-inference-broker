@@ -11,6 +11,7 @@ Coverage contract:
 import json
 import os
 import tempfile
+import threading
 import unittest
 
 from broker.service import Broker, SourcePolicy
@@ -103,13 +104,13 @@ class BatchSchedulerTests(unittest.TestCase):
         # batch: the model is loaded exactly once and never unloaded.
         self.assertEqual(len(self.load_calls("nemotron3:33b")), 1)
         self.assertEqual(self.unload_calls(), [])
-        # The first pick starts the batch; the rest continue it.
+        # Model residency is adapter behavior, not a scheduling preference.
         modes = [
             attempt["scheduler_mode"]
             for job_id in ids
             for attempt in broker.attempts(job_id)
         ]
-        self.assertEqual(modes, ["weighted_round_robin", "model_batch", "model_batch"])
+        self.assertEqual(modes, ["weighted_round_robin"] * 3)
 
     def test_model_switch_unloads_previous_model_between_batches(self):
         clock = MutableClock(1_000)
@@ -139,6 +140,7 @@ class BatchSchedulerTests(unittest.TestCase):
             broker.attempts(second)[0]["scheduler_mode"], "weighted_round_robin"
         )
 
+    @unittest.skip("superseded by the weight-only scheduler contract")
     def test_overdue_other_model_breaks_the_active_batch(self):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock, wait_debt_seconds=1_000)
@@ -178,27 +180,26 @@ class BatchSchedulerTests(unittest.TestCase):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock)
         policy = self.policy({
-            "interactive": {"enabled": True, "weight": 3.0},
-            "cron": {"enabled": True, "weight": 1.0},
+            "interactive": {"enabled": True, "weight": 2.0},
+            "cron": {"enabled": True, "weight": 6.0},
         })
         ids = []
-        for index in range(20):
+        for index in range(100):
             clock.value = 1_000 + index
             ids.append(broker.submit("interactive", "generate", {"prompt": f"i{index}"})["id"])
-        for index in range(20):
+        for index in range(100):
             clock.value = 1_100 + index
             ids.append(broker.submit("cron", "generate", {"prompt": f"c{index}"})["id"])
-        for _ in range(17):
+        for _ in range(60):
             self.assertTrue(broker.dispatch_once(policy=policy))
         interactive_done = sum(
-            1 for job_id in ids[:20] if broker.status(job_id)["state"] == "completed"
+            1 for job_id in ids[:100] if broker.status(job_id)["state"] == "completed"
         )
         cron_done = sum(
-            1 for job_id in ids[20:] if broker.status(job_id)["state"] == "completed"
+            1 for job_id in ids[100:] if broker.status(job_id)["state"] == "completed"
         )
-        # Both sources share one model, so every pick is a weighted pick among
-        # the same eligible set: the 3:1 weight ratio is preserved closely.
-        self.assertEqual((interactive_done, cron_done), (13, 4))
+        # Lower Weight means higher share: 2 receives exactly 3x Weight 6.
+        self.assertEqual((interactive_done, cron_done), (45, 15))
         snapshot = broker.analytics(policy, windows=(3_600,))
         scheduler = snapshot["scheduler"]["windows"]["3600"]
         self.assertAlmostEqual(
@@ -207,6 +208,50 @@ class BatchSchedulerTests(unittest.TestCase):
         self.assertAlmostEqual(
             scheduler["sources"]["cron"]["fairness_ratio"], 1.0, delta=0.1
         )
+
+    def test_old_low_importance_job_cannot_override_weight(self):
+        clock = MutableClock(1_000)
+        broker = self.make(clock=clock)
+        policy = self.policy({
+            "cron": {"enabled": True, "weight": 6},
+            "interactive": {"enabled": True, "weight": 2},
+        })
+        old = broker.submit("cron", "generate", {"prompt": "old"})["id"]
+        clock.value = 9_000_000
+        important = broker.submit("interactive", "generate", {"prompt": "new"})["id"]
+        broker.dispatch_once(policy=policy)
+        self.assertEqual(broker.status(important)["state"], "completed")
+        self.assertEqual(broker.status(old)["state"], "queued")
+
+    def test_forecast_projects_the_active_source_after_completion(self):
+        clock = MutableClock(1_000)
+        broker = self.make(clock=clock)
+        policy = self.policy({
+            "interactive": {"enabled": True, "weight": 1},
+            "cron": {"enabled": True, "weight": 10},
+        })
+        active = broker.submit("interactive", "generate", {"prompt": "active"})["id"]
+        clock.value += 1
+        expected = broker.submit("interactive", "generate", {"prompt": "next"})["id"]
+        clock.value += 1
+        broker.submit("cron", "generate", {"prompt": "other"})
+        entered, release = threading.Event(), threading.Event()
+        original_run = broker.ollama.run
+        def blocking_run(kind, request):
+            entered.set()
+            release.wait(2)
+            return original_run(kind, request)
+        broker.ollama.run = blocking_run
+        worker = threading.Thread(target=lambda: broker.dispatch_once(policy=policy))
+        worker.start()
+        self.assertTrue(entered.wait(1))
+        self.assertEqual(broker.status(active)["state"], "running")
+        forecast = broker.forecast(policy, limit=1)
+        self.assertEqual(forecast["next_selections"][0]["job_id"], expected)
+        release.set()
+        worker.join(timeout=2)
+        self.assertTrue(broker.dispatch_once(policy=policy))
+        self.assertEqual(broker.status(expected)["state"], "completed")
 
     def test_fifo_within_source_is_preserved(self):
         clock = MutableClock(1_000)
@@ -224,6 +269,7 @@ class BatchSchedulerTests(unittest.TestCase):
         finished = [broker.status(job_id)["finished"] for job_id in ids]
         self.assertEqual(finished, sorted(finished))
 
+    @unittest.skip("model batches were removed; weight is the sole soft selector")
     def test_batch_job_limit_survives_a_long_inference(self):
         clock = MutableClock(1_000)
         # The deprecated time-cap argument is accepted but cannot end a batch.
@@ -241,6 +287,7 @@ class BatchSchedulerTests(unittest.TestCase):
         modes = [broker.attempts(job_id)[0]["scheduler_mode"] for job_id in ids]
         self.assertEqual(modes, ["weighted_round_robin", "model_batch", "model_batch"])
 
+    @unittest.skip("model batches were removed; weight is the sole soft selector")
     def test_default_batch_stops_after_eight_jobs(self):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock, wait_debt_seconds=10_000)
@@ -258,6 +305,7 @@ class BatchSchedulerTests(unittest.TestCase):
         self.assertEqual(modes.count("weighted_round_robin"), 2)
         self.assertEqual(modes.count("model_batch"), 7)
 
+    @unittest.skip("legacy priority and wait-debt selection were removed")
     def test_priority_semantics_one_highest_ten_lowest(self):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock, wait_debt_seconds=1_000)
@@ -298,7 +346,6 @@ class BatchSchedulerTests(unittest.TestCase):
         ):
             clock.value = 1_000 + index
             ids.append(broker.submit(profile, "generate", {"prompt": prompt})["id"])
-        before_batch = dict(broker._batch_state or {})
         before_accumulator = dict(broker._weight_accumulator)
         before_states = [broker.status(job_id)["state"] for job_id in ids]
         before_audit = broker.db.execute(
@@ -313,17 +360,14 @@ class BatchSchedulerTests(unittest.TestCase):
         self.assertIn("contingency", first)
         self.assertIsNone(first["current_model"])  # nothing is running yet
         # The projection covers the full bounded queue (deterministic order)
-        # and starts a batch on the highest-weight source's FIFO head.
+        # and selects its FIFO heads with the inverse-weight share.
         self.assertEqual(
             sorted(item["job_id"] for item in first["next_selections"]), sorted(ids)
         )
-        self.assertEqual(first["next_selections"][0]["job_id"], ids[0])
+        self.assertEqual(first["next_selections"][0]["job_id"], ids[2])
         self.assertEqual(first["next_selections"][0]["mode"], "weighted_round_robin")
-        self.assertEqual(
-            {item["mode"] for item in first["next_selections"][1:]}, {"model_batch"}
-        )
+        self.assertEqual({item["mode"] for item in first["next_selections"]}, {"weighted_round_robin"})
         # Forecast is read-only: scheduler state and durable rows unchanged.
-        self.assertEqual(dict(broker._batch_state or {}), before_batch)
         self.assertEqual(dict(broker._weight_accumulator), before_accumulator)
         self.assertEqual([broker.status(job_id)["state"] for job_id in ids],
                          before_states)
@@ -342,7 +386,7 @@ class BatchSchedulerTests(unittest.TestCase):
         broker._candidates(db=broker.db)
         broker.db.set_trace_callback(None)
         observer_select = next(line for line in statements if "FROM jobs WHERE state='queued'" in line)
-        self.assertIn("id,profile,source,priority,created,queued_at", observer_select)
+        self.assertIn("id,profile,source,created,queued_at", observer_select)
         self.assertNotIn("payload", observer_select)
 
     def test_dispatcher_selects_large_queue_without_materializing_payloads(self):
@@ -367,7 +411,7 @@ class BatchSchedulerTests(unittest.TestCase):
             if "FROM jobs WHERE state='queued'" in line
         )
         self.assertIn(
-            "id,profile,source,priority,created,queued_at,attempt_count",
+            "id,profile,source,created,queued_at,attempt_count",
             candidate_select,
         )
         self.assertNotIn("payload", candidate_select)
@@ -377,7 +421,7 @@ class BatchSchedulerTests(unittest.TestCase):
         executions = [call for call in self.calls if isinstance(call, tuple) and call[0] == "run"]
         self.assertEqual(executions[-1][2]["prompt"], "selected")
 
-    def test_forecast_reflects_an_active_batch_series(self):
+    def test_forecast_uses_weight_only_selection(self):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock)
         policy = self.policy({
@@ -395,16 +439,9 @@ class BatchSchedulerTests(unittest.TestCase):
         )
         broker.dispatch_once(policy=policy)
         forecast = broker.forecast(policy, limit=5)
-        # The nemotron batch is active with one job done; the next selection
-        # continues that series, and the other model follows only after.
-        self.assertEqual(forecast["current_series"]["model"], "nemotron3:33b")
-        self.assertEqual(forecast["current_series"]["count"], 1)
-        self.assertEqual(forecast["next_selections"][0]["mode"], "model_batch")
-        self.assertEqual(forecast["next_selections"][0]["model"], "nemotron3:33b")
-        self.assertEqual(forecast["next_selections"][1]["mode"], "weighted_round_robin")
-        self.assertEqual(forecast["next_selections"][1]["model"], "gemma4:12b")
+        self.assertEqual({item["mode"] for item in forecast["next_selections"]}, {"weighted_round_robin"})
 
-    def test_restart_resets_batch_but_preserves_durable_jobs(self):
+    def test_restart_preserves_durable_jobs(self):
         path = tempfile.NamedTemporaryFile(suffix=".sqlite3").name
         self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
         clock = MutableClock(1_000)
@@ -414,14 +451,12 @@ class BatchSchedulerTests(unittest.TestCase):
                        FakeWol(calls), clock=clock)
         job_id = first.submit("interactive", "generate", {"prompt": "x"})["id"]
         first.dispatch_once(policy=policy)
-        self.assertIsNotNone(first._batch_state)
         first.db.close()
 
         restarted = Broker(path, FakeOllama(calls, ["nemotron3:33b"]),
                            FakeWol(calls), clock=clock)
         self.assertEqual(restarted.status(job_id)["state"], "completed")
-        self.assertIsNone(restarted._batch_state)
-        # Dispatch still works after restart and starts a fresh batch.
+        # Dispatch still works after restart.
         clock.value = 1_100
         next_id = restarted.submit("interactive", "generate", {"prompt": "y"})["id"]
         self.assertTrue(restarted.dispatch_once(policy=policy))
@@ -444,21 +479,19 @@ class BatchSchedulerTests(unittest.TestCase):
         broker.dispatch_once(policy=policy)
         # Equal weights pick interactive first (FIFO tie-break).
         self.assertEqual(broker.status(interactive_one)["state"], "completed")
-        # Atomic hot reload flips cron's weight while the batch is active.
+        # Atomic hot reload flips cron's relative share.
         replacement = str(policy.path) + ".tmp"
         with open(replacement, "w") as handle:
             json.dump({"version": 1, "sources": {
-                "interactive": {"enabled": True, "weight": 1.0},
-                "cron": {"enabled": True, "weight": 10.0},
+                "interactive": {"enabled": True, "weight": 10.0},
+                "cron": {"enabled": True, "weight": 1.0},
             }}, handle)
         os.replace(replacement, policy.path)
         self.assertTrue(broker.dispatch_once(policy=policy))
-        # The reloaded weight is applied on the next same-model continuation
-        # pick, so cron wins the weighted choice over the queued interactive
-        # job; the batch itself is not lost by the reload.
+        # The reloaded lower Weight makes cron win the next selection.
         self.assertEqual(broker.status(cron)["state"], "completed")
         self.assertEqual(broker.status(interactive_two)["state"], "queued")
-        self.assertEqual(broker.attempts(cron)[0]["scheduler_mode"], "model_batch")
+        self.assertEqual(broker.attempts(cron)[0]["scheduler_mode"], "weighted_round_robin")
         self.assertEqual(broker._last_scheduler_decision["selected_source"], "cron")
 
     def test_disabled_source_never_enters_a_batch(self):
@@ -499,7 +532,7 @@ class BatchSchedulerTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertIs(body["contingent"], True)
         self.assertEqual(len(body["next_selections"]), 2)  # bounded by limit
-        self.assertEqual(body["next_selections"][0]["priority"], 1)
+        self.assertEqual(body["next_selections"][0]["weight"], 1.0)
         self.assertNotIn("payload", json.dumps(body))
         # The endpoint never dispatches: every job is still queued.
         self.assertEqual(
@@ -523,27 +556,21 @@ class BatchSchedulerTests(unittest.TestCase):
                 "contingent": True,
                 "contingency": "read-only projection; it changes as jobs are admitted or complete",
                 "current_model": "nemotron3:33b",
-                "current_series": {
-                    "model": "nemotron3:33b", "count": 1,
-                    "started": 900,
-                },
-                "batch_limits": {"max_jobs": 8, "wait_debt_seconds": 1_800},
                 "next_selections": [{
                     "job_id": "job-1", "source": "interactive",
                     "profile": "interactive", "model": "nemotron3:33b",
-                    "priority": 1, "mode": "model_batch",
-                    "reason": "batch nemotron3:33b job 2/8",
+                    "weight": 1, "mode": "weighted_round_robin",
+                    "reason": "weight-only source selection",
                     "eligible_sources": ["interactive"], "wait_seconds": 5.0,
                 }],
             },
         }).decode()
         self.assertIn("<h2>Forecast</h2>", html)
         self.assertIn("Current model: <b>nemotron3:33b</b>", html)
-        self.assertIn("batch nemotron3:33b job 2/8", html)
-        self.assertIn("max batch 8 jobs", html)
+        self.assertIn("Weight 1 is most important", html)
         self.assertIn("read-only projection; it changes as jobs are admitted", html)
         self.assertIn(">job-1<", html)
-        self.assertIn(">model_batch<", html)
+        self.assertIn(">weighted_round_robin<", html)
 
     def test_forecast_unavailable_when_database_is_locked(self):
         import sqlite3

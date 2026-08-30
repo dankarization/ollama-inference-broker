@@ -69,11 +69,11 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(broker.status(low["id"])["queue_position"], 1)
         self.assertEqual(high["queue_position"], 2)
 
-    def test_compatibility_rejects_removed_per_job_scheduling_field(self):
-        with self.assertRaisesRegex(CompatibilityError, "per-job scheduling"):
-            submit(self.make(), "generate", {
-                "profile": "interactive", "prompt": "x", "priority": 1,
-            })
+    def test_compatibility_ignores_removed_legacy_scheduling_field(self):
+        job = submit(self.make(), "generate", {
+            "profile": "interactive", "prompt": "x", "priority": 1,
+        })
+        self.assertNotIn("priority", job["payload"])
 
     def test_ndjson_frames_cover_queued_cancellation_and_failure(self):
         broker = self.make()

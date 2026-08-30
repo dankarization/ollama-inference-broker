@@ -180,13 +180,10 @@ def _scheduler_window(
         weights = metadata.get("active_weights") or {}
         eligible = metadata.get("eligible_sources") or []
         eligible_weights = {
-            name: float(weights.get(name, 1.0)) for name in eligible
+            name: 1.0 / float(weights.get(name, 1.0)) for name in eligible
         }
         weight_total = sum(eligible_weights.values())
-        # Batch starts and same-model batch continuations both pick from the
-        # recorded eligible set, so expected share tracks the model-aware
-        # scheduler; exception picks (fifo/overdue) stay outside fairness.
-        if mode in {"weighted_round_robin", "model_batch"} and weight_total > 0:
+        if mode == "weighted_round_robin" and weight_total > 0:
             weighted_selected[source] += 1
             for name, weight in eligible_weights.items():
                 expected[name] += weight / weight_total

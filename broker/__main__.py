@@ -36,6 +36,14 @@ def policy_path(value: str | None) -> str | None:
     return normalized or None
 
 
+def install_drain_handler(dispatcher: Dispatcher | None) -> None:
+    """Keep SIGUSR1 reload safe even for admission-only broker instances."""
+    signal.signal(
+        signal.SIGUSR1,
+        lambda _signum, _frame: dispatcher.drain() if dispatcher is not None else None,
+    )
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(),
@@ -53,6 +61,7 @@ def main() -> None:
     configured_policy = policy_path(os.environ.get("BROKER_SOURCES_POLICY"))
     if configured_policy is not None:
         policy = SourcePolicy(configured_policy)
+    dispatcher = None
     if dispatch_enabled(os.environ.get("BROKER_DISPATCH_ENABLED")):
         allowed_sources = None
         if policy is None:
@@ -64,10 +73,9 @@ def main() -> None:
             allowed_sources=allowed_sources,
             policy=policy,
         )
-        # Local systemd signal: stop claims but retain HTTP admissions until
-        # the active remote call completes, then restart safely.
-        signal.signal(signal.SIGUSR1, lambda _signum, _frame: dispatcher.drain())
         dispatcher.start()
+    # Local systemd reload: drain claims when enabled; no-op while admission-only.
+    install_drain_handler(dispatcher)
     serve(broker, os.environ.get("BROKER_BIND", "127.0.0.1"), int(os.environ.get("BROKER_PORT", "8088")), policy=policy).serve_forever()
 
 

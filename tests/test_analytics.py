@@ -90,28 +90,17 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(job["source"], "legacy")
         self.assertEqual(job["queued_at"], 10)
         self.assertEqual(job["payload"], {"prompt": "x"})
-        self.assertIn("priority", {
+        self.assertNotIn("priority", {
             row[1] for row in broker.db.execute("PRAGMA table_info(jobs)")
         })
-        self.assertEqual(
-            broker.db.execute("SELECT priority FROM jobs WHERE id='legacy-job'").fetchone()[0], 1
-        )
         admitted = broker.submit("interactive", "generate", {"prompt": "new"})
         cron = broker.submit("cron", "generate", {"prompt": "new"})
         self.assertNotIn("priority", admitted)
         self.assertNotIn("priority", cron)
-        self.assertEqual(
-            broker.db.execute("SELECT priority FROM jobs WHERE id=?", (admitted["id"],)).fetchone()[0],
-            1,
-        )
-        self.assertEqual(
-            broker.db.execute("SELECT priority FROM jobs WHERE id=?", (cron["id"],)).fetchone()[0],
-            2,
-        )
         self.assertIn("legacy_jobs_state", {
             row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")
         })
-        self.assertIn("legacy_jobs_priority", {
+        self.assertNotIn("legacy_jobs_priority", {
             row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")
         })
         tables = {row[0] for row in broker.db.execute(
@@ -266,10 +255,7 @@ class AnalyticsTests(unittest.TestCase):
         self.assertNotIn("payload", matches[0])
         self.assertNotIn("result", matches[0])
 
-    def test_weighted_batch_starts_and_model_fifo_track_share(self):
-        """The model-aware batch scheduler keeps weight-based batch starts and
-        FIFO within each model batch; fairness is measured inside the eligible
-        model set, not across unrelated models."""
+    def test_weighted_selection_tracks_inverse_weight_share(self):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock)
         policy = self.policy({
@@ -300,21 +286,10 @@ class AnalyticsTests(unittest.TestCase):
         snapshot = broker.analytics(policy, windows=(3_600,))
         scheduler = snapshot["scheduler"]["windows"]["3600"]
         self.assertEqual(scheduler["selections"], 17)
-        # Batches start in weight order and then drain FIFO within the model:
-        # the gemma batch serves 8 vision jobs, the qwen batch 8 decision
-        # jobs, and the nemotron batch gets the last 1 video job.
-        self.assertEqual(scheduler["modes"]["weighted_round_robin"], 3)
-        self.assertEqual(scheduler["modes"]["model_batch"], 14)
-        self.assertEqual(scheduler["sources"]["olya-vision"]["selected"], 8)
-        self.assertEqual(scheduler["sources"]["olya-decision"]["selected"], 8)
-        self.assertEqual(scheduler["sources"]["shutterstock-video"]["selected"], 1)
-        # Within a model batch the weighted share of the eligible sources is
-        # preserved, so vision/decision fairness stays close to one.
-        self.assertAlmostEqual(
-            scheduler["sources"]["olya-vision"]["fairness_ratio"], 1.0, places=1
-        )
-        self.assertAlmostEqual(
-            scheduler["sources"]["olya-decision"]["fairness_ratio"], 1.0, places=1
+        self.assertEqual(scheduler["modes"]["weighted_round_robin"], 17)
+        self.assertGreater(
+            scheduler["sources"]["shutterstock-video"]["selected"],
+            scheduler["sources"]["olya-vision"]["selected"],
         )
         self.assertEqual(
             snapshot["scheduler"]["active_policy"]["sources"]["olya-vision"]["weight"],

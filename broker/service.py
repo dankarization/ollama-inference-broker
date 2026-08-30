@@ -26,20 +26,6 @@ from .policy import SourcePolicyError, normalize_source_policy
 LOGGER = logging.getLogger("ollama_inference_broker.audit")
 OBSERVER_READ_DEADLINE_SECONDS = 0.75
 
-# Used only to keep upgraded databases rollback-compatible.  The current
-# scheduler intentionally does not consult these values.
-LEGACY_SOURCE_PRIORITIES = {
-    "interactive": 1,
-    "cron": 2,
-    "shutterstock-video": 3,
-    "syncopia-telegram-memory": 4,
-    "shutterstock-canary": 5,
-    "olya-decision": 6,
-    "olya": 8,
-    "olya-vision": 8,
-}
-
-
 class SourcePolicy:
     """Runtime-reloadable per-source weights and enablement.
 
@@ -152,26 +138,10 @@ class SourcePolicy:
 
 
 class Broker:
-    """One-resource scheduler; MAIN-PC remains only the wakeable executor.
-
-    Selection is model-aware and batch-oriented: queued jobs are grouped by
-    their server-owned profile model, and an active batch keeps serving that
-    model until its bounded job count ends.  Batching
-    avoids unload/load cycles between same-model jobs; per-source weights and
-    FIFO-within-source order are preserved inside each batch.  A wait-debt
-    starvation guard serves the oldest overdue job (its wait reached the
-    priority-mapped bound) even when another model's batch is active.
-    """
+    """One-resource scheduler with FIFO per source and weight-only sharing."""
     def __init__(self, database: str | Path, ollama, wol, clock=time.time,
-                 lease_seconds=60, batch_max_jobs=8, batch_max_seconds=None,
-                 wait_debt_seconds=1800):
+                 lease_seconds=60):
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
-        self.batch_max_jobs = int(batch_max_jobs)
-        # Kept as an accepted constructor argument for callers that still pass
-        # the former wall-clock cap.  It is deliberately ignored: a slow
-        # inference must not end a compatible-model batch between jobs.
-        del batch_max_seconds
-        self.wait_debt_seconds = float(wait_debt_seconds)
         self.database = str(database)
         self.db = sqlite3.connect(self.database, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -186,10 +156,7 @@ class Broker:
         self._metrics_cache: dict[str, Any] = {
             "resource": "mainpc-gpu", "queue_depth": 0, "active": None,
         }
-        # In-memory scheduler state.  It is intentionally not persisted: after
-        # a restart the first dispatch simply starts a fresh batch, and a hot
-        # policy reload only changes weights/enablement, never this state.
-        self._batch_state: dict[str, Any] | None = None
+        # In-memory weighted-round-robin state; policy changes never reset it.
         self._weight_accumulator: dict[str, float] = {}
         # Immutable copy written under the lock for the lock-free forecast.
         self._scheduler_snapshot: dict[str, Any] | None = None
@@ -216,7 +183,7 @@ class Broker:
             self.db.execute("PRAGMA journal_mode=WAL")
             jobs_schema = """CREATE TABLE jobs (
                 id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
-                source TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 10,
+                source TEXT NOT NULL,
                 payload TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
                 started REAL, finished REAL, lease_until REAL, error TEXT,
                 switch_reason TEXT, result_json TEXT,
@@ -231,7 +198,6 @@ class Broker:
                 source TEXT PRIMARY KEY, next_allowed REAL NOT NULL)""")
             # Compatible with databases created by the first isolated MVP.
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
-            self._has_legacy_priority = "priority" in columns
             if "source" not in columns:
                 self.db.execute("ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'")
             if "result_json" not in columns:
@@ -255,13 +221,7 @@ class Broker:
                     "ALTER TABLE jobs ADD COLUMN requeue_count INTEGER NOT NULL DEFAULT 0"
                 )
             self.db.execute("UPDATE jobs SET queued_at=created WHERE queued_at IS NULL")
-            # Keep a legacy ``priority`` column in upgraded databases.  It is
-            # never read by admission or dispatch, but preserving it makes a
-            # rollback to the prior broker binary lossless and avoids SQLite
-            # table-rebuild/index compatibility hazards.  Older schemas can
-            # make it NOT NULL without a default, so admissions supply the
-            # former fixed source value (or the neutral legacy default) when
-            # that retained column exists.
+            self._retire_priority_column()
             self.db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred REAL NOT NULL,
@@ -324,6 +284,41 @@ class Broker:
                 "ON jobs(source,external_id) WHERE source='syncopia-telegram-memory' "
                 "AND external_id IS NOT NULL"
             )
+
+    def _retire_priority_column(self) -> None:
+        """Remove a legacy priority column only when new inserts need it gone.
+
+        Current deployed schemas have a default and can retain an inert historic
+        column without runtime reads or writes.  Very old NOT NULL/no-default
+        schemas are rebuilt once, transactionally, so new jobs have no hidden
+        priority value while all durable rows are preserved.
+        """
+        columns = list(self.db.execute("PRAGMA table_info(jobs)"))
+        priority = next((row for row in columns if row[1] == "priority"), None)
+        if priority is None or priority[4] is not None or not priority[3]:
+            return
+        for index in list(self.db.execute("PRAGMA index_list(jobs)")):
+            name = index[1]
+            if any(column[2] == "priority" for column in self.db.execute(f"PRAGMA index_info({name})")):
+                self.db.execute(f"DROP INDEX {name}")
+        try:
+            self.db.execute("ALTER TABLE jobs DROP COLUMN priority")
+            return
+        except sqlite3.OperationalError:
+            pass
+        names = [row[1] for row in columns if row[1] != "priority"]
+        self.db.execute("ALTER TABLE jobs RENAME TO jobs_with_legacy_priority")
+        schema = """CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
+            source TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL,
+            created REAL NOT NULL, started REAL, finished REAL, lease_until REAL,
+            error TEXT, switch_reason TEXT, result_json TEXT, source_item_id TEXT,
+            external_id TEXT, queued_at REAL, attempt_count INTEGER NOT NULL DEFAULT 0,
+            retry_count INTEGER NOT NULL DEFAULT 0, requeue_count INTEGER NOT NULL DEFAULT 0)"""
+        self.db.execute(schema)
+        joined = ",".join(names)
+        self.db.execute(f"INSERT INTO jobs ({joined}) SELECT {joined} FROM jobs_with_legacy_priority")
+        self.db.execute("DROP TABLE jobs_with_legacy_priority")
 
     def _audit(
         self,
@@ -463,21 +458,12 @@ class Broker:
                 ).fetchone()
                 if existing is not None:
                     return self.status(existing["id"])
-            if self._has_legacy_priority:
-                legacy_priority = LEGACY_SOURCE_PRIORITIES.get(source, 10)
-                self.db.execute(
-                    "INSERT INTO jobs(id,profile,kind,source,priority,payload,state,created,"
-                    "queued_at,source_item_id,external_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (job_id, profile, kind, source, legacy_priority, json.dumps(payload), "queued", now,
-                     now, source_item_id, external_id),
-                )
-            else:
-                self.db.execute(
-                    "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
-                    "queued_at,source_item_id,external_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (job_id, profile, kind, source, json.dumps(payload), "queued", now,
-                     now, source_item_id, external_id),
-                )
+            self.db.execute(
+                "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
+                "queued_at,source_item_id,external_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (job_id, profile, kind, source, json.dumps(payload), "queued", now,
+                 now, source_item_id, external_id),
+            )
             self._audit(
                 "admission.accepted", job_id=job_id, source=source,
                 from_state=None, to_state="queued", occurred=now,
@@ -506,7 +492,7 @@ class Broker:
 
     def _job(self, row):
         data = dict(row)
-        data.pop("priority", None)  # legacy storage is not a scheduling input
+        data.pop("priority", None)  # inert historic column is never public
         data["payload"] = json.loads(data["payload"])
         if data.get("result_json") is not None:
             data["result"] = json.loads(data.pop("result_json"))
@@ -720,17 +706,14 @@ class Broker:
         allowed = None
         if policy is not None:
             allowed = policy.enabled_sources()
-        candidates = self._candidates(allowed, db=db)
         running = db.execute(
             "SELECT profile FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1"
         ).fetchone()
+        # The next dispatch can occur only after the one active job completes.
+        # Project that slot release; keep all other hard eligibility checks.
+        candidates = self._candidates(allowed, db=db, release_running=running is not None)
         snapshot = self._scheduler_snapshot or {}
-        current_batch = dict(snapshot.get("batch") or {})
-        state = {
-            "batch": dict(current_batch) if current_batch else None,
-            "accumulator": dict(snapshot.get("accumulator") or {}),
-            "batch_max_jobs": self.batch_max_jobs,
-        }
+        accumulator = dict(snapshot.get("accumulator") or {})
         remaining = [dict(row) for row in candidates]
         selections: list[dict[str, Any]] = []
         for _ in range(bounded):
@@ -741,13 +724,11 @@ class Broker:
                 mode, reason = "fifo", "oldest queued job"
                 eligible = [picked["source"]]
             else:
-                result = self._select_candidate(remaining, policy, state, now)
-                if result is None:
+                picked = self._weighted_pick(remaining, policy, accumulator)
+                if picked is None:
                     break
-                picked, decision = result
-                mode = decision["mode"]
-                reason = decision["reason"]
-                eligible = decision["eligible_sources"]
+                mode, reason = "weighted_round_robin", "weight-only source selection"
+                eligible = sorted({row["source"] for row in remaining})
             queued_at = picked["queued_at"] if picked["queued_at"] is not None else picked["created"]
             wait = max(0.0, now - queued_at)
             selections.append({
@@ -755,7 +736,7 @@ class Broker:
                 "source": picked["source"],
                 "profile": picked["profile"],
                 "model": PROFILES[picked["profile"]].model,
-                "priority": int(picked["priority"] or 10),
+                "weight": (policy.weight(picked["source"]) or 1.0) if policy else 1.0,
                 "mode": mode,
                 "reason": reason,
                 "eligible_sources": eligible,
@@ -765,22 +746,10 @@ class Broker:
         return {
             "contingent": True,
             "contingency": (
-                "read-only projection; it changes as jobs are admitted or "
+                "read-only post-completion projection; it changes as jobs are admitted, "
                 "complete and when the source policy reloads"
             ),
             "current_model": PROFILES[running["profile"]].model if running else None,
-            "current_series": (
-                {
-                    "model": current_batch.get("model"),
-                    "count": current_batch.get("count", 0),
-                    "started": current_batch.get("started"),
-                }
-                if current_batch else None
-            ),
-            "batch_limits": {
-                "max_jobs": self.batch_max_jobs,
-                "wait_debt_seconds": self.wait_debt_seconds,
-            },
             "next_selections": selections,
         }
 
@@ -832,7 +801,8 @@ class Broker:
             )
             return [dict(row) for row in rows]
 
-    def _candidates(self, allowed_sources: frozenset[str] | None = None, db=None):
+    def _candidates(self, allowed_sources: frozenset[str] | None = None, db=None,
+                    release_running: bool = False):
         """Queued rows eligible now, ordered FIFO.
 
         Per-source concurrency and min-interval backpressure are applied here
@@ -847,7 +817,7 @@ class Broker:
         # projection narrow for both observers and the real dispatcher avoids
         # materializing every queued request while sorting a large backlog.
         query = (
-            "SELECT id,profile,source,priority,created,queued_at,attempt_count "
+            "SELECT id,profile,source,created,queued_at,attempt_count "
             "FROM jobs WHERE state='queued'"
         )
         values: tuple = ()
@@ -867,7 +837,7 @@ class Broker:
         candidates = []
         for row in connection.execute(query, values):
             profile = PROFILES[row["profile"]]
-            running = running_by_source.get(row["source"], 0)
+            running = 0 if release_running else running_by_source.get(row["source"], 0)
             next_allowed = schedules.get(row["source"])
             if running < profile.max_concurrency and (next_allowed is None or next_allowed <= now):
                 candidates.append(row)
@@ -894,108 +864,22 @@ class Broker:
                 accumulator = self._weight_accumulator = {}
         total_weight = 0.0
         for source in by_source:
-            weight = policy.weight(source)
-            if weight is None:
-                weight = 1.0
-            total_weight += weight
-            accumulator[source] = accumulator.get(source, 0.0) + weight
+            configured = policy.weight(source) or 1.0
+            share = 1.0 / configured
+            total_weight += share
+            accumulator[source] = accumulator.get(source, 0.0) + share
         # Ignore accumulator entries for sources no longer eligible after a
         # hot policy reload or an emptied queue.
         chosen_source = max(by_source, key=lambda source: accumulator[source])
         accumulator[chosen_source] -= total_weight
         return by_source[chosen_source][0]
 
-    def _wait_debt_seconds(self, row) -> float:
-        """Map user-facing priority (1 highest … 10 lowest) to a wait bound.
-
-        A priority-1 job is allowed the shortest wait before the starvation
-        guard forces its service; priority 10 gets the full configured window.
-        The mapping deliberately matches the documented semantics: lower
-        numbers are served first.
-        """
-        if self.wait_debt_seconds <= 0:
-            return 0.0
-        priority = int(row["priority"] or 10)
-        return self.wait_debt_seconds * priority / 10.0
-
-    def _select_candidate(self, candidates, policy: SourcePolicy, state: dict, now: float):
-        """Model-aware, batch-oriented pick that only mutates ``state``.
-
-        ``state`` carries the active batch and the weighted accumulator so the
-        same pure routine drives both real dispatch and the read-only
-        forecast.  Order of checks:
-
-        1. starvation guard — the oldest job whose wait reached its
-           priority-mapped debt bound breaks any batch and is served first;
-        2. active-batch continuation — while the bounded job count and
-           wall-clock window last, keep serving the same model, choosing
-           fairly among that model's sources;
-        3. new batch — weighted pick across all currently eligible sources;
-           the picked job's profile model becomes the batch model.
-
-        Returns ``(row, decision)`` or ``None``.
-        """
-        if not candidates:
-            return None
-        # Starvation guard: serve the oldest overdue job (candidates are FIFO,
-        # so the first row whose wait reached its priority-mapped debt bound is
-        # the oldest overdue one).  It breaks any active batch, so a job of
-        # another model is never starved behind a long same-model series.
-        overdue = None
-        for row in candidates:
-            queued_at = row["queued_at"] if row["queued_at"] is not None else row["created"]
-            debt = self._wait_debt_seconds(row)
-            if debt > 0 and now - queued_at >= debt:
-                overdue = row
-                break
-        if overdue is not None:
-            state["batch"] = None
-            wait = now - (overdue["queued_at"] if overdue["queued_at"] is not None else overdue["created"])
-            return overdue, {
-                "mode": "overdue",
-                "reason": f"wait {wait:g}s reached the {self._wait_debt_seconds(overdue):g}s priority debt bound",
-                "eligible_sources": [overdue["source"]],
-            }
-        batch = state["batch"]
-        if batch is not None and batch["count"] < state["batch_max_jobs"]:
-            same_model = [
-                row for row in candidates
-                if PROFILES[row["profile"]].model == batch["model"]
-            ]
-            if same_model:
-                picked = self._weighted_pick(same_model, policy, state["accumulator"])
-                if picked is not None:
-                    batch["count"] += 1
-                    return picked, {
-                        "mode": "model_batch",
-                        "reason": (
-                            f"batch {batch['model']} job {batch['count']}/"
-                            f"{state['batch_max_jobs']}"
-                        ),
-                        "eligible_sources": sorted({row["source"] for row in same_model}),
-                    }
-        picked = self._weighted_pick(candidates, policy, state["accumulator"])
-        model = PROFILES[picked["profile"]].model
-        state["batch"] = {
-            "model": model,
-            "started": now,
-            "count": 1,
-        }
-        return picked, {
-            "mode": "weighted_round_robin",
-            "reason": f"new batch for model {model}",
-            "eligible_sources": sorted({row["source"] for row in candidates}),
-        }
-
     def _next(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None):
-        # With a policy, sources share the GPU by their configured weights in
-        # model-oriented batches; without one, the enabled source set is served
-        # in global FIFO order.  The forecast consumes ``_scheduler_snapshot``,
-        # an immutable copy published here under the dispatcher lock.
+        # With a policy, sources share the GPU only by their configured weight;
+        # each selected source contributes its FIFO head.
         candidates = self._candidates(allowed_sources)
         if not candidates:
             self._last_scheduler_decision = None
-            self._batch_state = None
             self._scheduler_snapshot = None
             return None
         now = self.clock()
@@ -1007,19 +891,16 @@ class Broker:
                 "eligible_sources": sorted({row["source"] for row in candidates}),
             }
         else:
-            state = {
-                "batch": self._batch_state,
-                "accumulator": self._weight_accumulator,
-                "batch_max_jobs": self.batch_max_jobs,
-            }
-            result = self._select_candidate(candidates, policy, state, now)
-            if result is None:
+            selected = self._weighted_pick(candidates, policy)
+            if selected is None:
                 self._last_scheduler_decision = None
-                self._batch_state = None
                 self._scheduler_snapshot = None
                 return None
-            selected, decision = result
-            self._batch_state = state["batch"]
+            decision = {
+                "mode": "weighted_round_robin",
+                "reason": "weight-only source selection",
+                "eligible_sources": sorted({row["source"] for row in candidates}),
+            }
         policy_sources = policy.snapshot().get("sources", {}) if policy is not None else {}
         active_weights = {
             source: float(entry["weight"])
@@ -1035,7 +916,6 @@ class Broker:
             "selected_model": PROFILES[selected["profile"]].model,
         }
         self._scheduler_snapshot = {
-            "batch": dict(self._batch_state) if self._batch_state else None,
             "accumulator": dict(self._weight_accumulator),
             "last": dict(self._last_scheduler_decision),
         }

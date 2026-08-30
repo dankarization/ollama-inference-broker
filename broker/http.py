@@ -26,8 +26,6 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
             path = urlsplit(self.path).path
             if path == "/v1/jobs":
                 try:
-                    if "priority" in body:
-                        raise ValueError("per-job scheduling is not supported")
                     self._json(202, broker.submit(body["profile"], body["kind"], body.get("payload", {}),
                                                   body.get("source"), body.get("source_item_id"),
                                                   body.get("external_id")))

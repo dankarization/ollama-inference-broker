@@ -10,7 +10,7 @@ from unittest.mock import patch
 from urllib.request import urlopen
 
 from broker.http import serve
-from broker.__main__ import dispatch_enabled, dispatch_sources
+from broker.__main__ import dispatch_enabled, dispatch_sources, install_drain_handler
 from broker.adapters import OllamaHTTP
 from broker.service import Broker
 
@@ -41,6 +41,12 @@ class BrokerTests(unittest.TestCase):
         self.assertFalse(dispatch_enabled("false"))
         with self.assertRaisesRegex(ValueError, "must be true or false"):
             dispatch_enabled("later")
+
+    def test_admission_only_reload_installs_a_safe_noop_handler(self):
+        with patch("broker.__main__.signal.signal") as install:
+            install_drain_handler(None)
+        handler = install.call_args.args[1]
+        self.assertIsNone(handler(None, None))
 
     def test_dispatch_source_allowlist_requires_a_non_empty_value(self):
         self.assertEqual(
@@ -279,7 +285,7 @@ class BrokerTests(unittest.TestCase):
             server.server_close()
         self.assertEqual(self.calls, [])
 
-    def test_jobs_endpoint_rejects_removed_per_job_scheduling_field(self):
+    def test_jobs_endpoint_ignores_removed_legacy_scheduling_field(self):
         b = self.make()
         server = serve(b, port=0)
         thread = threading.Thread(target=server.handle_request)
@@ -291,23 +297,17 @@ class BrokerTests(unittest.TestCase):
                     "profile": "interactive", "kind": "generate", "priority": 1,
                 }).encode(), headers={"Content-Type": "application/json"}, method="POST",
             )
-            with self.assertRaises(__import__("urllib.error", fromlist=["HTTPError"]).HTTPError) as error:
-                urlopen(request)
-            self.assertEqual(error.exception.code, 400)
-            self.assertIn("per-job scheduling", error.exception.read().decode())
+            with urlopen(request) as response:
+                self.assertEqual(response.status, 202)
         finally:
             thread.join(timeout=1)
             server.server_close()
 
-    def test_fresh_database_retains_legacy_priority_for_rollback(self):
+    def test_fresh_database_has_no_priority_column(self):
         b = self.make()
         job = b.submit("interactive", "generate", {"prompt": "x"})
         columns = {row[1] for row in b.db.execute("PRAGMA table_info(jobs)")}
-        self.assertIn("priority", columns)
-        self.assertEqual(
-            b.db.execute("SELECT priority FROM jobs WHERE id=?", (job["id"],)).fetchone()[0],
-            1,
-        )
+        self.assertNotIn("priority", columns)
 
 if __name__ == "__main__": unittest.main()
 

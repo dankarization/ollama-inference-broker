@@ -212,22 +212,13 @@ def render(data: dict[str, Any]) -> bytes:
                 f'<p class=error>Forecast unavailable: {html.escape(str(forecast.get("reason", "observer read failed")))}.</p>'
             )
         else:
-            limits = forecast.get("batch_limits", {})
-            series = forecast.get("current_series")
-            if series:
-                series_text = (
-                    f"batch {cell(series.get('model'))} job {series.get('count', 0)}/"
-                    f"{limits.get('max_jobs')}"
-                )
-            else:
-                series_text = "no active batch"
             current_model = cell(forecast.get("current_model")) or "none"
             selection_rows = "".join(
                 "<tr>" + "".join((
                     f"<td>{cell(item['job_id'])}</td>",
                     f"<td>{cell(item['source'])}</td>",
                     f"<td>{cell(item['model'])}</td>",
-                    f"<td>{cell(item['priority'])}</td>",
+                    f"<td>{cell(item['weight'])}</td>",
                     f"<td>{cell(item['mode'])}</td>",
                     f"<td>{cell(item['reason'])}</td>",
                     f"<td>{cell(item['wait_seconds'])}s</td>",
@@ -236,11 +227,10 @@ def render(data: dict[str, Any]) -> bytes:
             ) or "<tr><td colspan=7>None queued</td></tr>"
             forecast_html = (
                 "<h2>Forecast</h2>"
-                f"<p>Current model: <b>{current_model}</b> · {series_text} · "
-                f"max batch {limits.get('max_jobs')} jobs · "
-                f"wait debt {limits.get('wait_debt_seconds')}s</p>"
+                f"<p>Current model: <b>{current_model}</b> · Weight 1 is most important; "
+                "lower Weight receives a larger scheduling share.</p>"
                 "<table><thead><tr><th>Job</th><th>Source</th><th>Model</th>"
-                "<th>Priority</th><th>Mode</th><th>Reason</th><th>Wait</th></tr></thead>"
+                "<th>Weight</th><th>Mode</th><th>Reason</th><th>Wait</th></tr></thead>"
                 f"<tbody>{selection_rows}</tbody></table>"
                 f"<p><small>{html.escape(forecast.get('contingency', ''))}.</small></p>"
             )

@@ -33,11 +33,11 @@ class DashboardTests(unittest.TestCase):
         with broker.db:
             broker.db.executemany(
                 "INSERT INTO jobs("
-                "id,profile,kind,source,priority,payload,state,created,finished,queued_at"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "id,profile,kind,source,payload,state,created,finished,queued_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?)",
                 [
                     (
-                        f"history-{index}", "interactive", "generate", "archive", 10,
+                        f"history-{index}", "interactive", "generate", "archive",
                         payload, "completed", float(index), 99_999.0, float(index),
                     )
                     for index in range(2_000)
@@ -45,9 +45,9 @@ class DashboardTests(unittest.TestCase):
             )
             broker.db.execute(
                 "INSERT INTO jobs("
-                "id,profile,kind,source,priority,payload,state,created,finished,queued_at"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?)",
-                ("history", "interactive", "generate", "history", 10, payload,
+                "id,profile,kind,source,payload,state,created,finished,queued_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?)",
+                ("history", "interactive", "generate", "history", payload,
                  "completed", 1.0, 99_999.0, 1.0),
             )
             broker.db.execute(

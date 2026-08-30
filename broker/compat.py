@@ -33,11 +33,9 @@ def submit(broker: Any, kind: str, request: Any) -> dict[str, Any]:
     source = request.get("source")
     if source is not None and not isinstance(source, str):
         raise CompatibilityError("source must be a string")
-    if "priority" in request:
-        raise CompatibilityError("per-job scheduling is not supported")
     payload = {key: value for key, value in request.items() if key not in {
         "profile", "source", "model", "keep_alive", "stream",
-        "source_item_id", "external_id",
+        "source_item_id", "external_id", "priority",
     }}
     try:
         return broker.submit(

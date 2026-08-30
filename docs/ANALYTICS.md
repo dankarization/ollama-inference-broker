@@ -75,30 +75,28 @@ Correlation lookup возвращает только job/source/profile/state/ti
 
 Scheduler window показывает actual selection count/share и expected share.
 Expected share рассчитывается на каждом решении только среди sources, которые
-тогда действительно были eligible (для `model_batch` — источники внутри
-текущей модели). Это не штрафует scheduler за пустую очередь,
-rate limit или disabled source, и корректно учитывает модельные батчи.
+тогда действительно были hard-eligible. Weight `w` имеет expected share,
+пропорциональную `1 / w`; это не штрафует scheduler за пустую очередь,
+rate limit или disabled source.
 `fairness_ratio=1` и малый
 `absolute_share_error` означают близость actual share к доступной weighted цели.
 
-Пример: 17 dispatch opportunities при постоянно заполненных очередях, weights
-`olya-vision=8`, `olya-decision=6`, `shutterstock-video=3` и batch-лимите 8:
+Пример: 12 dispatch opportunities при постоянно заполненных очередях, weights
+`source-a=2`, `source-b=6`:
 
 ```json
 {
-  "selections": 17,
-  "modes": {"weighted_round_robin": 3, "model_batch": 14},
+  "selections": 12,
+  "modes": {"weighted_round_robin": 12},
   "sources": {
-    "olya-vision": {"selected": 8, "fairness_ratio": 1.07},
-    "olya-decision": {"selected": 8, "fairness_ratio": 1.09},
-    "shutterstock-video": {"selected": 1, "fairness_ratio": 5.67}
+    "source-a": {"selected": 9, "fairness_ratio": 1.0},
+    "source-b": {"selected": 3, "fairness_ratio": 1.0}
   }
 }
 ```
 
-Батчи стартуют в порядке весов (vision, decision, video) и затем дренируют FIFO
-внутри модели: 8 заданий gemma, 8 заданий qwen и последнее задание nemotron.
-На коротком окне дискретность закономерно даёт отклонение. Для оценки нужны
+Lower numeric Weight получает большую share; на коротком окне дискретность
+закономерно даёт отклонение. Для оценки нужны
 одновременно 5 минут, 30 минут, 3 часа и 24 часа.
 
 ## Что сравнивать позже
@@ -106,8 +104,8 @@ rate limit или disabled source, и корректно учитывает мо
 Алгоритм нельзя менять до накопления baseline и отдельного rollout. Затем на
 одинаковом replay workload безопасно сравниваются:
 
-- model-aware batch scheduler — текущий baseline: weighted выбор внутри
-  модельного батча, FIFO внутри source и wait-debt starvation guard;
+- reciprocal-weight scheduler — текущий baseline: weight-only выбор source и
+  FIFO внутри source;
 - deficit round robin — лучше учитывает разную стоимость job, если появится
   надёжная оценка cost;
 - weighted fair queue — полезен при нескольких непрерывно загруженных sources,
