@@ -25,6 +25,31 @@ class FakeWol:
 
 
 class DashboardTests(unittest.TestCase):
+    def test_policy_select_state_machine_recovers_and_serializes(self):
+        # Executable model of the rendered desired/saved/saving state machine.
+        saved, desired, saving, sent = "A", "A", False, []
+        def change(value):
+            nonlocal desired, saving
+            desired = value
+            if not saving:
+                saving = True
+                sent.append(desired)
+        def settle(ok, persisted=None):
+            nonlocal saved, saving
+            value = sent[-1]
+            if ok:
+                saved = persisted or value
+                if desired != saved: sent.append(desired); return
+                saving = False; return
+            elif desired != value:
+                sent.append(desired); return
+            saving = False
+        change("B"); settle(False)  # latest B fails and releases the flag
+        self.assertFalse(saving); change("C"); self.assertEqual(sent[-1], "C"); settle(True)
+        self.assertEqual((saved, saving), ("C", False))
+        change("A"); change("B")  # B is queued; only A is in flight
+        self.assertEqual(sent[-1], "A"); settle(False); self.assertEqual(sent[-1], "B")
+        settle(True); self.assertEqual((saved, saving), ("B", False))
     def test_history_keyset_is_payload_free_ordered_and_exhaustible(self):
         db = tempfile.NamedTemporaryFile()
         self.addCleanup(db.close)
