@@ -110,6 +110,9 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("COVERING INDEX jobs_source_state_retry", retry_plan)
         data = snapshot(broker.db, now=100_000, policy_snapshot={"sources": {}})
         self.assertEqual(data["overall"]["states"]["queued"], 500)
+        observed = broker.dashboard()
+        self.assertEqual(observed["observation"]["state"], "live")
+        self.assertEqual(observed["overall"]["states"]["queued"], 500)
 
     def test_dashboard_endpoints_report_unavailable_observer_instead_of_empty_queue(self):
         db = tempfile.NamedTemporaryFile()
