@@ -64,6 +64,10 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("tr.innerHTML", html)
         self.assertIn("td.textContent", html)
         self.assertIn("timeZone:'Asia/Tbilisi'", html)
+        self.assertNotIn("<button", html)
+        self.assertIn("addEventListener('change'", html)
+        self.assertIn("while(desired!==saved)", html)
+        self.assertIn("desired===value", html)
     def test_payload_history_uses_the_bounded_observer_index_path(self):
         db = tempfile.NamedTemporaryFile()
         self.addCleanup(db.close)
