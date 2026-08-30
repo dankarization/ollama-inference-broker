@@ -345,6 +345,38 @@ class BatchSchedulerTests(unittest.TestCase):
         self.assertIn("id,profile,source,priority,created,queued_at", observer_select)
         self.assertNotIn("payload", observer_select)
 
+    def test_dispatcher_selects_large_queue_without_materializing_payloads(self):
+        clock = MutableClock(1_000)
+        broker = self.make(clock=clock)
+        policy = self.policy({"interactive": {"enabled": True, "weight": 1.0}})
+        large = "x" * 1_000_000
+        selected = broker.submit("interactive", "generate", {
+            "prompt": "selected", "context": large,
+        })["id"]
+        for index in range(1, 5):
+            clock.value += 1
+            broker.submit("interactive", "generate", {
+                "prompt": f"queued-{index}", "context": large,
+            })
+        statements = []
+        broker.db.set_trace_callback(statements.append)
+        self.assertTrue(broker.dispatch_once(policy=policy))
+        broker.db.set_trace_callback(None)
+        candidate_select = next(
+            line for line in statements
+            if "FROM jobs WHERE state='queued'" in line
+        )
+        self.assertIn(
+            "id,profile,source,priority,created,queued_at,attempt_count",
+            candidate_select,
+        )
+        self.assertNotIn("payload", candidate_select)
+        full_rows = [line for line in statements if "SELECT * FROM jobs WHERE id=" in line]
+        self.assertEqual(len(full_rows), 1)
+        self.assertIn(selected, full_rows[0])
+        executions = [call for call in self.calls if isinstance(call, tuple) and call[0] == "run"]
+        self.assertEqual(executions[-1][2]["prompt"], "selected")
+
     def test_forecast_reflects_an_active_batch_series(self):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock)

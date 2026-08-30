@@ -843,13 +843,13 @@ class Broker:
         connection = db if db is not None else self.db
         if allowed_sources is not None and not allowed_sources:
             return []
-        # Observer projections never execute a job, so avoid payload/result
-        # materialization there.  The dispatcher keeps full rows for _execute.
-        columns = (
-            "id,profile,source,priority,created,queued_at"
-            if db is not None else "*"
+        # Scheduler selection never needs payload/result_json.  Keeping this
+        # projection narrow for both observers and the real dispatcher avoids
+        # materializing every queued request while sorting a large backlog.
+        query = (
+            "SELECT id,profile,source,priority,created,queued_at,attempt_count "
+            "FROM jobs WHERE state='queued'"
         )
-        query = f"SELECT {columns} FROM jobs WHERE state='queued'"
         values: tuple = ()
         if allowed_sources is not None:
             placeholders = ",".join("?" for _ in allowed_sources)
@@ -1090,8 +1090,16 @@ class Broker:
                     (row["source"], now + interval),
                 )
             self._refresh_health_cache_locked()
+            # Payload is needed only after this job has been durably claimed.
+            # Fetching it here keeps the scheduler's full-queue projection
+            # payload-free while preserving the exact execution request.
+            execution_row = self.db.execute(
+                "SELECT * FROM jobs WHERE id=?", (row["id"],)
+            ).fetchone()
+            if execution_row is None:
+                raise RuntimeError("claimed job disappeared before execution")
         try:
-            self._execute(row)
+            self._execute(execution_row)
         except Exception as exc:
             with self.lock, self.db:
                 finished = self.clock()
