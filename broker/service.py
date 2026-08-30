@@ -343,8 +343,9 @@ class Broker:
             return
         for index in list(self.db.execute("PRAGMA index_list(jobs)")):
             name = index[1]
-            if any(column[2] == "priority" for column in self.db.execute(f"PRAGMA index_info({name})")):
-                self.db.execute(f"DROP INDEX {name}")
+            quoted_name = '"' + name.replace('"', '""') + '"'
+            if any(column[2] == "priority" for column in self.db.execute(f"PRAGMA index_info({quoted_name})")):
+                self.db.execute(f"DROP INDEX {quoted_name}")
         try:
             self.db.execute("ALTER TABLE jobs DROP COLUMN priority")
             return

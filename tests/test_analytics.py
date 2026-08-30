@@ -112,6 +112,34 @@ class AnalyticsTests(unittest.TestCase):
         self.assertIn("audit_events", tables)
         self.assertIn("job_attempts", tables)
 
+    def test_legacy_priority_index_with_punctuation_migrates_safely(self):
+        fd, path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(fd)
+        self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
+        db = sqlite3.connect(path)
+        db.execute("""CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
+            priority INTEGER NOT NULL, payload TEXT NOT NULL,
+            state TEXT NOT NULL, created REAL NOT NULL,
+            started REAL, finished REAL, lease_until REAL, error TEXT,
+            switch_reason TEXT)""")
+        db.execute(
+            "INSERT INTO jobs(id,profile,kind,priority,payload,state,created) "
+            "VALUES('legacy-job','interactive','generate',1,'{}','queued',10)"
+        )
+        # This valid SQLite identifier is invalid when interpolated bare into
+        # PRAGMA/DROP INDEX, reproducing the legacy migration edge case.
+        db.execute('CREATE INDEX "legacy priority-index" ON jobs(priority,created)')
+        db.commit()
+        db.close()
+
+        broker = self.make(path=path, clock=MutableClock(20))
+        self.assertEqual(broker.status("legacy-job")["state"], "queued")
+        self.assertNotIn("priority", {row[1] for row in broker.db.execute("PRAGMA table_info(jobs)")})
+        self.assertNotIn("legacy priority-index", {
+            row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")
+        })
+
     def test_retry_rejoins_global_fifo_at_its_latest_enqueue_time(self):
         clock = MutableClock(10)
         broker = self.make(clock=clock, fail_once=True)
