@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from urllib.request import urlopen
 
@@ -54,6 +55,14 @@ class BrokerTests(unittest.TestCase):
     def test_ollama_timeout_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "must be positive"):
             OllamaHTTP(timeout_seconds=0)
+
+    def test_systemd_drain_reload_targets_only_the_broker_main_pid(self):
+        root = Path(__file__).resolve().parents[1]
+        unit = (root / "systemd/ollama-inference-broker.service").read_text()
+        readme = (root / "README.md").read_text()
+        self.assertIn("ExecReload=/usr/bin/kill -USR1 $MAINPID", unit)
+        self.assertIn("systemctl --user reload ollama-inference-broker.service", readme)
+        self.assertIn("systemctl --user kill -s SIGUSR1", readme)
 
     def test_ollama_readiness_wait_tolerates_delayed_ps_visibility(self):
         client = OllamaHTTP()

@@ -184,6 +184,21 @@ durable `queued`. Это позволяет включить обратимый 
 не заканчивает батч: после долгого inference следующая совместимая модель
 остаётся continuation, если нет overdue работы другой модели. Это убирает
 unload/load между заданиями одной модели.
+
+### Safe dispatcher drain
+
+Для lossless drain dispatcher используйте только:
+
+```bash
+systemctl --user reload ollama-inference-broker.service
+```
+
+`ExecReload` посылает `SIGUSR1` исключительно broker `MainPID`: новые claims
+останавливаются, HTTP admissions и текущий inference продолжаются до обычного
+завершения. Не используйте `systemctl --user kill -s SIGUSR1 …`: по умолчанию
+эта команда сигнализирует весь service cgroup, включая дочерний `curl` активного
+inference, и может прервать job.
+
 Внутри батча источники делят GPU пропорционально весам (weighted
 round-robin с вращающимся аккумулятором), а внутри каждого источника
 сохраняется FIFO, per-source concurrency и min-interval backpressure.
