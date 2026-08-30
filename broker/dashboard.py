@@ -177,12 +177,21 @@ def render(data: dict[str, Any]) -> bytes:
             '<span class="weight-feedback" aria-live="polite"></span></form></td>'
         )
 
+    def enabled_cell(source: str, value: bool | None) -> str:
+        if value is None: return "<td>—</td>"
+        source_attribute = html.escape(source, quote=True)
+        return (f'<td><form class="enabled-form" data-source="{source_attribute}">'
+                f'<select name="enabled" aria-label="Enabled for {source_attribute}">'
+                f'<option value="true"{" selected" if value else ""}>yes</option>'
+                f'<option value="false"{" selected" if not value else ""}>no</option></select>'
+                '<button type="submit">Save</button><span class="enabled-feedback" aria-live="polite"></span></form></td>')
+
     rows = []
     for item in data["sources"]:
         scheduler, states = item["scheduler"], item["states"]
         rows.append("<tr>" + "".join((
             f"<td>{cell(item['source'])}</td>",
-            f"<td>{cell(scheduler['enabled'])}</td>",
+            enabled_cell(item["source"], scheduler['enabled']),
             weight_cell(item["source"], scheduler["weight"]),
             *(f"<td>{cell(value)}</td>" for value in (
             states["queued"], states["running"], states["lease"], states["retry"], states["delayed"],
@@ -203,6 +212,10 @@ def render(data: dict[str, Any]) -> bytes:
         )) + "</tr>"
         for job in active
     ) or "<tr><td colspan=7>None</td></tr>"
+    history_rows = "".join(
+        f"<tr data-history-id='{cell(row['id'])}'><td>{cell(row['id'])}</td><td>{cell(row['source'])}</td><td>{cell(row['profile'])}</td><td>{cell(row['state'])}</td>{timestamp_cell(row['finished'])}<td>{cell(row['attempt_count'])}</td></tr>"
+        for row in data.get("history", [])
+    ) or "<tr><td colspan=6>None</td></tr>"
     forecast = data.get("forecast")
     forecast_html = ""
     if forecast:
@@ -244,6 +257,7 @@ def render(data: dict[str, Any]) -> bytes:
 <h2>Sources</h2><table><thead><tr><th>Source</th><th>Enabled</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=13>None</td></tr>'}</tbody></table>
 <p><small>Delayed queued jobs are blocked by a source min-interval.</small></p>
 <h2>Active jobs</h2><table><thead><tr><th>ID</th><th>Source</th><th>State</th><th>Started</th><th>Lease until</th><th>Attempts</th><th>Retries</th></tr></thead><tbody>{active_rows}</tbody></table>
+<h2>History</h2><table><thead><tr><th>ID</th><th>Source</th><th>Profile</th><th>State</th><th>Finished</th><th>Attempts</th></tr></thead><tbody id=history-body>{history_rows}</tbody></table><div id=history-sentinel data-cursor="{html.escape(str((data.get('history') or [{}])[-1].get('finished','')) + ':' + str((data.get('history') or [{}])[-1].get('id','')), quote=True)}"></div>
 {forecast_html}
 <script>
 document.querySelectorAll('.weight-form').forEach((form) => {{
@@ -266,6 +280,8 @@ document.querySelectorAll('.weight-form').forEach((form) => {{
     }}
   }});
 }});
+document.querySelectorAll('.enabled-form').forEach((form) => {{ form.addEventListener('submit', async (event) => {{ event.preventDefault(); const feedback=form.querySelector('.enabled-feedback'); feedback.textContent='Saving…'; try {{ const response=await fetch('/v1/sources/'+encodeURIComponent(form.dataset.source)+'/enabled', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{enabled:form.elements.enabled.value==='true'}})}}); const result=await response.json(); if(!response.ok) throw new Error(result.error||'save failed'); feedback.textContent='Saved'; }} catch(error) {{ feedback.textContent=error.message||'Save failed'; }} }}); }});
+const sentinel=document.querySelector('#history-sentinel'); let loading=false; new IntersectionObserver(async entries => {{ if(loading||!entries[0].isIntersecting||!sentinel.dataset.cursor) return; loading=true; const response=await fetch('/v1/history?limit=30&cursor='+encodeURIComponent(sentinel.dataset.cursor)); const page=await response.json(); (page.items||[]).forEach(row=>{{ const tr=document.createElement('tr'); tr.dataset.historyId=row.id; tr.innerHTML=`<td>${{row.id}}</td><td>${{row.source}}</td><td>${{row.profile}}</td><td>${{row.state}}</td><td>${{row.finished}}</td><td>${{row.attempt_count}}</td>`; document.querySelector('#history-body').append(tr); }}); sentinel.dataset.cursor=page.next_cursor||''; loading=false; }}).observe(sentinel);
 </script>
 """
     return document.encode("utf-8")

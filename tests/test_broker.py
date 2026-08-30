@@ -372,6 +372,18 @@ class SourcePolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(SourcePolicyError, "not configured"):
             policy.set_weight("missing", 2)
 
+    def test_dashboard_enabled_update_persists_and_controls_eligibility(self):
+        from broker.service import SourcePolicy, SourcePolicyError
+        path = self._policy_file({"version": 1, "sources": {"a": {"enabled": True, "weight": 1}}})
+        policy = SourcePolicy(path)
+        self.assertFalse(policy.set_enabled("a", False))
+        self.assertEqual(policy.enabled_sources(), frozenset())
+        self.assertFalse(SourcePolicy(path).snapshot()["sources"]["a"]["enabled"])
+        self.assertTrue(policy.set_enabled("a", True))
+        self.assertEqual(policy.enabled_sources(), frozenset({"a"}))
+        with self.assertRaisesRegex(SourcePolicyError, "boolean"):
+            policy.set_enabled("a", "false")
+
     def test_policy_invalid_file_is_ignored_fail_closed(self):
         from broker.service import SourcePolicy
         path = self._policy_file({"version": 1, "sources": {"a": {"enabled": True, "weight": 1.0}}})

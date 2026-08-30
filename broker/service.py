@@ -136,6 +136,29 @@ class SourcePolicy:
             self._load_locked()
             return weight
 
+    def set_enabled(self, source: str, enabled: Any) -> bool:
+        if not isinstance(enabled, bool):
+            raise SourcePolicyError("enabled must be a boolean")
+        with self._lock:
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                normalized = normalize_source_policy(raw)
+            except (OSError, ValueError, SourcePolicyError) as error:
+                raise SourcePolicyError("policy is unavailable or invalid") from error
+            if source not in normalized:
+                raise SourcePolicyError(f"source {source!r} is not configured")
+            raw["sources"][source]["enabled"] = enabled
+            try:
+                mode = self.path.stat().st_mode & 0o7777
+                descriptor, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(raw, handle, indent=2, sort_keys=True); handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
+                os.chmod(temporary, mode); os.replace(temporary, self.path)
+            except OSError as error:
+                raise SourcePolicyError("unable to save policy") from error
+            self._signature = None; self._load_locked()
+            return enabled
+
 
 class Broker:
     """One-resource scheduler with FIFO per source and weight-only sharing."""
@@ -275,6 +298,10 @@ class Broker:
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_queued_candidates "
                 "ON jobs(state,source,queued_at,id,profile,created,attempt_count)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_terminal_history_v2 "
+                "ON jobs(state,finished,id,source,profile,created,started,attempt_count,retry_count)"
             )
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_source_item "
@@ -775,6 +802,7 @@ class Broker:
             lambda db: {
                 **dashboard_snapshot(db, now=now, policy_snapshot=policy_snapshot),
                 "forecast": self._forecast(db, policy, now, 8),
+                "history": self._terminal_history(db, limit=10),
             }
         )
         if snapshot is not None:
@@ -787,6 +815,28 @@ class Broker:
             return stale
         # An observer timeout or lock is not evidence that the queue is empty.
         return {"observation": self._observation("unavailable", now, error)}
+
+    def _terminal_history(self, db, *, limit: int, cursor: tuple[float, str] | None = None):
+        values: list[Any] = []
+        clause = ""
+        if cursor is not None:
+            clause = " AND (finished < ? OR (finished = ? AND id < ?))"
+            values.extend((cursor[0], cursor[0], cursor[1]))
+        rows = db.execute(
+            "SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count "
+            "FROM jobs INDEXED BY jobs_terminal_history_v2 "
+            "WHERE state IN ('completed','failed','cancelled') AND finished IS NOT NULL" + clause +
+            " ORDER BY finished DESC,id DESC LIMIT ?",
+            (*values, max(1, min(limit, 30))),
+        )
+        return [dict(row) for row in rows]
+
+    def terminal_history(self, *, limit: int = 30, cursor: tuple[float, str] | None = None):
+        data, error = self._observer_read(lambda db: self._terminal_history(db, limit=limit, cursor=cursor))
+        if data is None:
+            return {"unavailable": True, "reason": (error or {}).get("reason")}
+        next_cursor = None if not data else [data[-1]["finished"], data[-1]["id"]]
+        return {"items": data, "next_cursor": next_cursor}
 
     def correlations(
         self, *, source: str | None = None, source_item_id: str | None = None,

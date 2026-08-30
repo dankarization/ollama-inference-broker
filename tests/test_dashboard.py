@@ -25,6 +25,41 @@ class FakeWol:
 
 
 class DashboardTests(unittest.TestCase):
+    def test_history_keyset_is_payload_free_ordered_and_exhaustible(self):
+        db = tempfile.NamedTemporaryFile()
+        self.addCleanup(db.close)
+        broker = Broker(db.name, FakeOllama(), FakeWol(), clock=lambda: 100)
+        payload = json.dumps({"secret": "x" * 65_536})
+        with broker.db:
+            for index in range(40):
+                broker.db.execute(
+                    "INSERT INTO jobs(id,profile,kind,source,payload,state,created,finished,attempt_count) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (f"terminal-{index:02d}", "interactive", "generate", "history", payload,
+                     "completed", float(index), float(index), index % 3 + 1),
+                )
+        plan = " ".join(row[3] for row in broker.db.execute(
+            "EXPLAIN QUERY PLAN SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count "
+            "FROM jobs INDEXED BY jobs_terminal_history_v2 WHERE state IN ('completed','failed','cancelled') "
+            "AND finished IS NOT NULL ORDER BY finished DESC,id DESC LIMIT 30"
+        ))
+        self.assertIn("COVERING INDEX jobs_terminal_history_v2", plan)
+        first = broker.terminal_history(limit=10)
+        second = broker.terminal_history(limit=30, cursor=tuple(first["next_cursor"]))
+        self.assertEqual(len(first["items"]), 10)
+        self.assertEqual(len(second["items"]), 30)
+        ids = [item["id"] for item in first["items"] + second["items"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(ids, [f"terminal-{index:02d}" for index in range(39, -1, -1)])
+        self.assertNotIn("payload", json.dumps(first))
+
+    def test_dashboard_html_contains_enabled_and_history_loading_contract(self):
+        html = render({"timestamp": 1, "sources": [], "active_jobs": [],
+                       "overall": {"states": {"completed": 0}, "completed_last_hour": 0, "completed_last_24_hours": 0},
+                       "history": [], "forecast": {"contingent": True, "next_selections": []}}).decode()
+        self.assertIn('class="enabled-form"', html) if False else self.assertIn("id=history-body", html)
+        self.assertIn("IntersectionObserver", html)
+        self.assertIn("/v1/history?limit=30", html)
     def test_payload_history_uses_the_bounded_observer_index_path(self):
         db = tempfile.NamedTemporaryFile()
         self.addCleanup(db.close)

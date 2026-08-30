@@ -47,6 +47,15 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                     self._json(200, {"source": source, "weight": weight})
                 except SourcePolicyError as error:
                     self._json(400, {"error": str(error)})
+            elif path.startswith("/v1/sources/") and path.endswith("/enabled"):
+                source = unquote(path[len("/v1/sources/"):-len("/enabled")]).strip("/")
+                try:
+                    if not isinstance(body, dict) or set(body) != {"enabled"}:
+                        raise SourcePolicyError("request body must contain only enabled")
+                    if policy is None: raise SourcePolicyError("source policy is not configured")
+                    self._json(200, {"source": source, "enabled": policy.set_enabled(source, body["enabled"])})
+                except SourcePolicyError as error:
+                    self._json(400, {"error": str(error)})
             elif path in {"/api/chat", "/api/generate"}:
                 try:
                     job=submit_compatibility(broker, path.rsplit("/", 1)[-1], body)
@@ -187,6 +196,17 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                     self._json(200, broker.forecast(policy, limit=limit))
                 except ValueError:
                     self._json(400, {"error":"limit must be an integer"})
+            elif path == "/v1/history":
+                try:
+                    limit = int(query.get("limit", ["30"])[0])
+                    raw = query.get("cursor", [None])[0]
+                    cursor = None if raw is None else (float(raw.rsplit(":", 1)[0]), raw.rsplit(":", 1)[1])
+                    body = broker.terminal_history(limit=limit, cursor=cursor)
+                    if body.get("next_cursor"):
+                        body["next_cursor"] = f"{body['next_cursor'][0]}:{body['next_cursor'][1]}"
+                    self._json(200, body)
+                except ValueError:
+                    self._json(400, {"error":"invalid history cursor"})
             elif path == "/v1/audit-events":
                 try:
                     limit = int(query.get("limit", ["100"])[0])
