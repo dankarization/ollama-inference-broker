@@ -1,5 +1,6 @@
 import logging
 import os
+import signal
 from .adapters import OllamaHTTP, WakeOnLan
 from .http import serve
 from .service import Broker, Dispatcher, SourcePolicy
@@ -58,11 +59,15 @@ def main() -> None:
             # FIFO mode: env allowlist is required and immutable
             # until a restart (previous behaviour).
             allowed_sources = dispatch_sources(os.environ.get("BROKER_DISPATCH_SOURCES"))
-        Dispatcher(
+        dispatcher = Dispatcher(
             broker,
             allowed_sources=allowed_sources,
             policy=policy,
-        ).start()
+        )
+        # Local systemd signal: stop claims but retain HTTP admissions until
+        # the active remote call completes, then restart safely.
+        signal.signal(signal.SIGUSR1, lambda _signum, _frame: dispatcher.drain())
+        dispatcher.start()
     serve(broker, os.environ.get("BROKER_BIND", "127.0.0.1"), int(os.environ.get("BROKER_PORT", "8088")), policy=policy).serve_forever()
 
 

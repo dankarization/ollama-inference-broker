@@ -843,7 +843,13 @@ class Broker:
         connection = db if db is not None else self.db
         if allowed_sources is not None and not allowed_sources:
             return []
-        query = "SELECT * FROM jobs WHERE state='queued'"
+        # Observer projections never execute a job, so avoid payload/result
+        # materialization there.  The dispatcher keeps full rows for _execute.
+        columns = (
+            "id,profile,source,priority,created,queued_at"
+            if db is not None else "*"
+        )
+        query = f"SELECT {columns} FROM jobs WHERE state='queued'"
         values: tuple = ()
         if allowed_sources is not None:
             placeholders = ",".join("?" for _ in allowed_sources)
@@ -851,17 +857,19 @@ class Broker:
             values = tuple(sorted(allowed_sources))
         query += " ORDER BY queued_at, id"
         now = self.clock()
+        running_by_source = dict(connection.execute(
+            "SELECT source,count(*) FROM jobs "
+            "WHERE state IN ('running','cancel_requested') GROUP BY source"
+        ))
+        schedules = dict(connection.execute(
+            "SELECT source,next_allowed FROM source_schedules"
+        ))
         candidates = []
         for row in connection.execute(query, values):
             profile = PROFILES[row["profile"]]
-            running = connection.execute(
-                "SELECT count(*) FROM jobs WHERE source=? AND state IN ('running','cancel_requested')",
-                (row["source"],),
-            ).fetchone()[0]
-            scheduled = connection.execute(
-                "SELECT next_allowed FROM source_schedules WHERE source=?", (row["source"],)
-            ).fetchone()
-            if running < profile.max_concurrency and (scheduled is None or scheduled[0] <= now):
+            running = running_by_source.get(row["source"], 0)
+            next_allowed = schedules.get(row["source"])
+            if running < profile.max_concurrency and (next_allowed is None or next_allowed <= now):
                 candidates.append(row)
         return candidates
 
@@ -1213,6 +1221,11 @@ class Dispatcher(threading.Thread):
             policy,
             threading.Event(),
         )
+        self.drain_event = threading.Event()
+
+    def drain(self) -> None:
+        """Stop new claims while the in-flight remote execution finishes."""
+        self.drain_event.set()
     def run(self):
         while not self.stop_event.is_set():
             # With a runtime policy, the effective allowlist and weights come
@@ -1224,5 +1237,6 @@ class Dispatcher(threading.Thread):
                 enabled = policy.enabled_sources()
                 allowed = enabled if enabled else frozenset()
             self.broker.recover()
-            self.broker.dispatch_once(allowed, policy)
+            if not self.drain_event.is_set():
+                self.broker.dispatch_once(allowed, policy)
             self.stop_event.wait(self.interval)

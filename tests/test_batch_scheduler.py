@@ -334,6 +334,17 @@ class BatchSchedulerTests(unittest.TestCase):
         # And it is bounded by the requested limit.
         self.assertLessEqual(len(first["next_selections"]), 5)
 
+    def test_observer_candidates_do_not_sort_large_payloads(self):
+        broker = self.make()
+        broker.submit("interactive", "generate", {"prompt": "x" * 1_000_000})
+        statements = []
+        broker.db.set_trace_callback(statements.append)
+        broker._candidates(db=broker.db)
+        broker.db.set_trace_callback(None)
+        observer_select = next(line for line in statements if "FROM jobs WHERE state='queued'" in line)
+        self.assertIn("id,profile,source,priority,created,queued_at", observer_select)
+        self.assertNotIn("payload", observer_select)
+
     def test_forecast_reflects_an_active_batch_series(self):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock)
