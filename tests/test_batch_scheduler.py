@@ -543,6 +543,15 @@ class BatchSchedulerTests(unittest.TestCase):
             3,
         )
 
+    def test_forecast_bounds_each_source_candidate_backlog(self):
+        broker = self.make()
+        policy = self.policy({"interactive": {"enabled": True, "weight": 1.0}})
+        for index in range(100):
+            broker.submit("interactive", "generate", {"prompt": str(index)})
+        forecast = broker.forecast(policy, limit=2)
+        self.assertEqual(len(forecast["next_selections"]), 2)
+        self.assertEqual(len(broker._candidates(policy.enabled_sources(), limit_per_source=2)), 2)
+
     def test_dashboard_html_renders_the_contingent_forecast(self):
         from broker.dashboard import render
 

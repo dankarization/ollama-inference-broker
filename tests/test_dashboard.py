@@ -60,6 +60,10 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('class="enabled-form"', html) if False else self.assertIn("id=history-body", html)
         self.assertIn("IntersectionObserver", html)
         self.assertIn("/v1/history?limit=30", html)
+        self.assertLess(html.index("<h2>Forecast</h2>"), html.index("<h2>History</h2>"))
+        self.assertNotIn("tr.innerHTML", html)
+        self.assertIn("td.textContent", html)
+        self.assertIn("timeZone:'Asia/Tbilisi'", html)
     def test_payload_history_uses_the_bounded_observer_index_path(self):
         db = tempfile.NamedTemporaryFile()
         self.addCleanup(db.close)

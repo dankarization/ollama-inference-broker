@@ -752,7 +752,10 @@ class Broker:
         ).fetchone()
         # The next dispatch can occur only after the one active job completes.
         # Project that slot release; keep all other hard eligibility checks.
-        candidates = self._candidates(allowed, db=db, release_running=running is not None)
+        candidates = self._candidates(
+            allowed, db=db, release_running=running is not None,
+            limit_per_source=bounded,
+        )
         snapshot = self._scheduler_snapshot or {}
         accumulator = dict(snapshot.get("accumulator") or {})
         remaining = [dict(row) for row in candidates]
@@ -866,7 +869,7 @@ class Broker:
             return [dict(row) for row in rows]
 
     def _candidates(self, allowed_sources: frozenset[str] | None = None, db=None,
-                    release_running: bool = False):
+                    release_running: bool = False, limit_per_source: int | None = None):
         """Queued rows eligible now, ordered FIFO.
 
         Per-source concurrency and min-interval backpressure are applied here
@@ -889,7 +892,17 @@ class Broker:
             placeholders = ",".join("?" for _ in allowed_sources)
             query += f" AND source IN ({placeholders})"
             values = tuple(sorted(allowed_sources))
-        query += " ORDER BY queued_at, id"
+        if limit_per_source is not None:
+            query = (
+                "SELECT id,profile,source,created,queued_at,attempt_count FROM ("
+                "SELECT id,profile,source,created,queued_at,attempt_count,"
+                "row_number() OVER (PARTITION BY source ORDER BY queued_at,id) AS source_rank "
+                "FROM (" + query + ")"
+                ") WHERE source_rank<=? ORDER BY queued_at,id"
+            )
+            values += (limit_per_source,)
+        else:
+            query += " ORDER BY queued_at, id"
         now = self.clock()
         running_by_source = dict(connection.execute(
             "SELECT source,count(*) FROM jobs "
