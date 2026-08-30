@@ -180,7 +180,7 @@ def _scheduler_window(
         weights = metadata.get("active_weights") or {}
         eligible = metadata.get("eligible_sources") or []
         eligible_weights = {
-            name: float(weights.get(name, 1.0)) for name in eligible
+            name: 1.0 / float(weights.get(name, 1.0)) for name in eligible
         }
         weight_total = sum(eligible_weights.values())
         if mode == "weighted_round_robin" and weight_total > 0:

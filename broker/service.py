@@ -1,29 +1,30 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
+from .dashboard import snapshot as dashboard_snapshot
 from .compat import (CompatibilityError, validate_olya_decision_payload,
                      validate_olya_vision_payload,
                      validate_shutterstock_canary_payload,
                      validate_shutterstock_video_payload,
                      validate_syncopia_memory_payload)
-from .profiles import FIXED_SOURCE_PRIORITIES, MAX_PRIORITY, MIN_PRIORITY, PROFILES
+from .profiles import PROFILES
+from .policy import SourcePolicyError, normalize_source_policy
 
 
 LOGGER = logging.getLogger("ollama_inference_broker.audit")
-
-
-class SourcePolicyError(ValueError):
-    pass
-
+OBSERVER_READ_DEADLINE_SECONDS = 0.75
 
 class SourcePolicy:
     """Runtime-reloadable per-source weights and enablement.
@@ -49,6 +50,7 @@ class SourcePolicy:
     def __init__(self, path: str | Path, clock=time.time) -> None:
         self.path = Path(path)
         self.clock = clock
+        self._lock = threading.RLock()
         self._signature: tuple[int, int, int] | None = None
         self._sources: dict[str, dict[str, Any]] = {}
 
@@ -65,33 +67,7 @@ class SourcePolicy:
         except (OSError, ValueError):
             return  # atomic replace means this is only a transient partial read
         try:
-            if not isinstance(raw, dict):
-                raise SourcePolicyError("policy must contain an object 'sources'")
-            sources = raw.get("sources")
-            if not isinstance(sources, dict):
-                raise SourcePolicyError("policy must contain an object 'sources'")
-            normalized: dict[str, dict[str, Any]] = {}
-            for name, entry in sources.items():
-                if not isinstance(name, str) or not name:
-                    raise SourcePolicyError("source names must be non-empty strings")
-                if not isinstance(entry, dict):
-                    raise SourcePolicyError(f"source {name!r} must be an object")
-                unknown = set(entry) - {"enabled", "weight"}
-                if unknown:
-                    raise SourcePolicyError(
-                        f"source {name!r} has unknown keys: {', '.join(sorted(unknown))}"
-                    )
-                enabled = entry.get("enabled", True)
-                weight = entry.get("weight", 1.0)
-                if not isinstance(enabled, bool):
-                    raise SourcePolicyError(f"source {name!r} enabled must be a boolean")
-                if (
-                    isinstance(weight, bool)
-                    or not isinstance(weight, (int, float))
-                    or weight <= 0
-                ):
-                    raise SourcePolicyError(f"source {name!r} weight must be a positive number")
-                normalized[name] = {"enabled": enabled, "weight": float(weight)}
+            normalized = normalize_source_policy(raw)
         except SourcePolicyError:
             if self._signature is None:
                 raise
@@ -104,29 +80,93 @@ class SourcePolicy:
 
     def snapshot(self) -> dict[str, Any]:
         """Return the current effective policy for observability (no secrets)."""
-        self._load_locked()
-        return {
-            "path": str(self.path),
-            "sources": {name: dict(entry) for name, entry in self._sources.items()},
-        }
+        with self._lock:
+            self._load_locked()
+            return {
+                "path": str(self.path),
+                "sources": {name: dict(entry) for name, entry in self._sources.items()},
+            }
 
     def enabled_sources(self) -> frozenset[str]:
-        self._load_locked()
-        return frozenset(
-            name for name, entry in self._sources.items() if entry["enabled"]
-        )
+        with self._lock:
+            self._load_locked()
+            return frozenset(
+                name for name, entry in self._sources.items() if entry["enabled"]
+            )
 
     def weight(self, source: str) -> float | None:
-        self._load_locked()
-        entry = self._sources.get(source)
-        return entry["weight"] if entry else None
+        with self._lock:
+            self._load_locked()
+            entry = self._sources.get(source)
+            return entry["weight"] if entry else None
+
+    def set_weight(self, source: str, weight: Any) -> int:
+        """Atomically update one configured source with a dashboard-safe weight."""
+        if isinstance(weight, bool) or not isinstance(weight, int) or not 1 <= weight <= 10:
+            raise SourcePolicyError("weight must be an integer from 1 through 10")
+        with self._lock:
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                normalized = normalize_source_policy(raw)
+            except (OSError, ValueError, SourcePolicyError) as error:
+                raise SourcePolicyError("policy is unavailable or invalid") from error
+            if source not in normalized:
+                raise SourcePolicyError(f"source {source!r} is not configured")
+
+            raw["sources"][source]["weight"] = weight
+            try:
+                original_mode = self.path.stat().st_mode & 0o7777
+                descriptor, temporary = tempfile.mkstemp(
+                    prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent,
+                )
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(raw, handle, indent=2, sort_keys=True)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(temporary, original_mode)
+                os.replace(temporary, self.path)
+            except OSError as error:
+                try:
+                    os.unlink(temporary)
+                except (OSError, UnboundLocalError):
+                    pass
+                raise SourcePolicyError("unable to save policy") from error
+            self._signature = None
+            self._load_locked()
+            return weight
+
+    def set_enabled(self, source: str, enabled: Any) -> bool:
+        if not isinstance(enabled, bool):
+            raise SourcePolicyError("enabled must be a boolean")
+        with self._lock:
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                normalized = normalize_source_policy(raw)
+            except (OSError, ValueError, SourcePolicyError) as error:
+                raise SourcePolicyError("policy is unavailable or invalid") from error
+            if source not in normalized:
+                raise SourcePolicyError(f"source {source!r} is not configured")
+            raw["sources"][source]["enabled"] = enabled
+            try:
+                mode = self.path.stat().st_mode & 0o7777
+                descriptor, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(raw, handle, indent=2, sort_keys=True); handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
+                os.chmod(temporary, mode); os.replace(temporary, self.path)
+            except OSError as error:
+                raise SourcePolicyError("unable to save policy") from error
+            self._signature = None; self._load_locked()
+            return enabled
 
 
 class Broker:
-    """One-resource scheduler; MAIN-PC remains only the wakeable executor."""
-    def __init__(self, database: str | Path, ollama, wol, clock=time.time, lease_seconds=60):
+    """One-resource scheduler with FIFO per source and weight-only sharing."""
+    def __init__(self, database: str | Path, ollama, wol, clock=time.time,
+                 lease_seconds=60):
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
-        self.db = sqlite3.connect(str(database), check_same_thread=False)
+        self.database = str(database)
+        self.db = sqlite3.connect(self.database, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
         self.completed = threading.Condition(self.lock)
@@ -134,6 +174,15 @@ class Broker:
             "status": "starting", "resource": "mainpc-gpu", "queue_depth": 0,
             "active_job_id": None, "timestamp": self.clock(),
         }
+        self._loaded_models_cache: list[dict[str, Any]] = []
+        self._dashboard_cache: dict[str, Any] | None = None
+        self._metrics_cache: dict[str, Any] = {
+            "resource": "mainpc-gpu", "queue_depth": 0, "active": None,
+        }
+        # In-memory weighted-round-robin state; policy changes never reset it.
+        self._weight_accumulator: dict[str, float] = {}
+        # Immutable copy written under the lock for the lock-free forecast.
+        self._scheduler_snapshot: dict[str, Any] | None = None
         self._init_db()
         self.recover()
         with self.lock:
@@ -155,24 +204,25 @@ class Broker:
     def _init_db(self):
         with self.db:
             self.db.execute("PRAGMA journal_mode=WAL")
-            self.db.execute("""CREATE TABLE IF NOT EXISTS jobs (
+            jobs_schema = """CREATE TABLE jobs (
                 id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
-                source TEXT NOT NULL, priority INTEGER NOT NULL,
+                source TEXT NOT NULL,
                 payload TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
                 started REAL, finished REAL, lease_until REAL, error TEXT,
                 switch_reason TEXT, result_json TEXT,
                 source_item_id TEXT, external_id TEXT, queued_at REAL,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 retry_count INTEGER NOT NULL DEFAULT 0,
-                requeue_count INTEGER NOT NULL DEFAULT 0)""")
+                requeue_count INTEGER NOT NULL DEFAULT 0)"""
+            self.db.execute(jobs_schema.replace(
+                "CREATE TABLE jobs", "CREATE TABLE IF NOT EXISTS jobs", 1
+            ))
             self.db.execute("""CREATE TABLE IF NOT EXISTS source_schedules (
                 source TEXT PRIMARY KEY, next_allowed REAL NOT NULL)""")
             # Compatible with databases created by the first isolated MVP.
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
             if "source" not in columns:
                 self.db.execute("ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'")
-            if "priority" not in columns:
-                self.db.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 10")
             if "result_json" not in columns:
                 self.db.execute("ALTER TABLE jobs ADD COLUMN result_json TEXT")
             if "source_item_id" not in columns:
@@ -194,6 +244,7 @@ class Broker:
                     "ALTER TABLE jobs ADD COLUMN requeue_count INTEGER NOT NULL DEFAULT 0"
                 )
             self.db.execute("UPDATE jobs SET queued_at=created WHERE queued_at IS NULL")
+            self._retire_priority_column()
             self.db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred REAL NOT NULL,
@@ -231,6 +282,31 @@ class Broker:
                 "CREATE INDEX IF NOT EXISTS jobs_source_state ON jobs(source,state,created)"
             )
             self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_state_started "
+                "ON jobs(state,started,created,id)"
+            )
+            # Dashboard source discovery and retry totals must stay index-only
+            # on payload-heavy production queues.
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_state_source ON jobs(state,source)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_source_state_retry "
+                "ON jobs(source,state,retry_count)"
+            )
+            # Candidate selection/forecast must not visit queued payload rows.
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_queued_candidates "
+                "ON jobs(state,source,queued_at,id,profile,created,attempt_count)"
+            )
+            # History is globally newest-first across all terminal states.  Keep
+            # its ordering keys first so SQLite can stop at LIMIT without a
+            # temporary sort; the remaining projected columns make it covering.
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_terminal_history_v3 "
+                "ON jobs(finished DESC,id DESC,state,source,profile,created,started,attempt_count,retry_count)"
+            )
+            self.db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_source_item "
                 "ON jobs(source,source_item_id)"
             )
@@ -252,6 +328,42 @@ class Broker:
                 "ON jobs(source,external_id) WHERE source='syncopia-telegram-memory' "
                 "AND external_id IS NOT NULL"
             )
+
+    def _retire_priority_column(self) -> None:
+        """Remove a legacy priority column only when new inserts need it gone.
+
+        Current deployed schemas have a default and can retain an inert historic
+        column without runtime reads or writes.  Very old NOT NULL/no-default
+        schemas are rebuilt once, transactionally, so new jobs have no hidden
+        priority value while all durable rows are preserved.
+        """
+        columns = list(self.db.execute("PRAGMA table_info(jobs)"))
+        priority = next((row for row in columns if row[1] == "priority"), None)
+        if priority is None or priority[4] is not None or not priority[3]:
+            return
+        for index in list(self.db.execute("PRAGMA index_list(jobs)")):
+            name = index[1]
+            quoted_name = '"' + name.replace('"', '""') + '"'
+            if any(column[2] == "priority" for column in self.db.execute(f"PRAGMA index_info({quoted_name})")):
+                self.db.execute(f"DROP INDEX {quoted_name}")
+        try:
+            self.db.execute("ALTER TABLE jobs DROP COLUMN priority")
+            return
+        except sqlite3.OperationalError:
+            pass
+        names = [row[1] for row in columns if row[1] != "priority"]
+        self.db.execute("ALTER TABLE jobs RENAME TO jobs_with_legacy_priority")
+        schema = """CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
+            source TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL,
+            created REAL NOT NULL, started REAL, finished REAL, lease_until REAL,
+            error TEXT, switch_reason TEXT, result_json TEXT, source_item_id TEXT,
+            external_id TEXT, queued_at REAL, attempt_count INTEGER NOT NULL DEFAULT 0,
+            retry_count INTEGER NOT NULL DEFAULT 0, requeue_count INTEGER NOT NULL DEFAULT 0)"""
+        self.db.execute(schema)
+        joined = ",".join(names)
+        self.db.execute(f"INSERT INTO jobs ({joined}) SELECT {joined} FROM jobs_with_legacy_priority")
+        self.db.execute("DROP TABLE jobs_with_legacy_priority")
 
     def _audit(
         self,
@@ -326,7 +438,7 @@ class Broker:
             self.completed.notify_all()
 
     def submit(self, profile: str, kind: str, payload: dict, source: str | None = None,
-               priority: int | None = None, source_item_id: str | None = None,
+               source_item_id: str | None = None,
                external_id: str | None = None) -> dict:
         if profile not in PROFILES:
             raise ValueError("unknown profile")
@@ -379,7 +491,6 @@ class Broker:
                 })
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
-        resolved_priority = self._resolve_priority(source, priority)
         source_item_id = self._correlation_value("source_item_id", source_item_id)
         external_id = self._correlation_value("external_id", external_id)
         job_id, now = str(uuid.uuid4()), self.clock()
@@ -393,10 +504,10 @@ class Broker:
                 if existing is not None:
                     return self.status(existing["id"])
             self.db.execute(
-                "INSERT INTO jobs(id,profile,kind,source,priority,payload,state,created,"
-                "queued_at,source_item_id,external_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (job_id, profile, kind, source, resolved_priority, json.dumps(payload),
-                 "queued", now, now, source_item_id, external_id),
+                "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
+                "queued_at,source_item_id,external_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (job_id, profile, kind, source, json.dumps(payload), "queued", now,
+                 now, source_item_id, external_id),
             )
             self._audit(
                 "admission.accepted", job_id=job_id, source=source,
@@ -404,7 +515,6 @@ class Broker:
                 metadata={
                     "profile": profile,
                     "kind": kind,
-                    "priority": resolved_priority,
                     "has_source_item_id": source_item_id is not None,
                     "has_external_id": external_id is not None,
                 },
@@ -420,17 +530,6 @@ class Broker:
             raise ValueError(f"{name} must be a non-empty string up to 256 characters")
         return value.strip()
 
-    @staticmethod
-    def _resolve_priority(source: str, priority: int | None) -> int:
-        fixed = FIXED_SOURCE_PRIORITIES.get(source)
-        if fixed is not None:
-            if priority is not None and priority != fixed:
-                raise ValueError(f"source '{source}' has fixed priority {fixed}")
-            return fixed
-        if isinstance(priority, bool) or not isinstance(priority, int) or not MIN_PRIORITY <= priority <= MAX_PRIORITY:
-            raise ValueError(f"priority for non-fixed sources must be an integer from {MIN_PRIORITY} to {MAX_PRIORITY}")
-        return priority
-
     def status(self, job_id: str) -> dict | None:
         with self.lock:
             row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -438,6 +537,7 @@ class Broker:
 
     def _job(self, row):
         data = dict(row)
+        data.pop("priority", None)  # inert historic column is never public
         data["payload"] = json.loads(data["payload"])
         if data.get("result_json") is not None:
             data["result"] = json.loads(data.pop("result_json"))
@@ -449,8 +549,8 @@ class Broker:
 
     def _position(self, row):
         before = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued' AND "
-            "(priority < ? OR (priority = ? AND (created < ? OR (created = ? AND id < ?))))",
-            (row["priority"], row["priority"], row["created"], row["created"], row["id"])).fetchone()[0]
+            "(queued_at < ? OR (queued_at = ? AND id < ?))",
+            (row["queued_at"], row["queued_at"], row["id"])).fetchone()[0]
         return before + 1
 
     def cancel(self, job_id: str) -> dict | None:
@@ -570,6 +670,183 @@ class Broker:
                 windows=windows,
             )
 
+    @staticmethod
+    def _observer_error(error: sqlite3.Error) -> dict[str, str]:
+        """Return safe, actionable SQLite observer diagnostics."""
+        sqlite_error = getattr(error, "sqlite_errorname", None)
+        if not sqlite_error:
+            message = str(error).lower()
+            if "interrupted" in message:
+                sqlite_error = "SQLITE_INTERRUPT"
+            elif "locked" in message or "busy" in message:
+                sqlite_error = "SQLITE_BUSY"
+            elif "no such table" in message or "no such index" in message:
+                sqlite_error = "SQLITE_SCHEMA"
+            else:
+                sqlite_error = "SQLITE_ERROR"
+        LOGGER.warning(json.dumps({
+            "event": "observer.read_failed", "sqlite_error": sqlite_error,
+        }, sort_keys=True))
+        return {
+            "reason": "database observer read unavailable",
+            "sqlite_error": sqlite_error,
+        }
+
+    def _observer_read(self, reader):
+        """Run a bounded read without waiting for the dispatcher connection."""
+        connection = None
+        deadline = time.monotonic() + OBSERVER_READ_DEADLINE_SECONDS
+        try:
+            connection = sqlite3.connect(
+                self.database, timeout=OBSERVER_READ_DEADLINE_SECONDS,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute(
+                f"PRAGMA busy_timeout={int(OBSERVER_READ_DEADLINE_SECONDS * 1_000)}"
+            )
+            connection.set_progress_handler(
+                lambda: int(time.monotonic() >= deadline), 1_000,
+            )
+            return reader(connection), None
+        except sqlite3.Error as error:
+            return None, self._observer_error(error)
+        finally:
+            if connection is not None:
+                connection.close()
+
+    @staticmethod
+    def _observation(
+        state: str, now: float, error: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        observation: dict[str, Any] = {"state": state, "observed_at": now}
+        if error is not None:
+            observation.update(error)
+        return observation
+
+    def forecast(self, policy: SourcePolicy | None = None, limit: int = 5) -> dict:
+        """Read-only projection of upcoming dispatcher selections.
+
+        The projection never mutates the queue, leases, accumulators or batch
+        state: it simulates the same ``_select_candidate`` routine on private
+        copies and is explicitly contingent on later admissions and state
+        changes.  A locked database yields ``unavailable`` instead of fake
+        emptiness.  Bounded by ``limit`` (1..20) next selections.
+        """
+        now = self.clock()
+        data, error = self._observer_read(
+            lambda db: self._forecast(db, policy, now, limit)
+        )
+        if data is None:
+            return {
+                "contingent": True,
+                "unavailable": True,
+                "reason": (error or {}).get("reason", "database observer read unavailable"),
+            }
+        return data
+
+    def _forecast(self, db, policy, now: float, limit: int) -> dict[str, Any]:
+        """Projection body; reads only, never writes."""
+        bounded = max(1, min(int(limit), 20))
+        allowed = None
+        if policy is not None:
+            allowed = policy.enabled_sources()
+        running = db.execute(
+            "SELECT profile FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1"
+        ).fetchone()
+        # The next dispatch can occur only after the one active job completes.
+        # Project that slot release; keep all other hard eligibility checks.
+        candidates = self._candidates(
+            allowed, db=db, release_running=running is not None,
+            limit_per_source=bounded,
+        )
+        snapshot = self._scheduler_snapshot or {}
+        accumulator = dict(snapshot.get("accumulator") or {})
+        remaining = [dict(row) for row in candidates]
+        selections: list[dict[str, Any]] = []
+        for _ in range(bounded):
+            if not remaining:
+                break
+            if policy is None:
+                picked = remaining[0]
+                mode, reason = "fifo", "oldest queued job"
+                eligible = [picked["source"]]
+            else:
+                picked = self._weighted_pick(remaining, policy, accumulator)
+                if picked is None:
+                    break
+                mode, reason = "weighted_round_robin", "weight-only source selection"
+                eligible = sorted({row["source"] for row in remaining})
+            queued_at = picked["queued_at"] if picked["queued_at"] is not None else picked["created"]
+            wait = max(0.0, now - queued_at)
+            selections.append({
+                "job_id": picked["id"],
+                "source": picked["source"],
+                "profile": picked["profile"],
+                "model": PROFILES[picked["profile"]].model,
+                "weight": (policy.weight(picked["source"]) or 1.0) if policy else 1.0,
+                "mode": mode,
+                "reason": reason,
+                "eligible_sources": eligible,
+                "wait_seconds": round(wait, 3),
+            })
+            remaining = [row for row in remaining if row["id"] != picked["id"]]
+        return {
+            "contingent": True,
+            "contingency": (
+                "read-only post-completion projection; it changes as jobs are admitted, "
+                "complete and when the source policy reloads"
+            ),
+            "current_model": PROFILES[running["profile"]].model if running else None,
+            "next_selections": selections,
+        }
+
+    def dashboard(self, policy: SourcePolicy | None = None) -> dict:
+        """Payload-free live queue data for the local operational dashboard."""
+        policy_snapshot = policy.snapshot() if policy is not None else None
+        now = self.clock()
+        snapshot, error = self._observer_read(
+            lambda db: {
+                **dashboard_snapshot(db, now=now, policy_snapshot=policy_snapshot),
+                "forecast": self._forecast(db, policy, now, 8),
+                "history": self._terminal_history(db, limit=10),
+            }
+        )
+        if snapshot is not None:
+            snapshot["observation"] = self._observation("live", now)
+            self._dashboard_cache = snapshot
+            return snapshot
+        if self._dashboard_cache is not None:
+            stale = deepcopy(self._dashboard_cache)
+            stale["observation"] = self._observation("stale", now, error)
+            return stale
+        # An observer timeout or lock is not evidence that the queue is empty.
+        return {"observation": self._observation("unavailable", now, error)}
+
+    def _terminal_history(self, db, *, limit: int, cursor: tuple[float, str] | None = None):
+        values: list[Any] = []
+        clause = ""
+        if cursor is not None:
+            # A row-value range follows the index ordering without turning the
+            # keyset predicate into a multi-index OR that needs a temp sort.
+            clause = " AND (finished,id) < (?,?)"
+            values.extend(cursor)
+        rows = db.execute(
+            "SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count "
+            "FROM jobs INDEXED BY jobs_terminal_history_v3 "
+            "WHERE state IN ('completed','failed','cancelled') AND finished IS NOT NULL" + clause +
+            " ORDER BY finished DESC,id DESC LIMIT ?",
+            (*values, max(1, min(limit, 30))),
+        )
+        return [dict(row) for row in rows]
+
+    def terminal_history(self, *, limit: int = 30, cursor: tuple[float, str] | None = None):
+        data, error = self._observer_read(lambda db: self._terminal_history(db, limit=limit, cursor=cursor))
+        if data is None:
+            return {"unavailable": True, "reason": (error or {}).get("reason")}
+        next_cursor = None if not data else [data[-1]["finished"], data[-1]["id"]]
+        return {"items": data, "next_cursor": next_cursor}
+
     def correlations(
         self, *, source: str | None = None, source_item_id: str | None = None,
         external_id: str | None = None, limit: int = 100,
@@ -597,62 +874,83 @@ class Broker:
             )
             return [dict(row) for row in rows]
 
-    def _candidates(self, allowed_sources: frozenset[str] | None = None):
-        """Queued rows eligible now, ordered by strict priority then FIFO.
+    def _candidates(self, allowed_sources: frozenset[str] | None = None, db=None,
+                    release_running: bool = False, limit_per_source: int | None = None):
+        """Queued rows eligible now, ordered FIFO.
 
         Per-source concurrency and min-interval backpressure are applied here
         exactly as before; this method returns the full ordered candidate list
-        so a weighted policy can pick a source fairly instead of always taking
-        the highest-priority row.
+        so a weighted policy can pick a source fairly.  ``db`` may be an
+        observer connection for read-only projections.
         """
+        connection = db if db is not None else self.db
         if allowed_sources is not None and not allowed_sources:
             return []
-        query = "SELECT * FROM jobs WHERE state='queued'"
+        # Scheduler selection never needs payload/result_json.  Keeping this
+        # projection narrow for both observers and the real dispatcher avoids
+        # materializing every queued request while sorting a large backlog.
+        query = (
+            "SELECT id,profile,source,created,queued_at,attempt_count "
+            "FROM jobs INDEXED BY jobs_queued_candidates WHERE state='queued'"
+        )
         values: tuple = ()
         if allowed_sources is not None:
             placeholders = ",".join("?" for _ in allowed_sources)
             query += f" AND source IN ({placeholders})"
             values = tuple(sorted(allowed_sources))
-        query += " ORDER BY priority, created, id"
+        if limit_per_source is not None:
+            query = (
+                "SELECT id,profile,source,created,queued_at,attempt_count FROM ("
+                "SELECT id,profile,source,created,queued_at,attempt_count,"
+                "row_number() OVER (PARTITION BY source ORDER BY queued_at,id) AS source_rank "
+                "FROM (" + query + ")"
+                ") WHERE source_rank<=? ORDER BY queued_at,id"
+            )
+            values += (limit_per_source,)
+        else:
+            query += " ORDER BY queued_at, id"
         now = self.clock()
+        running_by_source = dict(connection.execute(
+            "SELECT source,count(*) FROM jobs "
+            "WHERE state IN ('running','cancel_requested') GROUP BY source"
+        ))
+        schedules = dict(connection.execute(
+            "SELECT source,next_allowed FROM source_schedules"
+        ))
         candidates = []
-        for row in self.db.execute(query, values):
+        for row in connection.execute(query, values):
             profile = PROFILES[row["profile"]]
-            running = self.db.execute(
-                "SELECT count(*) FROM jobs WHERE source=? AND state IN ('running','cancel_requested')",
-                (row["source"],),
-            ).fetchone()[0]
-            scheduled = self.db.execute(
-                "SELECT next_allowed FROM source_schedules WHERE source=?", (row["source"],)
-            ).fetchone()
-            if running < profile.max_concurrency and (scheduled is None or scheduled[0] <= now):
+            running = 0 if release_running else running_by_source.get(row["source"], 0)
+            next_allowed = schedules.get(row["source"])
+            if running < profile.max_concurrency and (next_allowed is None or next_allowed <= now):
                 candidates.append(row)
         return candidates
 
-    def _weighted_pick(self, candidates, policy: SourcePolicy):
+    def _weighted_pick(self, candidates, policy: SourcePolicy, accumulator=None):
         """Pick a candidate by weighted round-robin across sources.
 
         Weights are relative shares of dispatch opportunities per source; the
-        first candidate of each source is ordered internally by strict
-        priority then FIFO.  A deterministic rotating accumulator keeps the
+        first candidate of each source is ordered FIFO. A deterministic rotating accumulator keeps the
         schedule fair and stable across policy reloads.  When the policy has
         no entry for a source, the source keeps the default weight of 1.
+        ``accumulator`` may be a caller-owned dict for read-only projections;
+        the real dispatcher uses the broker-owned accumulator.
         """
         by_source: dict[str, list] = {}
         for row in candidates:
             by_source.setdefault(row["source"], []).append(row)
         if not by_source:
             return None
-        accumulator = getattr(self, "_weight_accumulator", None)
         if accumulator is None:
-            accumulator = self._weight_accumulator = {}
+            accumulator = getattr(self, "_weight_accumulator", None)
+            if accumulator is None:
+                accumulator = self._weight_accumulator = {}
         total_weight = 0.0
         for source in by_source:
-            weight = policy.weight(source)
-            if weight is None:
-                weight = 1.0
-            total_weight += weight
-            accumulator[source] = accumulator.get(source, 0.0) + weight
+            configured = policy.weight(source) or 1.0
+            share = 1.0 / configured
+            total_weight += share
+            accumulator[source] = accumulator.get(source, 0.0) + share
         # Ignore accumulator entries for sources no longer eligible after a
         # hot policy reload or an emptied queue.
         chosen_source = max(by_source, key=lambda source: accumulator[source])
@@ -660,37 +958,49 @@ class Broker:
         return by_source[chosen_source][0]
 
     def _next(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None):
-        # Strict priority is deliberate when no weighted policy is installed:
-        # no aging can promote lower-priority work ahead of a waiting
-        # higher-priority job.  With a policy, sources share the GPU by their
-        # configured weights instead (fairness), preserving per-source
-        # priority/FIFO order inside each source.
+        # With a policy, sources share the GPU only by their configured weight;
+        # each selected source contributes its FIFO head.
         candidates = self._candidates(allowed_sources)
         if not candidates:
             self._last_scheduler_decision = None
+            self._scheduler_snapshot = None
             return None
+        now = self.clock()
         if policy is None:
             selected = candidates[0]
-            mode = "strict_priority_fifo"
-            reason = "lowest priority value, then oldest queued job"
-            active_weights: dict[str, float] = {}
+            decision = {
+                "mode": "fifo",
+                "reason": "oldest queued job",
+                "eligible_sources": sorted({row["source"] for row in candidates}),
+            }
         else:
             selected = self._weighted_pick(candidates, policy)
-            mode = "weighted_round_robin"
-            reason = "weighted accumulator among currently eligible sources"
-            policy_sources = policy.snapshot().get("sources", {})
-            active_weights = {
-                source: float(entry["weight"])
-                for source, entry in sorted(policy_sources.items())
-                if entry.get("enabled", True)
+            if selected is None:
+                self._last_scheduler_decision = None
+                self._scheduler_snapshot = None
+                return None
+            decision = {
+                "mode": "weighted_round_robin",
+                "reason": "weight-only source selection",
+                "eligible_sources": sorted({row["source"] for row in candidates}),
             }
+        policy_sources = policy.snapshot().get("sources", {}) if policy is not None else {}
+        active_weights = {
+            source: float(entry["weight"])
+            for source, entry in sorted(policy_sources.items())
+            if entry.get("enabled", True)
+        }
         self._last_scheduler_decision = {
-            "mode": mode,
-            "reason": reason,
-            "eligible_sources": sorted({row["source"] for row in candidates}),
+            "mode": decision["mode"],
+            "reason": decision["reason"],
+            "eligible_sources": decision["eligible_sources"],
             "active_weights": active_weights,
             "selected_source": selected["source"],
-            "selected_priority": selected["priority"],
+            "selected_model": PROFILES[selected["profile"]].model,
+        }
+        self._scheduler_snapshot = {
+            "accumulator": dict(self._weight_accumulator),
+            "last": dict(self._last_scheduler_decision),
         }
         return selected
 
@@ -743,8 +1053,16 @@ class Broker:
                     (row["source"], now + interval),
                 )
             self._refresh_health_cache_locked()
+            # Payload is needed only after this job has been durably claimed.
+            # Fetching it here keeps the scheduler's full-queue projection
+            # payload-free while preserving the exact execution request.
+            execution_row = self.db.execute(
+                "SELECT * FROM jobs WHERE id=?", (row["id"],)
+            ).fetchone()
+            if execution_row is None:
+                raise RuntimeError("claimed job disappeared before execution")
         try:
-            self._execute(row)
+            self._execute(execution_row)
         except Exception as exc:
             with self.lock, self.db:
                 finished = self.clock()
@@ -766,7 +1084,9 @@ class Broker:
     def _execute(self, row):
         profile = PROFILES[row["profile"]]
         self.wol.wake()
-        loaded = [m.get("name") for m in self.ollama.ps().get("models", [])]
+        models = self.ollama.ps().get("models", [])
+        self._loaded_models_cache = [dict(model) for model in models if isinstance(model, dict)]
+        loaded = [m.get("name") for m in models]
         others = [m for m in loaded if m != profile.model]
         if others:
             for model in others: self.ollama.unload(model)
@@ -832,12 +1152,23 @@ class Broker:
                 self.completed.wait(remaining)
 
     def metrics(self) -> dict:
-        with self.lock:
-            queued = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0]
-            active = self.db.execute("SELECT * FROM jobs WHERE state IN ('running','cancel_requested')").fetchone()
-        ps = self.ollama.ps()
-        return {"resource": "mainpc-gpu", "queue_depth": queued, "active": self._job(active) if active else None,
-                "loaded_models": ps.get("models", []), "timestamp": self.clock()}
+        snapshot, _ = self._observer_read(lambda db: {
+            "queue_depth": db.execute(
+                "SELECT count(*) FROM jobs WHERE state='queued'"
+            ).fetchone()[0],
+            "active": (lambda row: dict(row) if row else None)(db.execute(
+                "SELECT id,source,profile,kind,state,created,started,lease_until,attempt_count,retry_count "
+                "FROM jobs WHERE state IN ('running','cancel_requested') "
+                "ORDER BY started,created,id LIMIT 1"
+            ).fetchone()),
+        })
+        if snapshot is not None:
+            self._metrics_cache = {"resource": "mainpc-gpu", **snapshot}
+        return {
+            **self._metrics_cache,
+            "loaded_models": [dict(model) for model in self._loaded_models_cache],
+            "timestamp": self.clock(),
+        }
 
     def health(self) -> dict:
         """Return a local broker probe without waking or querying MAIN-PC."""
@@ -861,16 +1192,22 @@ class Dispatcher(threading.Thread):
             policy,
             threading.Event(),
         )
+        self.drain_event = threading.Event()
+
+    def drain(self) -> None:
+        """Stop new claims while the in-flight remote execution finishes."""
+        self.drain_event.set()
     def run(self):
         while not self.stop_event.is_set():
             # With a runtime policy, the effective allowlist and weights come
             # from the reloaded policy file; without one, the env allowlist is
-            # used with strict priority (previous behaviour).
+            # used with global FIFO ordering.
             policy = self.policy
             allowed = self.allowed_sources
             if policy is not None:
                 enabled = policy.enabled_sources()
                 allowed = enabled if enabled else frozenset()
             self.broker.recover()
-            self.broker.dispatch_once(allowed, policy)
+            if not self.drain_event.is_set():
+                self.broker.dispatch_once(allowed, policy)
             self.stop_event.wait(self.interval)

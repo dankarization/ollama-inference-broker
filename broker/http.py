@@ -1,12 +1,14 @@
 from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .compat import (CompatibilityError, stream_frames, submit as submit_compatibility,
                      submit_olya_decision, submit_olya_vision, submit_shutterstock_canary,
                      submit_shutterstock_video, submit_syncopia_memory)
 from .profiles import PROFILES
+from .dashboard import render as render_dashboard
+from .policy import SourcePolicyError
 
 def serve(broker, host="127.0.0.1", port=8088, policy=None):
     class Handler(BaseHTTPRequestHandler):
@@ -15,12 +17,18 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
         def _stream(self, status, frames):
             encoded=b"".join(frames); self.send_response(status); self.send_header("Content-Type","application/x-ndjson"); self.send_header("Content-Length",str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
         def do_POST(self):
-            size=int(self.headers.get("Content-Length", 0)); body=json.loads(self.rfile.read(size) or b"{}")
+            size=int(self.headers.get("Content-Length", 0))
+            try:
+                body=json.loads(self.rfile.read(size) or b"{}")
+            except (TypeError, ValueError):
+                self._json(400, {"error": "request body must be JSON"})
+                return
             path = urlsplit(self.path).path
             if path == "/v1/jobs":
-                try: self._json(202, broker.submit(body["profile"], body["kind"], body.get("payload", {}),
-                                                  body.get("source"), body.get("priority"),
-                                                  body.get("source_item_id"), body.get("external_id")))
+                try:
+                    self._json(202, broker.submit(body["profile"], body["kind"], body.get("payload", {}),
+                                                  body.get("source"), body.get("source_item_id"),
+                                                  body.get("external_id")))
                 except (KeyError, ValueError) as e: self._json(400, {"error": str(e)})
             elif path.startswith("/v1/jobs/") and path.endswith("/cancel"):
                 result=broker.cancel(path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
@@ -28,6 +36,26 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                 try:
                     result=broker.retry(path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
                 except ValueError as e: self._json(409, {"error":str(e)})
+            elif path.startswith("/v1/sources/") and path.endswith("/weight"):
+                source = unquote(path[len("/v1/sources/"):-len("/weight")]).strip("/")
+                try:
+                    if not isinstance(body, dict) or set(body) != {"weight"}:
+                        raise SourcePolicyError("request body must contain only weight")
+                    if policy is None:
+                        raise SourcePolicyError("source policy is not configured")
+                    weight = policy.set_weight(source, body["weight"])
+                    self._json(200, {"source": source, "weight": weight})
+                except SourcePolicyError as error:
+                    self._json(400, {"error": str(error)})
+            elif path.startswith("/v1/sources/") and path.endswith("/enabled"):
+                source = unquote(path[len("/v1/sources/"):-len("/enabled")]).strip("/")
+                try:
+                    if not isinstance(body, dict) or set(body) != {"enabled"}:
+                        raise SourcePolicyError("request body must contain only enabled")
+                    if policy is None: raise SourcePolicyError("source policy is not configured")
+                    self._json(200, {"source": source, "enabled": policy.set_enabled(source, body["enabled"])})
+                except SourcePolicyError as error:
+                    self._json(400, {"error": str(error)})
             elif path in {"/api/chat", "/api/generate"}:
                 try:
                     job=submit_compatibility(broker, path.rsplit("/", 1)[-1], body)
@@ -141,7 +169,15 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
             parsed = urlsplit(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
-            if path == "/healthz": self._json(200, broker.health())
+            if path == "/dashboard":
+                dashboard = broker.dashboard(policy)
+                encoded = render_dashboard(dashboard)
+                status = 503 if dashboard["observation"]["state"] == "unavailable" else 200
+                self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
+            elif path == "/v1/dashboard":
+                dashboard = broker.dashboard(policy)
+                self._json(503 if dashboard["observation"]["state"] == "unavailable" else 200, dashboard)
+            elif path == "/healthz": self._json(200, broker.health())
             elif path == "/v1/metrics": self._json(200, broker.metrics())
             elif path == "/v1/analytics":
                 try:
@@ -154,6 +190,23 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                     self._json(200, broker.analytics(policy, windows))
                 except ValueError:
                     self._json(400, {"error":"window must be positive seconds up to one year"})
+            elif path == "/v1/forecast":
+                try:
+                    limit = int(query.get("limit", ["5"])[0])
+                    self._json(200, broker.forecast(policy, limit=limit))
+                except ValueError:
+                    self._json(400, {"error":"limit must be an integer"})
+            elif path == "/v1/history":
+                try:
+                    limit = int(query.get("limit", ["30"])[0])
+                    raw = query.get("cursor", [None])[0]
+                    cursor = None if raw is None else (float(raw.rsplit(":", 1)[0]), raw.rsplit(":", 1)[1])
+                    body = broker.terminal_history(limit=limit, cursor=cursor)
+                    if body.get("next_cursor"):
+                        body["next_cursor"] = f"{body['next_cursor'][0]}:{body['next_cursor'][1]}"
+                    self._json(200, body)
+                except ValueError:
+                    self._json(400, {"error":"invalid history cursor"})
             elif path == "/v1/audit-events":
                 try:
                     limit = int(query.get("limit", ["100"])[0])

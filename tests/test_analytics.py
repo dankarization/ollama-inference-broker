@@ -70,14 +70,17 @@ class AnalyticsTests(unittest.TestCase):
         db = sqlite3.connect(path)
         db.execute("""CREATE TABLE jobs (
             id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
-            payload TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
+            priority INTEGER NOT NULL, payload TEXT NOT NULL,
+            state TEXT NOT NULL, created REAL NOT NULL,
             started REAL, finished REAL, lease_until REAL, error TEXT,
             switch_reason TEXT)""")
         db.execute(
-            "INSERT INTO jobs(id,profile,kind,payload,state,created) "
-            "VALUES('legacy-job','interactive','generate','{\"prompt\":\"x\"}',"
+            "INSERT INTO jobs(id,profile,kind,priority,payload,state,created) "
+            "VALUES('legacy-job','interactive','generate',1,'{\"prompt\":\"x\"}',"
             "'queued',10)"
         )
+        db.execute("CREATE INDEX legacy_jobs_state ON jobs(state)")
+        db.execute("CREATE INDEX legacy_jobs_priority ON jobs(priority,created)")
         db.commit()
         db.close()
 
@@ -85,14 +88,69 @@ class AnalyticsTests(unittest.TestCase):
         job = broker.status("legacy-job")
         self.assertEqual(job["state"], "queued")
         self.assertEqual(job["source"], "legacy")
-        self.assertEqual(job["priority"], 10)
         self.assertEqual(job["queued_at"], 10)
         self.assertEqual(job["payload"], {"prompt": "x"})
+        self.assertNotIn("priority", {
+            row[1] for row in broker.db.execute("PRAGMA table_info(jobs)")
+        })
+        admitted = broker.submit("interactive", "generate", {"prompt": "new"})
+        cron = broker.submit("cron", "generate", {"prompt": "new"})
+        self.assertNotIn("priority", admitted)
+        self.assertNotIn("priority", cron)
+        self.assertIn("legacy_jobs_state", {
+            row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")
+        })
+        indexes = {row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")}
+        self.assertIn("jobs_state_source", indexes)
+        self.assertIn("jobs_source_state_retry", indexes)
+        self.assertNotIn("legacy_jobs_priority", {
+            row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")
+        })
         tables = {row[0] for row in broker.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
         self.assertIn("audit_events", tables)
         self.assertIn("job_attempts", tables)
+
+    def test_legacy_priority_index_with_punctuation_migrates_safely(self):
+        fd, path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(fd)
+        self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
+        db = sqlite3.connect(path)
+        db.execute("""CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, profile TEXT NOT NULL, kind TEXT NOT NULL,
+            priority INTEGER NOT NULL, payload TEXT NOT NULL,
+            state TEXT NOT NULL, created REAL NOT NULL,
+            started REAL, finished REAL, lease_until REAL, error TEXT,
+            switch_reason TEXT)""")
+        db.execute(
+            "INSERT INTO jobs(id,profile,kind,priority,payload,state,created) "
+            "VALUES('legacy-job','interactive','generate',1,'{}','queued',10)"
+        )
+        # This valid SQLite identifier is invalid when interpolated bare into
+        # PRAGMA/DROP INDEX, reproducing the legacy migration edge case.
+        db.execute('CREATE INDEX "legacy priority-index" ON jobs(priority,created)')
+        db.commit()
+        db.close()
+
+        broker = self.make(path=path, clock=MutableClock(20))
+        self.assertEqual(broker.status("legacy-job")["state"], "queued")
+        self.assertNotIn("priority", {row[1] for row in broker.db.execute("PRAGMA table_info(jobs)")})
+        self.assertNotIn("legacy priority-index", {
+            row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")
+        })
+
+    def test_retry_rejoins_global_fifo_at_its_latest_enqueue_time(self):
+        clock = MutableClock(10)
+        broker = self.make(clock=clock, fail_once=True)
+        retried = broker.submit("interactive", "generate", {"prompt": "old"})["id"]
+        broker.dispatch_once()
+        self.assertEqual(broker.status(retried)["state"], "failed")
+        clock.value = 20
+        newer = broker.submit("interactive", "generate", {"prompt": "new"})["id"]
+        clock.value = 30
+        broker.retry(retried)
+        self.assertEqual([row["id"] for row in broker._candidates()], [newer, retried])
 
     def test_attempt_retry_correlation_metrics_and_payload_safe_logs(self):
         clock = MutableClock(100)
@@ -106,7 +164,7 @@ class AnalyticsTests(unittest.TestCase):
 
         job = broker.submit(
             "batch-video", "generate", {"prompt": "private-payload-marker"},
-            source="analytics-source", priority=7,
+            source="analytics-source",
             source_item_id="item-42", external_id="external-7",
         )
         self.assertEqual(job["source_item_id"], "item-42")
@@ -144,6 +202,20 @@ class AnalyticsTests(unittest.TestCase):
         self.assertNotIn("item-42", logs)
         self.assertNotIn("external-7", logs)
 
+    def test_retry_uses_latest_enqueue_time_for_fifo(self):
+        clock = MutableClock(100)
+        broker = self.make(clock=clock)
+        retried = broker.submit("interactive", "generate", {"prompt": "old"})["id"]
+        with broker.db:
+            broker.db.execute("UPDATE jobs SET state='failed' WHERE id=?", (retried,))
+        clock.value = 150
+        waiting = broker.submit("interactive", "generate", {"prompt": "new"})["id"]
+        clock.value = 200
+        broker.retry(retried)
+        self.assertTrue(broker.dispatch_once())
+        self.assertEqual(broker.status(waiting)["state"], "completed")
+        self.assertEqual(broker.status(retried)["state"], "queued")
+
     def test_expired_lease_is_durably_failed_across_restart(self):
         fd, path = tempfile.mkstemp(suffix=".sqlite3")
         os.close(fd)
@@ -159,7 +231,7 @@ class AnalyticsTests(unittest.TestCase):
             broker.db.execute(
                 "INSERT INTO job_attempts(job_id,attempt_no,source,queued_at,"
                 "selected_at,started,lease_until,scheduler_mode,selection_reason) "
-                "VALUES(?,1,'interactive',100,100,100,105,'strict_priority_fifo','test')",
+                "VALUES(?,1,'interactive',100,100,100,105,'fifo','test')",
                 (job_id,),
             )
         broker.db.close()
@@ -190,7 +262,7 @@ class AnalyticsTests(unittest.TestCase):
             broker.db.execute(
                 "INSERT INTO job_attempts(job_id,attempt_no,source,queued_at,"
                 "selected_at,started,lease_until,scheduler_mode,selection_reason) "
-                "VALUES(?,1,'interactive',100,100,100,120,'strict_priority_fifo','test')",
+                "VALUES(?,1,'interactive',100,100,100,120,'fifo','test')",
                 (job_id,),
             )
         clock.value = 110
@@ -202,7 +274,7 @@ class AnalyticsTests(unittest.TestCase):
         broker = self.make()
         job = broker.submit(
             "batch-video", "generate", {"prompt": "private-value"},
-            source="lookup-source", priority=7,
+            source="lookup-source",
             source_item_id="item-a", external_id="external-a",
         )
         self.assertEqual(broker.cancel(job["id"])["state"], "cancelled")
@@ -214,7 +286,7 @@ class AnalyticsTests(unittest.TestCase):
         self.assertNotIn("payload", matches[0])
         self.assertNotIn("result", matches[0])
 
-    def test_weight_8_to_6_to_3_report_tracks_actual_and_expected_share(self):
+    def test_weighted_selection_tracks_inverse_weight_share(self):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock)
         policy = self.policy({
@@ -245,14 +317,10 @@ class AnalyticsTests(unittest.TestCase):
         snapshot = broker.analytics(policy, windows=(3_600,))
         scheduler = snapshot["scheduler"]["windows"]["3600"]
         self.assertEqual(scheduler["selections"], 17)
-        self.assertEqual(scheduler["sources"]["olya-vision"]["selected"], 8)
-        self.assertEqual(scheduler["sources"]["olya-decision"]["selected"], 6)
-        self.assertEqual(scheduler["sources"]["shutterstock-video"]["selected"], 3)
-        self.assertAlmostEqual(
-            scheduler["sources"]["olya-vision"]["expected_share"], 8 / 17, places=5
-        )
-        self.assertAlmostEqual(
-            scheduler["sources"]["olya-decision"]["expected_share"], 6 / 17, places=5
+        self.assertEqual(scheduler["modes"]["weighted_round_robin"], 17)
+        self.assertGreater(
+            scheduler["sources"]["shutterstock-video"]["selected"],
+            scheduler["sources"]["olya-vision"]["selected"],
         )
         self.assertEqual(
             snapshot["scheduler"]["active_policy"]["sources"]["olya-vision"]["weight"],
@@ -281,13 +349,16 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(snapshot["scheduler"]["windows"]["3600"]["selections"], 2)
 
     def test_hot_policy_disable_ignores_stale_accumulator_source(self):
-        broker = self.make()
+        clock = MutableClock(100)
+        broker = self.make(clock=clock)
         policy = self.policy({
             "interactive": {"enabled": True, "weight": 1},
             "shutterstock-video": {"enabled": True, "weight": 1},
         })
         first = broker.submit("interactive", "generate", {"prompt": "one"})["id"]
+        clock.value = 101
         second = broker.submit("interactive", "generate", {"prompt": "two"})["id"]
+        clock.value = 102
         broker.submit("shutterstock-video", "generate", {"prompt": "video"})
         self.assertTrue(broker.dispatch_once(policy.enabled_sources(), policy))
         self.assertEqual(
@@ -321,7 +392,7 @@ class AnalyticsTests(unittest.TestCase):
         broker = self.make()
         job_id = broker.submit(
             "batch-video", "generate", {"prompt": "not-in-audit"},
-            source="api-source", priority=7, source_item_id="source-1",
+            source="api-source", source_item_id="source-1",
         )["id"]
         broker.dispatch_once()
         server = serve(broker, port=0)

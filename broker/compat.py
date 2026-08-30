@@ -33,16 +33,13 @@ def submit(broker: Any, kind: str, request: Any) -> dict[str, Any]:
     source = request.get("source")
     if source is not None and not isinstance(source, str):
         raise CompatibilityError("source must be a string")
-    priority = request.get("priority")
-    if priority is not None and (isinstance(priority, bool) or not isinstance(priority, int)):
-        raise CompatibilityError("priority must be an integer when supplied")
     payload = {key: value for key, value in request.items() if key not in {
-        "profile", "source", "priority", "model", "keep_alive", "stream",
-        "source_item_id", "external_id",
+        "profile", "source", "model", "keep_alive", "stream",
+        "source_item_id", "external_id", "priority",
     }}
     try:
         return broker.submit(
-            profile, kind, payload, source, priority,
+            profile, kind, payload, source,
             request.get("source_item_id"), request.get("external_id"),
         )
     except ValueError as exc:
@@ -321,7 +318,7 @@ def validate_syncopia_memory_payload(request: Any) -> dict[str, Any]:
     return {
         "messages": messages,
         "format": schema,
-        "think": "low",
+        "think": False,
         "options": {
             "temperature": 0,
             "num_ctx": profile.max_context,

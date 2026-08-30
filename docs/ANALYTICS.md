@@ -1,8 +1,9 @@
 # Аналитика очереди и scheduler
 
 Этот слой нужен для сравнения scheduler algorithms на исторических данных. Он
-не меняет действующий выбор: без runtime policy остаётся strict priority/FIFO,
-с policy — существующий weighted round-robin.
+не меняет действующий выбор: без runtime policy остаётся global FIFO,
+с policy — model-aware batch scheduler (weighted выбор источника внутри
+модельного батча, FIFO внутри источника, starvation guard по wait-debt).
 
 ## Что сохраняется
 
@@ -24,7 +25,7 @@ Correlation identifiers ограничены строкой до 256 симво�
 вымышленные scheduler decisions/attempts; их текущее состояние видно в
 `current`, но historical window counters учитывают только новые audit events.
 
-Каждый `scheduler.selected` сохраняет выбранный source/priority, mode и причину,
+Каждый `scheduler.selected` сохраняет выбранный source, mode и причину,
 реально eligible sources и активные weights из последней hot policy. Поэтому
 atomic reload policy не обнуляет историю и позволяет восстановить условия
 каждого решения.
@@ -74,43 +75,28 @@ Correlation lookup возвращает только job/source/profile/state/ti
 
 Scheduler window показывает actual selection count/share и expected share.
 Expected share рассчитывается на каждом решении только среди sources, которые
-тогда действительно были eligible. Это не штрафует scheduler за пустую очередь,
-rate limit или disabled source. `fairness_ratio=1` и малый
+тогда действительно были hard-eligible. Weight `w` имеет expected share,
+пропорциональную `1 / w`; это не штрафует scheduler за пустую очередь,
+rate limit или disabled source.
+`fairness_ratio=1` и малый
 `absolute_share_error` означают близость actual share к доступной weighted цели.
 
-Пример после 17 dispatch opportunities при постоянно заполненных очередях и
-weights `olya-vision=8`, `olya-decision=6`, `shutterstock-video=3`:
+Пример: 12 dispatch opportunities при постоянно заполненных очередях, weights
+`source-a=2`, `source-b=6`:
 
 ```json
 {
-  "selections": 17,
+  "selections": 12,
+  "modes": {"weighted_round_robin": 12},
   "sources": {
-    "olya-vision": {
-      "selected": 8,
-      "actual_share": 0.470588,
-      "expected_share": 0.470588,
-      "fairness_ratio": 1.0,
-      "absolute_share_error": 0.0
-    },
-    "olya-decision": {
-      "selected": 6,
-      "actual_share": 0.352941,
-      "expected_share": 0.352941,
-      "fairness_ratio": 1.0,
-      "absolute_share_error": 0.0
-    },
-    "shutterstock-video": {
-      "selected": 3,
-      "actual_share": 0.176471,
-      "expected_share": 0.176471,
-      "fairness_ratio": 1.0,
-      "absolute_share_error": 0.0
-    }
+    "source-a": {"selected": 9, "fairness_ratio": 1.0},
+    "source-b": {"selected": 3, "fairness_ratio": 1.0}
   }
 }
 ```
 
-На коротком окне дискретность закономерно даёт отклонение. Для оценки нужны
+Lower numeric Weight получает большую share; на коротком окне дискретность
+закономерно даёт отклонение. Для оценки нужны
 одновременно 5 минут, 30 минут, 3 часа и 24 часа.
 
 ## Что сравнивать позже
@@ -118,13 +104,13 @@ weights `olya-vision=8`, `olya-decision=6`, `shutterstock-video=3`:
 Алгоритм нельзя менять до накопления baseline и отдельного rollout. Затем на
 одинаковом replay workload безопасно сравниваются:
 
-- weighted round robin — текущий baseline, прост и детерминирован;
+- reciprocal-weight scheduler — текущий baseline: weight-only выбор source и
+  FIFO внутри source;
 - deficit round robin — лучше учитывает разную стоимость job, если появится
   надёжная оценка cost;
 - weighted fair queue — полезен при нескольких непрерывно загруженных sources,
   но требует виртуального времени/cost;
-- aging поверх bounded priority — уменьшает starvation, но должен сохранять
-  hard priority constraints.
+- aging — уменьшает starvation, но должен сохранять FIFO-инварианты source.
 
 Основные критерии: p95 wait/e2e по source, throughput, success/retry/requeue,
 starvation (максимальный wait), actual-vs-expected share и смены модели. Нельзя
@@ -146,13 +132,10 @@ starvation (максимальный wait), actual-vs-expected share и смен
 `<tg-time>` даёт нативные активные Telegram даты/время; динамические
 идентификаторы HTML-экранируются и ограничены тремя компактными значениями.
 
-В отчёте есть только одна операторская шкала: **приоритет 1–10** (1 выше, 10
-ниже): Shutterstock 3, Olya Vision 8, Olya Decision 6. Это фактический
-server-owned `job.priority`, а не число из source policy. Внутри broker
-runtime policy всё ещё хранит отдельные private weights для weighted
-round-robin между sources; priority упорядочивает jobs *внутри* выбранного
-source. Репорт их не печатает, а это изменение не меняет текущие weights,
-allocation или throughput.
+В отчёте отображается effective **weight** каждого source: это единственный
+операторский scheduling-параметр. Runtime policy использует weights для
+weighted round-robin между sources, а внутри выбранного source сохраняется
+FIFO.
 
 Размеры файлов и queue delta не выводятся: в broker SQLite нет надёжного
 поля размера и почасового baseline snapshot. Health состоит только из

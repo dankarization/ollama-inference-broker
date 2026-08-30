@@ -5,20 +5,16 @@
 
 ## Фаза 0 — контракт и инвентаризация
 
-- [x] Определены API broker, workload profiles, server-owned priority classes,
-  отмена и локальная SQLite WAL очередь.
-- [x] Зафиксирована политика: `interactive` — 1, `cron` — 2,
-  `shutterstock-video` — 3, `olya` — 8. Меньшее число означает более высокий
-  приоритет; Shutterstock photo остаётся cloud/OmniRoute вне broker, а другие
-  источники передают целое число от 1 до 10.
+- [x] Определены API broker, workload profiles, source weights, отмена и
+  локальная SQLite WAL очередь.
 - [ ] Инвентаризация всех прямых callers локального Ollama, владельцев их
   миграции и границ local/cloud routing. Это требует отдельного scope и не
   выполняется изолированным MVP.
 
 ## Фаза 1 — MVP безопасного последовательного admission
 
-- [x] Один процесс broker с durable queue, strict priority и FIFO при равном
-  приоритете.
+- [x] Один процесс broker с durable queue, weighted source scheduling и FIFO
+  внутри выбранного source.
 - [x] Одна активная локальная нагрузка, SQLite leases, отмена queued заданий и
   requeue просроченной lease после restart.
 - [x] Server-owned profile limits, readiness check, controlled unload/switch и
@@ -29,8 +25,8 @@
 - [x] Локальный `GET /healthz`: состояние очереди и активной lease без WOL,
   запроса к MAIN-PC или обращения к Ollama.
 - [x] Добавлен отдельный Phase-2 text endpoint `syncopia-telegram-memory`:
-  pinned qwen38, 64k context, `think=low`, tools disabled и production policy
-  weight `4`; legacy `priority` в source policy теперь отклоняется fail-closed.
+  pinned qwen38, 64k context, 8k output, `think=false`, tools disabled и production policy
+  weight `4`; неизвестные ключи source policy отклоняются fail-closed.
 - [x] Развёрнут loopback-only user-service с durable SQLite и явным
   admission-only guard (`BROKER_DISPATCH_ENABLED=false`). Проверены `/healthz`
   и приём/отмена synthetic job: dispatch, WOL и MAIN-PC/Ollama не вызывались.

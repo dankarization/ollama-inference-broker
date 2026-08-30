@@ -53,11 +53,11 @@ PROFILES = {
         max_schema_bytes=16_384,
     ),
     # Phase-2 Telegram-memory extraction is a separate text-only source.  The
-    # 64k context and low thinking mode are enforced again by its compatibility
+    # 64k context and thinking-disabled mode are enforced again by its compatibility
     # contract; callers cannot borrow the Olya lane or widen either limit.
     "syncopia-memory-qwen38": Profile(
-        "syncopia-memory-qwen38", "qwen3.8:ad-iq2-xs", 65_536, 4_096, 1_800,
-        max_concurrency=1, request_timeout_seconds=300,
+        "syncopia-memory-qwen38", "qwen3.8:ad-iq2-xs", 65_536, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=900,
         max_schema_bytes=65_536,
     ),
     "batch-video": Profile("batch-video", "nemotron3:33b", 8_192, 512, 120),
@@ -69,18 +69,3 @@ PROFILES = {
         max_images=4, max_schema_bytes=16_384,
     ),
 }
-
-# Lower is more important. These classes are policy compiled into the broker,
-# never trusted from a caller-provided priority field.
-FIXED_SOURCE_PRIORITIES = {
-    "interactive": 1,  # OpenClaw interactive/open session
-    "cron": 2,         # OpenClaw cron
-    "shutterstock-video": 3,
-    "olya": 8,
-    "olya-vision": 8,
-    "olya-decision": 6,
-    "syncopia-telegram-memory": 4,
-    "shutterstock-canary": 5,
-}
-MIN_PRIORITY = 1
-MAX_PRIORITY = 10

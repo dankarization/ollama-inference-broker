@@ -1,8 +1,8 @@
 # Локальный брокер инференса
 
 Это приватный control plane для одного GPU-хоста с Ollama. Брокер предотвращает
-конкуренцию локальных задач за VRAM и предоставляет строгую очередь с
-приоритетами. Это изолированный MVP: он не меняет текущих callers, трафик,
+конкуренцию локальных задач за VRAM и предоставляет durable FIFO-очередь с
+weighted scheduling по источникам. Это изолированный MVP: он не меняет текущих callers, трафик,
 маршрутизацию, production-конфигурацию или порядок source roots.
 
 ## Назначение
@@ -91,6 +91,26 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
   `/v1/correlations` дают payload-free историю очереди, попыток, correlation и
   scheduler fairness. Определения метрик и пример 8:3 — в
   [docs/ANALYTICS.md](docs/ANALYTICS.md).
+- `GET /dashboard` — локальная auto-refresh HTML-панель очереди без payload,
+  результатов и ошибок. Она показывает policy (`enabled`, `weight`),
+  состояния, lease, retry/delay, активные jobs, completed total/1h/24h и
+  read-only **Forecast** под активными jobs: текущую модель и bounded список
+  следующих weight-only выборов с configured Weight. Forecast помечен как
+  contingent: он меняется при новых admissions, завершениях и hot reload
+  policy, и никогда не мутирует очередь/leases/аккумуляторы. Машинный
+  payload-free снимок доступен как `GET /v1/dashboard` (тот же `forecast`),
+  отдельно — `GET /v1/forecast`. После запуска
+  broker откройте `http://127.0.0.1:8088/dashboard` (или его настроенный host
+  и port). Снимок содержит `observation.state`: `live` — текущие данные,
+  `stale` — последний успешный снимок при временно недоступном observer-read,
+  `unavailable` — HTTP 503 без вымышленных нулевых счётчиков. `dead` всегда
+  ноль: в текущей модели broker исчерпанная работа —
+  terminal `failed`, отдельного state `dead` нет.
+- `GET /v1/forecast` — read-only проекция ближайших выборов scheduler
+  (bounded, по умолчанию 5, максимум 20): текущая модель и следующие
+  selections с source/model/weight/mode/reason/wait. Проекция
+  не пишет в БД и не меняет состояние scheduler; при занятой БД возвращает
+  `unavailable` вместо вымышленной пустоты.
 - `GET /healthz` проверяет только локальное состояние broker: очередь, активную lease и timestamp. Он не отправляет WOL и не обращается к MAIN-PC/Ollama.
 - `/api/chat` и `/api/generate` реализуют локальный compatibility contract:
   обязателен server-side `profile`, а `stream=true` возвращает NDJSON admission
@@ -104,26 +124,14 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
 
 Сервер сам выбирает профиль, модель, контекст, лимит вывода и keepalive.
 Переданные caller значения `model`, `num_ctx`, `num_predict` и `keep_alive` не
-могут повысить эти лимиты. SQLite использует WAL. Dispatch выполняется строго
-по приоритету, затем FIFO; старение очереди намеренно не применяется.
+могут повысить эти лимиты. SQLite использует WAL. Без source policy dispatch
+выполняется в глобальном FIFO-порядке; с policy — по weight источника и FIFO
+внутри выбранного источника.
 
 Каждое принятое задание и scheduler decision сохраняются в durable
 audit/attempt history. `POST /v1/jobs` опционально принимает
 `source_item_id`/`external_id`; private payload и значения correlation не
 копируются в structured logs. Существующие request/response поля не удалены.
-
-## Действующая политика приоритетов
-
-Меньшее число означает более высокий приоритет.
-
-| Источник / ключ конфигурации | Фиксированный приоритет |
-| --- | ---: |
-| Интерактивная сессия OpenClaw (`interactive`) | 1 |
-| OpenClaw cron (`cron`) | 2 |
-| Локальное Shutterstock video (`shutterstock-video`) | 3 |
-| Phase-2 Syncopia Telegram memory (`syncopia-telegram-memory`) | 4 |
-| Изолированный VLM canary (`shutterstock-canary`) | 5 |
-| Olya (`olya`) | 8 |
 
 Рабочий source `shutterstock` намеренно не имеет broker profile и не может
 получить lease. Новый `shutterstock-canary` — отдельное имя source, а не
@@ -131,12 +139,9 @@ audit/attempt history. `POST /v1/jobs` опционально принимает
 `qwen3-vl:30b` с максимум четырьмя изображениями, суммарно 8 MiB decoded,
 JSON Schema до 16 KiB, concurrency `1`, не чаще одного job в 60 секунд и
 server-side timeout 300 секунд. `shutterstock-video` — отдельный локальный workload на
-`nemotron3:33b`; только он получает приоритет 3. Ключ `olya` — только имя
-источника, а не интеграция. Эти четыре значения
-принадлежат broker: caller может не передавать `priority` либо повторить
-фиксированное значение, но не может его переопределить. Остальные источники
-обязаны передать целый `priority` от 1 (максимальный) до 10 (минимальный),
-например `{ "profile":"batch-video", "source":"maintenance", "priority":7 }`.
+`nemotron3:33b`. Ключ `olya` — только имя источника, а не интеграция. Job
+admission не принимает scheduling-параметров: source weight задаётся только
+runtime policy.
 
 При смене модели broker будит MAIN-PC, читает `/api/ps`, выгружает несовместимую
 модель, запрашивает и проверяет готовность целевой модели и только затем
@@ -171,20 +176,45 @@ durable `queued`. Это позволяет включить обратимый 
 }
 ```
 
-Выбор при наличии policy: источники делят GPU пропорционально весам (weighted
-round-robin с вращающимся аккумулятором); внутри каждого источника сохраняется
-строгий порядок priority/FIFO, per-source concurrency и min-interval
-backpressure. Итоговый allowlist берётся из `enabled`-записей файла, а не из
-env. `GET /v1/sources` отдаёт текущий снапшот политики (без секретов). При
-отсутствии policy поведение прежнее: env-allowlist + strict priority.
+Выбор при наличии policy — только weighted round-robin по source. Weight `1`
+самый важный: effective share равна `1 / weight`, поэтому Weight `2` получает
+примерно в три раза больше выборов, чем Weight `6`, пока оба hard-eligible.
+Внутри source сохраняется FIFO; возраст job и модель не меняют долю.
+
+### Safe dispatcher drain
+
+Для lossless drain dispatcher используйте только:
+
+```bash
+systemctl --user reload ollama-inference-broker.service
+```
+
+`ExecReload` посылает `SIGUSR1` исключительно broker `MainPID`: новые claims
+останавливаются, HTTP admissions и текущий inference продолжаются до обычного
+завершения. Не используйте `systemctl --user kill -s SIGUSR1 …`: по умолчанию
+эта команда сигнализирует весь service cgroup, включая дочерний `curl` активного
+inference, и может прервать job.
+
+Источники делят GPU через deterministic reciprocal-weight round-robin с
+вращающимся accumulator; hard eligibility включает FIFO, per-source concurrency
+и min-interval backpressure. Waiting time никогда не меняет долю и не вызывает
+preemption.
+Итоговый allowlist берётся из `enabled`-записей файла, а не из env.
+`GET /v1/sources` отдаёт текущий снапшот политики (без секретов). При
+отсутствии policy поведение — env-allowlist + global FIFO.
 
 Канонический production policy хранится в `config/sources.production.json`:
 веса Shutterstock Video / Olya Vision / Olya Decision остаются `3/8/6`, а
 отдельный source `syncopia-telegram-memory` имеет scheduler weight ровно `4`.
-`priority` и `weight` — разные параметры: первый упорядочивает jobs внутри
-выбранного source, второй задаёт долю source в weighted scheduler. Policy с
-неизвестным ключом (включая ошибочный `priority` вместо `weight`) отклоняется,
-чтобы значение больше не могло молча стать default `1.0`.
+`weight` — единственный scheduling-параметр: он задаёт долю source в weighted
+scheduler. Policy с неизвестным ключом отклоняется, чтобы конфигурация не могла
+молча стать default `1.0`.
+
+### User-facing Weight (1 highest … 10 lowest)
+
+Weight — единственный soft scheduling input. **1 — самый важный, 10 — самый
+низкий**; lower numeric Weight получает большую относительную частоту. Weight
+не является deadline и не меняется с возрастом job.
 
 `POST /v1/shutterstock-video/generate` — синхронный bounded контракт локального
 видео-чанка (profile `shutterstock-video`, `nemotron3:33b`): принимает `prompt`,
@@ -208,15 +238,15 @@ Runtime-параметры моделей задаёт broker, caller не мо�
 `POST /v1/syncopia-memory/extract` — отдельный синхронный text-only contract
 для локального Phase-2 extractor. Он требует `tools=[]`, `stream=false`, ровно
 system+user messages и JSON Schema, запускает только
-`qwen3.8:ad-iq2-xs` с `num_ctx=65536`, `think=low` и source
+`qwen3.8:ad-iq2-xs` с `num_ctx=65536`, `num_predict=8192`, `think=false` и source
 `syncopia-telegram-memory`. Request hash используется caller как idempotency
 key; Olya/Shutterstock endpoints и profiles не переиспользуются.
 
 ## Проверка и разработка
 
 Безопасная canary-проверка использует mock или staging задания `interactive`,
-`cron`, `shutterstock`, `olya` и dynamic priority. Следует проверить один
-удалённый запрос за раз, порядок priority/FIFO, WOL/readiness, unload перед
+`cron`, `shutterstock` и `olya`. Следует проверить один удалённый запрос за раз,
+weighted source selection/FIFO, WOL/readiness, unload перед
 сменой модели, восстановление просроченной lease и отмену queued задания.
 Ни один live caller не мигрируется до успешной проверки; откат — остановить
 broker без изменения routes.

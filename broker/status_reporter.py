@@ -25,7 +25,7 @@ from typing import Any, Callable, Iterable
 from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
-from .profiles import FIXED_SOURCE_PRIORITIES
+from .policy import SourcePolicyError, normalize_source_policy
 
 TBILISI = ZoneInfo("Asia/Tbilisi")
 REPORT_SOURCES = {
@@ -100,17 +100,12 @@ def _policy(path: str | Path | None) -> dict[str, dict[str, Any]]:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    sources = raw.get("sources") if isinstance(raw, dict) else None
-    if not isinstance(sources, dict):
+    try:
+        return normalize_source_policy(raw)
+    except SourcePolicyError:
+        # Never report an invalid on-disk policy as effective; the dispatcher
+        # keeps its last-known-good snapshot after a bad hot reload.
         return {}
-    normalized: dict[str, dict[str, Any]] = {}
-    for source, entry in sources.items():
-        if isinstance(source, str) and isinstance(entry, dict):
-            enabled = entry.get("enabled")
-            weight = entry.get("weight")
-            if isinstance(enabled, bool) and isinstance(weight, (int, float)) and not isinstance(weight, bool) and weight > 0:
-                normalized[source] = {"enabled": enabled, "weight": float(weight)}
-    return normalized
 
 
 def _source_clause(sources: Iterable[str]) -> tuple[str, tuple[str, ...]]:
@@ -145,15 +140,12 @@ def _tg_time(value: datetime, display: str) -> str:
     return f'<tg-time unix="{int(value.timestamp())}" format="">{display}</tg-time>'
 
 
-def _public_priority(policy: dict[str, dict[str, Any]], source: str) -> str:
-    """Return the source's actual broker job priority on the public 1--10 scale."""
+def _public_weight(policy: dict[str, dict[str, Any]], source: str) -> str:
+    """Return the enabled source's effective scheduler weight."""
     configured = policy.get(source)
     if configured is None or not configured["enabled"]:
         return "н/д"
-    value = FIXED_SOURCE_PRIORITIES.get(source)
-    if value is None:
-        return "н/д"
-    return f"{value}/10"
+    return f"{configured['weight']:g}"
 
 
 def _probe_url(url: str, timeout: float = 2.0) -> bool:
@@ -224,7 +216,7 @@ def build_report(
         ))
         queued_rows = list(db.execute(
             f"SELECT id,source_item_id,external_id FROM jobs WHERE source IN ({placeholders}) "
-            "AND state='queued' ORDER BY priority,created,id",
+            "AND state='queued' ORDER BY queued_at,id",
             values,
         ))
         terminal = dict(db.execute(
@@ -234,7 +226,7 @@ def build_report(
         ))
         completed = int(terminal.get("job.completed", 0))
         producer_completed[producer] = completed
-        priority_line = f"<b>Приоритет {_public_priority(policy, sources[0])}</b>"
+        weight_line = f"<b>Вес {_public_weight(policy, sources[0])}</b>"
         identifiers = _bounded_identifiers(active_rows)
         identifier_label = "Активно"
         if not identifiers:
@@ -243,7 +235,7 @@ def build_report(
         identifier_line = f"\n{identifier_label}: {identifiers}" if identifiers else ""
         parts.extend((
             "",
-            f"<u>{producer}</u> · {priority_line}",
+            f"<u>{producer}</u> · {weight_line}",
             "Сейчас: "
             f"очередь {current.get('queued', 0)} · в работе {current.get('running', 0) + current.get('cancel_requested', 0)} "
             f"· повтор {retry_queued} · ошибки {current.get('failed', 0)}",

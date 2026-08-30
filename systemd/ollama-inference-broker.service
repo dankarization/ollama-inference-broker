@@ -18,6 +18,9 @@ Environment=BROKER_SOURCES_POLICY=%h/.local/state/ollama-inference-broker/source
 Environment=BROKER_DISPATCH_SOURCES=pilot-mainpc
 ExecStartPre=/usr/bin/mkdir -p %h/.local/state/ollama-inference-broker
 ExecStart=/usr/bin/python3 -m broker
+# The supported drain operation is `systemctl --user reload …`: signal only
+# the broker MainPID, never the cgroup that also contains an active curl call.
+ExecReload=/usr/bin/kill -USR1 $MAINPID
 Restart=on-failure
 RestartSec=5
 UMask=0077

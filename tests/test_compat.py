@@ -61,13 +61,19 @@ class CompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(CompatibilityError, "JSON Schema"):
             submit_shutterstock_canary(broker, {"prompt": "x", "images": ["aGVsbG8="], "format": "json"})
 
-    def test_admission_uses_strict_broker_priority_order(self):
+    def test_admission_uses_global_fifo_order(self):
         broker = self.make()
         low = submit(broker, "generate", {"profile": "olya", "prompt": "low"})
         high = submit(broker, "generate", {"profile": "interactive", "prompt": "high"})
         self.assertEqual(low["queue_position"], 1)
-        self.assertEqual(broker.status(low["id"])["queue_position"], 2)
-        self.assertEqual(high["queue_position"], 1)
+        self.assertEqual(broker.status(low["id"])["queue_position"], 1)
+        self.assertEqual(high["queue_position"], 2)
+
+    def test_compatibility_ignores_removed_legacy_scheduling_field(self):
+        job = submit(self.make(), "generate", {
+            "profile": "interactive", "prompt": "x", "priority": 1,
+        })
+        self.assertNotIn("priority", job["payload"])
 
     def test_ndjson_frames_cover_queued_cancellation_and_failure(self):
         broker = self.make()

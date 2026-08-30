@@ -13,6 +13,7 @@ from broker.service import Broker
 from broker.status_reporter import (
     DeliveryError,
     TBILISI,
+    _policy,
     build_report,
     deliver_via_telegram_html,
     previous_closed_hour,
@@ -41,8 +42,6 @@ class StatusReporterTests(unittest.TestCase):
         self.start = datetime(2026, 8, 24, 12, 0, tzinfo=TBILISI)
         self.interval = previous_closed_hour(datetime(2026, 8, 24, 13, 10, tzinfo=TBILISI))
         self.policy = {
-            # Source policy weights are scheduler-private and deliberately do
-            # not define the operator-facing broker priority.
             "shutterstock-video": {"enabled": True, "weight": 9.0},
             "olya-vision": {"enabled": True, "weight": 8.0},
             "olya-decision": {"enabled": True, "weight": 6.0},
@@ -52,13 +51,29 @@ class StatusReporterTests(unittest.TestCase):
     def tearDown(self):
         self.broker.db.close()
 
+    def test_policy_uses_scheduler_defaults_for_omitted_values(self):
+        handle = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        json.dump({"version": 1, "sources": {"defaulted": {}}}, handle)
+        handle.close()
+        self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
+        self.assertEqual(_policy(handle.name), {
+            "defaulted": {"enabled": True, "weight": 1.0},
+        })
+
+    def test_policy_rejects_unknown_keys_like_the_dispatcher(self):
+        handle = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        json.dump({"version": 1, "sources": {"invalid": {"weight": 2, "priority": 1}}}, handle)
+        handle.close()
+        self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
+        self.assertEqual(_policy(handle.name), {})
+
     def add_job(self, ident, source, state, *, created_offset=0, started_offset=None,
                 finished_offset=None, retry_count=0):
         created = self.start.timestamp() + created_offset
         self.db.execute(
-            "INSERT INTO jobs(id,profile,kind,source,priority,payload,state,created,queued_at,"
-            "source_item_id,external_id,started,finished,retry_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (ident, "batch-video", "generate", source, 7, "{}", state, created, created,
+            "INSERT INTO jobs(id,profile,kind,source,payload,state,created,queued_at,"
+            "source_item_id,external_id,started,finished,retry_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ident, "batch-video", "generate", source, "{}", state, created, created,
              ident, None,
              self.start.timestamp() + started_offset if started_offset is not None else None,
              self.start.timestamp() + finished_offset if finished_offset is not None else None,
@@ -107,22 +122,22 @@ class StatusReporterTests(unittest.TestCase):
             '<b><i>Закрытый час</i></b>: <tg-time unix="1787558400" format="">12:00</tg-time>–<tg-time unix="1787562000" format="">13:00</tg-time>',
             'Снимок: <tg-time unix="1787562600" format="">24.08.2026 13:10:00</tg-time>',
             "",
-            "<u>Shutterstock</u> · <b>Приоритет 3/10</b>",
+            "<u>Shutterstock</u> · <b>Вес 9</b>",
             "Сейчас: очередь 0 · в работе 0 · повтор 0 · ошибки 0",
             "<b><u>Час: завершено 1 · ошибок 0 · lease-expired 0</u></b>",
             "",
-            "<u>Olya Vision</u> · <b>Приоритет 8/10</b>",
+            "<u>Olya Vision</u> · <b>Вес 8</b>",
             "Сейчас: очередь 0 · в работе 0 · повтор 0 · ошибки 0",
             "<b><u>Час: завершено 1 · ошибок 0 · lease-expired 0</u></b>",
             "",
-            "<u>Olya Decision</u> · <b>Приоритет 6/10</b>",
+            "<u>Olya Decision</u> · <b>Вес 6</b>",
             "Сейчас: очередь 0 · в работе 0 · повтор 0 · ошибки 1",
             "<b><u>Час: завершено 0 · ошибок 1 · lease-expired 1</u></b>",
             "",
             "<b><u>Итого: 2 completed/ч · очередь 0</u></b>",
             "Здоровье: service ✓ · broker ✓ · Ollama ✓",
         )))
-        self.assertNotIn("вес", text.lower())
+        self.assertIn("Вес", text)
         self.assertNotIn("p95", text)
         self.assertNotIn("video-очередь", text)
         self.assertLess(len(text), 1_100)
@@ -250,6 +265,7 @@ class StatusReporterTests(unittest.TestCase):
         self.assertNotIn("OllamaHTTP", module)
         self.assertNotIn("/api/generate", module)
         self.assertNotIn("broker.compat", module)
+        self.assertNotIn("from .service import", module)
 
 
 if __name__ == "__main__":
