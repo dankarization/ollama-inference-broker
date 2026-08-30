@@ -262,6 +262,15 @@ class Broker:
                 "CREATE INDEX IF NOT EXISTS jobs_state_started "
                 "ON jobs(state,started,created,id)"
             )
+            # Dashboard source discovery and retry totals must stay index-only
+            # on payload-heavy production queues.
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_state_source ON jobs(state,source)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_source_state_retry "
+                "ON jobs(source,state,retry_count)"
+            )
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_source_item "
                 "ON jobs(source,source_item_id)"

@@ -43,13 +43,13 @@ def snapshot(
     # payloads and can be multiple GiB, so even an index-only global scan can
     # exceed the observer deadline on a cold cache.  Policy/schedule sources
     # are known directly; active unconfigured sources remain visible through
-    # the state-leading index.
+    # a covering state/source index.
     source_names = set(policy_sources)
     source_names.update(schedules)
     source_names.update(
         row["source"]
         for row in db.execute(
-            "SELECT DISTINCT source FROM jobs INDEXED BY jobs_state_started "
+            "SELECT DISTINCT source FROM jobs INDEXED BY jobs_state_source "
             "WHERE state IN ('queued','running','cancel_requested')"
         )
     )
@@ -81,7 +81,7 @@ def snapshot(
             (now - 3_600, now - 86_400, source, now - 86_400),
         ).fetchone()
         retry = db.execute(
-            "SELECT count(*) FROM jobs INDEXED BY jobs_source_state "
+            "SELECT count(*) FROM jobs INDEXED BY jobs_source_state_retry "
             "WHERE source=? AND state='queued' AND retry_count>0",
             (source,),
         ).fetchone()[0]

@@ -78,6 +78,39 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(any("FROM audit_events" in query for query in queries))
         self.assertFalse(any("finished>=" in query for query in queries))
 
+    def test_dashboard_queued_payload_reads_use_covering_indexes(self):
+        db = tempfile.NamedTemporaryFile()
+        self.addCleanup(db.close)
+        broker = Broker(db.name, FakeOllama(), FakeWol(), clock=lambda: 100_000)
+        payload = json.dumps({"prompt": "x" * 65_536})
+        with broker.db:
+            broker.db.executemany(
+                "INSERT INTO jobs(id,profile,kind,source,payload,state,created,queued_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                [
+                    (f"queued-{index}", "interactive", "generate", "payload-source",
+                     payload, "queued", float(index), float(index))
+                    for index in range(500)
+                ],
+            )
+        state_plan = " ".join(
+            row[3] for row in broker.db.execute(
+                "EXPLAIN QUERY PLAN SELECT DISTINCT source FROM jobs "
+                "INDEXED BY jobs_state_source WHERE state IN ('queued','running','cancel_requested')"
+            )
+        )
+        retry_plan = " ".join(
+            row[3] for row in broker.db.execute(
+                "EXPLAIN QUERY PLAN SELECT count(*) FROM jobs "
+                "INDEXED BY jobs_source_state_retry WHERE source=? AND state='queued' AND retry_count>0",
+                ("payload-source",),
+            )
+        )
+        self.assertIn("COVERING INDEX jobs_state_source", state_plan)
+        self.assertIn("COVERING INDEX jobs_source_state_retry", retry_plan)
+        data = snapshot(broker.db, now=100_000, policy_snapshot={"sources": {}})
+        self.assertEqual(data["overall"]["states"]["queued"], 500)
+
     def test_dashboard_endpoints_report_unavailable_observer_instead_of_empty_queue(self):
         db = tempfile.NamedTemporaryFile()
         self.addCleanup(db.close)

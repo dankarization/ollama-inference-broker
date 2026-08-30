@@ -100,6 +100,9 @@ class AnalyticsTests(unittest.TestCase):
         self.assertIn("legacy_jobs_state", {
             row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")
         })
+        indexes = {row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")}
+        self.assertIn("jobs_state_source", indexes)
+        self.assertIn("jobs_source_state_retry", indexes)
         self.assertNotIn("legacy_jobs_priority", {
             row[1] for row in broker.db.execute("PRAGMA index_list(jobs)")
         })
