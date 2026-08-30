@@ -156,18 +156,21 @@ class Broker:
 
     Selection is model-aware and batch-oriented: queued jobs are grouped by
     their server-owned profile model, and an active batch keeps serving that
-    model until a bounded job count or wall-clock window ends.  Batching
+    model until its bounded job count ends.  Batching
     avoids unload/load cycles between same-model jobs; per-source weights and
     FIFO-within-source order are preserved inside each batch.  A wait-debt
     starvation guard serves the oldest overdue job (its wait reached the
     priority-mapped bound) even when another model's batch is active.
     """
     def __init__(self, database: str | Path, ollama, wol, clock=time.time,
-                 lease_seconds=60, batch_max_jobs=8, batch_max_seconds=600,
+                 lease_seconds=60, batch_max_jobs=8, batch_max_seconds=None,
                  wait_debt_seconds=1800):
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
         self.batch_max_jobs = int(batch_max_jobs)
-        self.batch_max_seconds = float(batch_max_seconds)
+        # Kept as an accepted constructor argument for callers that still pass
+        # the former wall-clock cap.  It is deliberately ignored: a slow
+        # inference must not end a compatible-model batch between jobs.
+        del batch_max_seconds
         self.wait_debt_seconds = float(wait_debt_seconds)
         self.database = str(database)
         self.db = sqlite3.connect(self.database, check_same_thread=False)
@@ -727,7 +730,6 @@ class Broker:
             "batch": dict(current_batch) if current_batch else None,
             "accumulator": dict(snapshot.get("accumulator") or {}),
             "batch_max_jobs": self.batch_max_jobs,
-            "batch_max_seconds": self.batch_max_seconds,
         }
         remaining = [dict(row) for row in candidates]
         selections: list[dict[str, Any]] = []
@@ -772,13 +774,11 @@ class Broker:
                     "model": current_batch.get("model"),
                     "count": current_batch.get("count", 0),
                     "started": current_batch.get("started"),
-                    "until": current_batch.get("until"),
                 }
                 if current_batch else None
             ),
             "batch_limits": {
                 "max_jobs": self.batch_max_jobs,
-                "max_seconds": self.batch_max_seconds,
                 "wait_debt_seconds": self.wait_debt_seconds,
             },
             "next_selections": selections,
@@ -949,7 +949,7 @@ class Broker:
                 "eligible_sources": [overdue["source"]],
             }
         batch = state["batch"]
-        if batch is not None and batch["count"] < state["batch_max_jobs"] and now < batch["until"]:
+        if batch is not None and batch["count"] < state["batch_max_jobs"]:
             same_model = [
                 row for row in candidates
                 if PROFILES[row["profile"]].model == batch["model"]
@@ -971,7 +971,6 @@ class Broker:
         state["batch"] = {
             "model": model,
             "started": now,
-            "until": now + state["batch_max_seconds"],
             "count": 1,
         }
         return picked, {
@@ -1004,7 +1003,6 @@ class Broker:
                 "batch": self._batch_state,
                 "accumulator": self._weight_accumulator,
                 "batch_max_jobs": self.batch_max_jobs,
-                "batch_max_seconds": self.batch_max_seconds,
             }
             result = self._select_candidate(candidates, policy, state, now)
             if result is None:

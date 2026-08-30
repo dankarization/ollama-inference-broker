@@ -217,7 +217,7 @@ def render(data: dict[str, Any]) -> bytes:
             if series:
                 series_text = (
                     f"batch {cell(series.get('model'))} job {series.get('count', 0)}/"
-                    f"{limits.get('max_jobs')} · window until {timestamp_cell(series.get('until'), tag='code')}"
+                    f"{limits.get('max_jobs')}"
                 )
             else:
                 series_text = "no active batch"
@@ -237,7 +237,7 @@ def render(data: dict[str, Any]) -> bytes:
             forecast_html = (
                 "<h2>Forecast</h2>"
                 f"<p>Current model: <b>{current_model}</b> · {series_text} · "
-                f"max batch {limits.get('max_jobs')} jobs / {limits.get('max_seconds')}s · "
+                f"max batch {limits.get('max_jobs')} jobs · "
                 f"wait debt {limits.get('wait_debt_seconds')}s</p>"
                 "<table><thead><tr><th>Job</th><th>Source</th><th>Model</th>"
                 "<th>Priority</th><th>Mode</th><th>Reason</th><th>Wait</th></tr></thead>"

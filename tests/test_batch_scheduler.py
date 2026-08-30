@@ -224,23 +224,39 @@ class BatchSchedulerTests(unittest.TestCase):
         finished = [broker.status(job_id)["finished"] for job_id in ids]
         self.assertEqual(finished, sorted(finished))
 
-    def test_batch_is_bounded_by_job_count_and_time_window(self):
+    def test_batch_job_limit_survives_a_long_inference(self):
         clock = MutableClock(1_000)
-        # A huge debt bound keeps the starvation guard out of this test.
-        broker = self.make(clock=clock, batch_max_jobs=2, batch_max_seconds=10,
+        # The deprecated time-cap argument is accepted but cannot end a batch.
+        broker = self.make(clock=clock, batch_max_jobs=3, batch_max_seconds=10,
                            wait_debt_seconds=10_000)
         policy = self.policy({"interactive": {"enabled": True, "weight": 1.0}})
         ids = []
         for index in range(3):
             clock.value = 1_000 + index
             ids.append(broker.submit("interactive", "generate", {"prompt": f"p{index}"})["id"])
-        broker.dispatch_once(policy=policy)   # batch starts (job 1/2)
-        broker.dispatch_once(policy=policy)   # batch continues (job 2/2)
-        clock.value = 2_000                   # window (10s) expired
-        broker.dispatch_once(policy=policy)   # must start a new batch
+        broker.dispatch_once(policy=policy)   # batch starts (job 1/3)
+        clock.value = 2_000                   # >600s after the batch started
+        broker.dispatch_once(policy=policy)   # still a same-model continuation (job 2/3)
+        broker.dispatch_once(policy=policy)   # continuation reaches the count cap (job 3/3)
         modes = [broker.attempts(job_id)[0]["scheduler_mode"] for job_id in ids]
-        self.assertEqual(modes, ["weighted_round_robin", "model_batch",
-                                 "weighted_round_robin"])
+        self.assertEqual(modes, ["weighted_round_robin", "model_batch", "model_batch"])
+
+    def test_default_batch_stops_after_eight_jobs(self):
+        clock = MutableClock(1_000)
+        broker = self.make(clock=clock, wait_debt_seconds=10_000)
+        policy = self.policy({"interactive": {"enabled": True, "weight": 1.0}})
+        ids = [
+            broker.submit("interactive", "generate", {"prompt": f"p{index}"})["id"]
+            for index in range(9)
+        ]
+        for _ in ids:
+            self.assertTrue(broker.dispatch_once(policy=policy))
+        modes = [broker.attempts(job_id)[0]["scheduler_mode"] for job_id in ids]
+        # Same-timestamp submissions have random UUIDs, so assert scheduler
+        # modes rather than a particular job-id order: 8 jobs form one batch
+        # (one start plus seven continuations), then job 9 starts another.
+        self.assertEqual(modes.count("weighted_round_robin"), 2)
+        self.assertEqual(modes.count("model_batch"), 7)
 
     def test_priority_semantics_one_highest_ten_lowest(self):
         clock = MutableClock(1_000)
@@ -466,10 +482,9 @@ class BatchSchedulerTests(unittest.TestCase):
                 "current_model": "nemotron3:33b",
                 "current_series": {
                     "model": "nemotron3:33b", "count": 1,
-                    "started": 900, "until": 1_500,
+                    "started": 900,
                 },
-                "batch_limits": {"max_jobs": 8, "max_seconds": 600,
-                                  "wait_debt_seconds": 1_800},
+                "batch_limits": {"max_jobs": 8, "wait_debt_seconds": 1_800},
                 "next_selections": [{
                     "job_id": "job-1", "source": "interactive",
                     "profile": "interactive", "model": "nemotron3:33b",
@@ -482,7 +497,7 @@ class BatchSchedulerTests(unittest.TestCase):
         self.assertIn("<h2>Forecast</h2>", html)
         self.assertIn("Current model: <b>nemotron3:33b</b>", html)
         self.assertIn("batch nemotron3:33b job 2/8", html)
-        self.assertIn("max batch 8 jobs / 600s", html)
+        self.assertIn("max batch 8 jobs", html)
         self.assertIn("read-only projection; it changes as jobs are admitted", html)
         self.assertIn(">job-1<", html)
         self.assertIn(">model_batch<", html)
