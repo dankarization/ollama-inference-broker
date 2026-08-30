@@ -173,7 +173,7 @@ def render(data: dict[str, Any]) -> bytes:
         return (
             '<td><form class="weight-form" data-source="'
             f'{source_attribute}"><select name="weight" aria-label="Weight for '
-            f'{source_attribute}">{options}</select><button type="submit">Save</button>'
+            f'{source_attribute}">{options}</select>'
             '<span class="weight-feedback" aria-live="polite"></span></form></td>'
         )
 
@@ -184,7 +184,7 @@ def render(data: dict[str, Any]) -> bytes:
                 f'<select name="enabled" aria-label="Enabled for {source_attribute}">'
                 f'<option value="true"{" selected" if value else ""}>yes</option>'
                 f'<option value="false"{" selected" if not value else ""}>no</option></select>'
-                '<button type="submit">Save</button><span class="enabled-feedback" aria-live="polite"></span></form></td>')
+                '<span class="enabled-feedback" aria-live="polite"></span></form></td>')
 
     rows = []
     for item in data["sources"]:
@@ -260,27 +260,9 @@ def render(data: dict[str, Any]) -> bytes:
 {forecast_html}
 <h2>History</h2><table><thead><tr><th>ID</th><th>Source</th><th>Profile</th><th>State</th><th>Finished</th><th>Attempts</th></tr></thead><tbody id=history-body>{history_rows}</tbody></table><div id=history-sentinel data-cursor="{html.escape(str((data.get('history') or [{}])[-1].get('finished','')) + ':' + str((data.get('history') or [{}])[-1].get('id','')), quote=True)}"></div>
 <script>
-document.querySelectorAll('.weight-form').forEach((form) => {{
-  form.addEventListener('submit', async (event) => {{
-    event.preventDefault();
-    const feedback = form.querySelector('.weight-feedback');
-    const weight = Number(form.elements.weight.value);
-    feedback.className = 'weight-feedback';
-    feedback.textContent = 'Saving…';
-    try {{
-      const response = await fetch('/v1/sources/' + encodeURIComponent(form.dataset.source) + '/weight', {{
-        method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{weight}}),
-      }});
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || 'save failed');
-      feedback.textContent = 'Saved';
-    }} catch (error) {{
-      feedback.className = 'weight-feedback error';
-      feedback.textContent = error.message || 'Save failed';
-    }}
-  }});
-}});
-document.querySelectorAll('.enabled-form').forEach((form) => {{ form.addEventListener('submit', async (event) => {{ event.preventDefault(); const feedback=form.querySelector('.enabled-feedback'); feedback.textContent='Saving…'; try {{ const response=await fetch('/v1/sources/'+encodeURIComponent(form.dataset.source)+'/enabled', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{enabled:form.elements.enabled.value==='true'}})}}); const result=await response.json(); if(!response.ok) throw new Error(result.error||'save failed'); feedback.textContent='Saved'; }} catch(error) {{ feedback.textContent=error.message||'Save failed'; }} }}); }});
+const bindPolicySelect=(form, field)=>{{ const select=form.elements[field], feedback=form.querySelector('.'+field+'-feedback'); let serial=0, saved=select.value; select.addEventListener('change', async()=>{{ const mine=++serial, value=select.value; feedback.className=field+'-feedback'; feedback.textContent='Saving…'; try {{ const response=await fetch('/v1/sources/'+encodeURIComponent(form.dataset.source)+'/'+field,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{[field]:field==='weight'?Number(value):value==='true'}})}}); const result=await response.json(); if(!response.ok) throw new Error(result.error||'save failed'); if(mine!==serial)return; saved=value; select.value=String(result[field]); feedback.textContent='Saved'; }} catch(error) {{ if(mine!==serial)return; select.value=saved; feedback.className=field+'-feedback error'; feedback.textContent=error.message||'Save failed'; }} }}); }};
+document.querySelectorAll('.weight-form').forEach(form=>bindPolicySelect(form,'weight'));
+document.querySelectorAll('.enabled-form').forEach(form=>bindPolicySelect(form,'enabled'));
 const sentinel=document.querySelector('#history-sentinel'); let loading=false; const historyBody=document.querySelector('#history-body'); const displayTime=value=>new Date(Number(value)*1000).toLocaleString('en-GB',{{timeZone:'Asia/Tbilisi'}}); new IntersectionObserver(async entries => {{ if(loading||!entries[0].isIntersecting||!sentinel.dataset.cursor) return; loading=true; const response=await fetch('/v1/history?limit=30&cursor='+encodeURIComponent(sentinel.dataset.cursor)); const page=await response.json(); (page.items||[]).forEach(row=>{{ const tr=document.createElement('tr'); tr.dataset.historyId=row.id; [row.id,row.source,row.profile,row.state,displayTime(row.finished),row.attempt_count].forEach(value=>{{ const td=document.createElement('td'); td.textContent=String(value); tr.append(td); }}); historyBody.append(tr); }}); sentinel.dataset.cursor=page.next_cursor||''; loading=false; }}).observe(sentinel);
 </script>
 """
