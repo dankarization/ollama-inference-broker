@@ -106,13 +106,24 @@ class DashboardTests(unittest.TestCase):
                 ("payload-source",),
             )
         )
+        candidate_plan = " ".join(
+            row[3] for row in broker.db.execute(
+                "EXPLAIN QUERY PLAN SELECT id,profile,source,created,queued_at,attempt_count "
+                "FROM jobs INDEXED BY jobs_queued_candidates WHERE state='queued' "
+                "ORDER BY queued_at,id"
+            )
+        )
         self.assertIn("COVERING INDEX jobs_state_source", state_plan)
         self.assertIn("COVERING INDEX jobs_source_state_retry", retry_plan)
+        self.assertIn("COVERING INDEX jobs_queued_candidates", candidate_plan)
         data = snapshot(broker.db, now=100_000, policy_snapshot={"sources": {}})
         self.assertEqual(data["overall"]["states"]["queued"], 500)
-        observed = broker.dashboard()
-        self.assertEqual(observed["observation"]["state"], "live")
-        self.assertEqual(observed["overall"]["states"]["queued"], 500)
+        for _ in range(3):
+            observed = broker.dashboard()
+            self.assertEqual(observed["observation"]["state"], "live")
+            self.assertEqual(observed["overall"]["states"]["queued"], 500)
+            forecast = broker.forecast()
+            self.assertNotIn("unavailable", forecast)
 
     def test_dashboard_endpoints_report_unavailable_observer_instead_of_empty_queue(self):
         db = tempfile.NamedTemporaryFile()

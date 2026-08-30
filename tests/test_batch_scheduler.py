@@ -385,7 +385,10 @@ class BatchSchedulerTests(unittest.TestCase):
         broker.db.set_trace_callback(statements.append)
         broker._candidates(db=broker.db)
         broker.db.set_trace_callback(None)
-        observer_select = next(line for line in statements if "FROM jobs WHERE state='queued'" in line)
+        observer_select = next(
+            line for line in statements
+            if "INDEXED BY jobs_queued_candidates WHERE state='queued'" in line
+        )
         self.assertIn("id,profile,source,created,queued_at", observer_select)
         self.assertNotIn("payload", observer_select)
 
@@ -408,7 +411,7 @@ class BatchSchedulerTests(unittest.TestCase):
         broker.db.set_trace_callback(None)
         candidate_select = next(
             line for line in statements
-            if "FROM jobs WHERE state='queued'" in line
+            if "INDEXED BY jobs_queued_candidates WHERE state='queued'" in line
         )
         self.assertIn(
             "id,profile,source,created,queued_at,attempt_count",

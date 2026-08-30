@@ -271,6 +271,11 @@ class Broker:
                 "CREATE INDEX IF NOT EXISTS jobs_source_state_retry "
                 "ON jobs(source,state,retry_count)"
             )
+            # Candidate selection/forecast must not visit queued payload rows.
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_queued_candidates "
+                "ON jobs(state,source,queued_at,id,profile,created,attempt_count)"
+            )
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_source_item "
                 "ON jobs(source,source_item_id)"
@@ -827,7 +832,7 @@ class Broker:
         # materializing every queued request while sorting a large backlog.
         query = (
             "SELECT id,profile,source,created,queued_at,attempt_count "
-            "FROM jobs WHERE state='queued'"
+            "FROM jobs INDEXED BY jobs_queued_candidates WHERE state='queued'"
         )
         values: tuple = ()
         if allowed_sources is not None:
