@@ -203,6 +203,47 @@ def render(data: dict[str, Any]) -> bytes:
         )) + "</tr>"
         for job in active
     ) or "<tr><td colspan=7>None</td></tr>"
+    forecast = data.get("forecast")
+    forecast_html = ""
+    if forecast:
+        if forecast.get("unavailable"):
+            forecast_html = (
+                "<h2>Forecast</h2>"
+                f'<p class=error>Forecast unavailable: {html.escape(str(forecast.get("reason", "observer read failed")))}.</p>'
+            )
+        else:
+            limits = forecast.get("batch_limits", {})
+            series = forecast.get("current_series")
+            if series:
+                series_text = (
+                    f"batch {cell(series.get('model'))} job {series.get('count', 0)}/"
+                    f"{limits.get('max_jobs')} · window until {timestamp_cell(series.get('until'), tag='code')}"
+                )
+            else:
+                series_text = "no active batch"
+            current_model = cell(forecast.get("current_model")) or "none"
+            selection_rows = "".join(
+                "<tr>" + "".join((
+                    f"<td>{cell(item['job_id'])}</td>",
+                    f"<td>{cell(item['source'])}</td>",
+                    f"<td>{cell(item['model'])}</td>",
+                    f"<td>{cell(item['priority'])}</td>",
+                    f"<td>{cell(item['mode'])}</td>",
+                    f"<td>{cell(item['reason'])}</td>",
+                    f"<td>{cell(item['wait_seconds'])}s</td>",
+                )) + "</tr>"
+                for item in forecast.get("next_selections", [])
+            ) or "<tr><td colspan=7>None queued</td></tr>"
+            forecast_html = (
+                "<h2>Forecast</h2>"
+                f"<p>Current model: <b>{current_model}</b> · {series_text} · "
+                f"max batch {limits.get('max_jobs')} jobs / {limits.get('max_seconds')}s · "
+                f"wait debt {limits.get('wait_debt_seconds')}s</p>"
+                "<table><thead><tr><th>Job</th><th>Source</th><th>Model</th>"
+                "<th>Priority</th><th>Mode</th><th>Reason</th><th>Wait</th></tr></thead>"
+                f"<tbody>{selection_rows}</tbody></table>"
+                f"<p><small>{html.escape(forecast.get('contingency', ''))}.</small></p>"
+            )
     overall = data["overall"]
     document = f"""<!doctype html><html lang=en><meta charset=utf-8>
 <meta http-equiv=refresh content=15><title>Ollama broker queue</title>
@@ -213,6 +254,7 @@ def render(data: dict[str, Any]) -> bytes:
 <h2>Sources</h2><table><thead><tr><th>Source</th><th>Enabled</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=13>None</td></tr>'}</tbody></table>
 <p><small>Delayed queued jobs are blocked by a source min-interval.</small></p>
 <h2>Active jobs</h2><table><thead><tr><th>ID</th><th>Source</th><th>State</th><th>Started</th><th>Lease until</th><th>Attempts</th><th>Retries</th></tr></thead><tbody>{active_rows}</tbody></table>
+{forecast_html}
 <script>
 document.querySelectorAll('.weight-form').forEach((form) => {{
   form.addEventListener('submit', async (event) => {{

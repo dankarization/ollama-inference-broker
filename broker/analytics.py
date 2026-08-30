@@ -183,7 +183,10 @@ def _scheduler_window(
             name: float(weights.get(name, 1.0)) for name in eligible
         }
         weight_total = sum(eligible_weights.values())
-        if mode == "weighted_round_robin" and weight_total > 0:
+        # Batch starts and same-model batch continuations both pick from the
+        # recorded eligible set, so expected share tracks the model-aware
+        # scheduler; exception picks (fifo/overdue) stay outside fairness.
+        if mode in {"weighted_round_robin", "model_batch"} and weight_total > 0:
             weighted_selected[source] += 1
             for name, weight in eligible_weights.items():
                 expected[name] += weight / weight_total

@@ -93,14 +93,25 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
   [docs/ANALYTICS.md](docs/ANALYTICS.md).
 - `GET /dashboard` — локальная auto-refresh HTML-панель очереди без payload,
   результатов и ошибок. Она показывает policy (`enabled`, `weight`),
-  состояния, lease, retry/delay, активные jobs и completed total/1h/24h.
-  Машинный payload-free снимок доступен как `GET /v1/dashboard`. После запуска
+  состояния, lease, retry/delay, активные jobs, completed total/1h/24h и
+  read-only **Forecast** под активными jobs: текущую модель/серию батча,
+  bounded список следующих выборов с причинами (`new batch`/`model_batch`/
+  `overdue`), wait каждого кандидата и лимиты батча. Forecast помечен как
+  contingent: он меняется при новых admissions, завершениях и hot reload
+  policy, и никогда не мутирует очередь/leases/аккумуляторы. Машинный
+  payload-free снимок доступен как `GET /v1/dashboard` (тот же `forecast`),
+  отдельно — `GET /v1/forecast`. После запуска
   broker откройте `http://127.0.0.1:8088/dashboard` (или его настроенный host
   и port). Снимок содержит `observation.state`: `live` — текущие данные,
   `stale` — последний успешный снимок при временно недоступном observer-read,
   `unavailable` — HTTP 503 без вымышленных нулевых счётчиков. `dead` всегда
   ноль: в текущей модели broker исчерпанная работа —
   terminal `failed`, отдельного state `dead` нет.
+- `GET /v1/forecast` — read-only проекция ближайших выборов scheduler
+  (bounded, по умолчанию 5, максимум 20): текущая модель/серия, следующие
+  selections с source/model/priority/mode/reason/wait и лимиты батча. Проекция
+  не пишет в БД и не меняет состояние scheduler; при занятой БД возвращает
+  `unavailable` вместо вымышленной пустоты.
 - `GET /healthz` проверяет только локальное состояние broker: очередь, активную lease и timestamp. Он не отправляет WOL и не обращается к MAIN-PC/Ollama.
 - `/api/chat` и `/api/generate` реализуют локальный compatibility contract:
   обязателен server-side `profile`, а `stream=true` возвращает NDJSON admission
@@ -166,11 +177,19 @@ durable `queued`. Это позволяет включить обратимый 
 }
 ```
 
-Выбор при наличии policy: источники делят GPU пропорционально весам (weighted
-round-robin с вращающимся аккумулятором); внутри каждого источника сохраняется
-FIFO, per-source concurrency и min-interval
-backpressure. Итоговый allowlist берётся из `enabled`-записей файла, а не из
-env. `GET /v1/sources` отдаёт текущий снапшот политики (без секретов). При
+Выбор при наличии policy: scheduler работает по моделям и батчам. Queued jobs
+группируются по server-owned модели профиля; активный батч продолжает
+обслуживать ту же модель, пока не достигнут bounded лимиты — максимум
+`batch_max_jobs` заданий (по умолчанию 8) и `batch_max_seconds` секунд
+(по умолчанию 600). Это убирает unload/load между заданиями одной модели.
+Внутри батча источники делят GPU пропорционально весам (weighted
+round-robin с вращающимся аккумулятором), а внутри каждого источника
+сохраняется FIFO, per-source concurrency и min-interval backpressure.
+Starvation guard: задание, чей wait достиг своего priority-маппинга
+wait-debt (`wait_debt_seconds * priority / 10`), разрывает текущий батч и
+обслуживается следующим — даже если ждущая работа принадлежит другой модели.
+Итоговый allowlist берётся из `enabled`-записей файла, а не из env.
+`GET /v1/sources` отдаёт текущий снапшот политики (без секретов). При
 отсутствии policy поведение — env-allowlist + global FIFO.
 
 Канонический production policy хранится в `config/sources.production.json`:
@@ -179,6 +198,21 @@ env. `GET /v1/sources` отдаёт текущий снапшот политик
 `weight` — единственный scheduling-параметр: он задаёт долю source в weighted
 scheduler. Policy с неизвестным ключом отклоняется, чтобы конфигурация не могла
 молча стать default `1.0`.
+
+### User-facing priority (1 highest … 10 lowest)
+
+Каждое задание хранит legacy-совместимый `priority` (источник задаёт его
+серверно: `interactive=1`, `cron=2`, `shutterstock-video=3`,
+`syncopia-telegram-memory=4`, `shutterstock-canary=5`, `olya-decision=6`,
+`olya=8`, `olya-vision=8`; прочие источники — `10`). Семантика для оператора:
+**1 — самый высокий приоритет, 10 — самый низкий**. Scheduler отображает это
+число в wait-debt starvation guard: задание считается overdue, когда его
+ожидание достигло `wait_debt_seconds * priority / 10`. То есть приоритет 1
+получает самый короткий allowed wait и обслуживается раньше, приоритет 10 —
+полный окно `wait_debt_seconds`; отображение совпадает с user-facing
+семантикой. Задание с большим приоритетом (меньшим числом) может быть
+обслужено раньше более старого low-priority задания, если его debt-порог уже
+достигнут.
 
 `POST /v1/shutterstock-video/generate` — синхронный bounded контракт локального
 видео-чанка (profile `shutterstock-video`, `nemotron3:33b`): принимает `prompt`,

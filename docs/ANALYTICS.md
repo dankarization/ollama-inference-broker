@@ -2,7 +2,8 @@
 
 Этот слой нужен для сравнения scheduler algorithms на исторических данных. Он
 не меняет действующий выбор: без runtime policy остаётся global FIFO,
-с policy — существующий weighted round-robin.
+с policy — model-aware batch scheduler (weighted выбор источника внутри
+модельного батча, FIFO внутри источника, starvation guard по wait-debt).
 
 ## Что сохраняется
 
@@ -74,42 +75,29 @@ Correlation lookup возвращает только job/source/profile/state/ti
 
 Scheduler window показывает actual selection count/share и expected share.
 Expected share рассчитывается на каждом решении только среди sources, которые
-тогда действительно были eligible. Это не штрафует scheduler за пустую очередь,
-rate limit или disabled source. `fairness_ratio=1` и малый
+тогда действительно были eligible (для `model_batch` — источники внутри
+текущей модели). Это не штрафует scheduler за пустую очередь,
+rate limit или disabled source, и корректно учитывает модельные батчи.
+`fairness_ratio=1` и малый
 `absolute_share_error` означают близость actual share к доступной weighted цели.
 
-Пример после 17 dispatch opportunities при постоянно заполненных очередях и
-weights `olya-vision=8`, `olya-decision=6`, `shutterstock-video=3`:
+Пример: 17 dispatch opportunities при постоянно заполненных очередях, weights
+`olya-vision=8`, `olya-decision=6`, `shutterstock-video=3` и batch-лимите 8:
 
 ```json
 {
   "selections": 17,
+  "modes": {"weighted_round_robin": 3, "model_batch": 14},
   "sources": {
-    "olya-vision": {
-      "selected": 8,
-      "actual_share": 0.470588,
-      "expected_share": 0.470588,
-      "fairness_ratio": 1.0,
-      "absolute_share_error": 0.0
-    },
-    "olya-decision": {
-      "selected": 6,
-      "actual_share": 0.352941,
-      "expected_share": 0.352941,
-      "fairness_ratio": 1.0,
-      "absolute_share_error": 0.0
-    },
-    "shutterstock-video": {
-      "selected": 3,
-      "actual_share": 0.176471,
-      "expected_share": 0.176471,
-      "fairness_ratio": 1.0,
-      "absolute_share_error": 0.0
-    }
+    "olya-vision": {"selected": 8, "fairness_ratio": 1.07},
+    "olya-decision": {"selected": 8, "fairness_ratio": 1.09},
+    "shutterstock-video": {"selected": 1, "fairness_ratio": 5.67}
   }
 }
 ```
 
+Батчи стартуют в порядке весов (vision, decision, video) и затем дренируют FIFO
+внутри модели: 8 заданий gemma, 8 заданий qwen и последнее задание nemotron.
 На коротком окне дискретность закономерно даёт отклонение. Для оценки нужны
 одновременно 5 минут, 30 минут, 3 часа и 24 часа.
 
@@ -118,7 +106,8 @@ weights `olya-vision=8`, `olya-decision=6`, `shutterstock-video=3`:
 Алгоритм нельзя менять до накопления baseline и отдельного rollout. Затем на
 одинаковом replay workload безопасно сравниваются:
 
-- weighted round robin — текущий baseline, прост и детерминирован;
+- model-aware batch scheduler — текущий baseline: weighted выбор внутри
+  модельного батча, FIFO внутри source и wait-debt starvation guard;
 - deficit round robin — лучше учитывает разную стоимость job, если появится
   надёжная оценка cost;
 - weighted fair queue — полезен при нескольких непрерывно загруженных sources,

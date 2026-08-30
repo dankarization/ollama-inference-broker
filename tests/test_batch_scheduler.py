@@ -1,0 +1,508 @@
+"""Deterministic tests for the model-aware, batch-oriented scheduler.
+
+Coverage contract:
+- same-model jobs batch together and avoid unload/load between them;
+- an overdue job of another model breaks the batch (starvation guard);
+- source weights still shape fair selection within a model batch;
+- FIFO order is preserved inside each source;
+- the dashboard forecast is read-only, deterministic and contingent;
+- restart and hot policy reload are safe (durable jobs survive).
+"""
+import json
+import os
+import tempfile
+import unittest
+
+from broker.service import Broker, SourcePolicy
+
+
+class FakeWol:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def wake(self):
+        self.calls.append("wake")
+
+
+class FakeOllama:
+    def __init__(self, calls, loaded=None):
+        self.calls, self.loaded = calls, list(loaded or [])
+
+    def ps(self):
+        self.calls.append("ps")
+        return {"models": [{"name": name, "size_vram": 1} for name in self.loaded]}
+
+    def is_ready(self, model):
+        self.calls.append(("ready", model))
+        return model in self.loaded
+
+    def unload(self, model):
+        self.calls.append(("unload", model))
+        self.loaded.remove(model)
+
+    def run(self, kind, request):
+        self.calls.append(("run", kind, request.copy()))
+        if request.get("prompt") == "" and request["model"] not in self.loaded:
+            self.loaded.append(request["model"])
+        return {"done": True}
+
+
+class MutableClock:
+    def __init__(self, value):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+
+class BatchSchedulerTests(unittest.TestCase):
+    def make(self, loaded=None, clock=None, **kwargs):
+        self.calls = []
+        self.tmp = tempfile.NamedTemporaryFile()
+        self.addCleanup(self.tmp.close)
+        return Broker(
+            self.tmp.name, FakeOllama(self.calls, loaded), FakeWol(self.calls),
+            clock=clock or MutableClock(1_000), **kwargs,
+        )
+
+    def policy(self, sources):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"version": 1, "sources": sources}, handle)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return SourcePolicy(path)
+
+    def load_calls(self, model):
+        return [
+            call for call in self.calls
+            if isinstance(call, tuple) and call[0] == "run"
+            and call[2].get("model") == model and call[2].get("prompt") == ""
+        ]
+
+    def unload_calls(self):
+        return [call[1] for call in self.calls
+                if isinstance(call, tuple) and call[0] == "unload"]
+
+    def test_same_model_jobs_batch_without_reload(self):
+        clock = MutableClock(1_000)
+        broker = self.make(clock=clock)  # nothing preloaded
+        policy = self.policy({
+            "interactive": {"enabled": True, "weight": 1.0},
+            "cron": {"enabled": True, "weight": 1.0},
+        })
+        ids = []
+        for index, prompt in enumerate(("i1", "i2", "c1")):
+            clock.value = 1_000 + index
+            profile = "interactive" if prompt.startswith("i") else "cron"
+            ids.append(broker.submit(profile, "generate", {"prompt": prompt})["id"])
+        for _ in ids:
+            self.assertTrue(broker.dispatch_once(policy=policy))
+        self.assertEqual([broker.status(job_id)["state"] for job_id in ids],
+                         ["completed"] * 3)
+        # Both profiles resolve to nemotron3:33b, so the three jobs form one
+        # batch: the model is loaded exactly once and never unloaded.
+        self.assertEqual(len(self.load_calls("nemotron3:33b")), 1)
+        self.assertEqual(self.unload_calls(), [])
+        # The first pick starts the batch; the rest continue it.
+        modes = [
+            attempt["scheduler_mode"]
+            for job_id in ids
+            for attempt in broker.attempts(job_id)
+        ]
+        self.assertEqual(modes, ["weighted_round_robin", "model_batch", "model_batch"])
+
+    def test_model_switch_unloads_previous_model_between_batches(self):
+        clock = MutableClock(1_000)
+        broker = self.make(["nemotron3:33b"], clock=clock)
+        policy = self.policy({
+            "interactive": {"enabled": True, "weight": 1.0},
+            "olya-vision": {"enabled": True, "weight": 1.0},
+        })
+        first = broker.submit("interactive", "generate", {"prompt": "i"})["id"]
+        clock.value = 1_001
+        second = broker.submit(
+            "olya-vision-gemma", "generate",
+            {"prompt": "v", "images": ["aGVsbG8="], "format": {"type": "object"}},
+            source="olya-vision",
+        )["id"]
+        broker.dispatch_once(policy=policy)
+        broker.dispatch_once(policy=policy)
+        self.assertEqual(broker.status(first)["state"], "completed")
+        self.assertEqual(broker.status(second)["state"], "completed")
+        self.assertEqual(
+            broker.status(second)["switch_reason"],
+            "unloaded incompatible model before switch",
+        )
+        # Only the incompatible previous model is unloaded, exactly once.
+        self.assertEqual(self.unload_calls(), ["nemotron3:33b"])
+        self.assertEqual(
+            broker.attempts(second)[0]["scheduler_mode"], "weighted_round_robin"
+        )
+
+    def test_overdue_other_model_breaks_the_active_batch(self):
+        clock = MutableClock(1_000)
+        broker = self.make(clock=clock, wait_debt_seconds=1_000)
+        policy = self.policy({
+            "interactive": {"enabled": True, "weight": 1.0},
+            "olya-vision": {"enabled": True, "weight": 1.0},
+        })
+        first = broker.submit("interactive", "generate", {"prompt": "i1"})["id"]
+        clock.value = 1_001
+        second = broker.submit("interactive", "generate", {"prompt": "i2"})["id"]
+        broker.dispatch_once(policy=policy)
+        # A different-model job is admitted while the nemotron batch is active.
+        clock.value = 1_010
+        overdue = broker.submit(
+            "olya-vision-gemma", "generate",
+            {"prompt": "v", "images": ["aGVsbG8="], "format": {"type": "object"}},
+            source="olya-vision",
+        )["id"]
+        clock.value = 2_050
+        # interactive (priority 1 -> debt 100s) has waited 1049s; olya-vision
+        # (priority 8 -> debt 800s) only 1040s, so it is not yet overdue.  The
+        # overdue interactive job is served before the batch would drain.
+        self.assertTrue(broker.dispatch_once(policy=policy))
+        self.assertEqual(broker.status(second)["state"], "completed")
+        self.assertEqual(broker.status(overdue)["state"], "queued")
+        self.assertEqual(broker.attempts(second)[0]["scheduler_mode"], "overdue")
+        self.assertIn("priority debt", broker.attempts(second)[0]["selection_reason"])
+        # The batch is broken: the next pick serves the other model instead
+        # of continuing the nemotron series (its wait is still within debt).
+        self.assertTrue(broker.dispatch_once(policy=policy))
+        self.assertEqual(broker.status(overdue)["state"], "completed")
+        self.assertNotEqual(
+            broker.attempts(overdue)[0]["scheduler_mode"], "model_batch"
+        )
+
+    def test_weights_fairness_within_model_batch(self):
+        clock = MutableClock(1_000)
+        broker = self.make(clock=clock)
+        policy = self.policy({
+            "interactive": {"enabled": True, "weight": 3.0},
+            "cron": {"enabled": True, "weight": 1.0},
+        })
+        ids = []
+        for index in range(20):
+            clock.value = 1_000 + index
+            ids.append(broker.submit("interactive", "generate", {"prompt": f"i{index}"})["id"])
+        for index in range(20):
+            clock.value = 1_100 + index
+            ids.append(broker.submit("cron", "generate", {"prompt": f"c{index}"})["id"])
+        for _ in range(17):
+            self.assertTrue(broker.dispatch_once(policy=policy))
+        interactive_done = sum(
+            1 for job_id in ids[:20] if broker.status(job_id)["state"] == "completed"
+        )
+        cron_done = sum(
+            1 for job_id in ids[20:] if broker.status(job_id)["state"] == "completed"
+        )
+        # Both sources share one model, so every pick is a weighted pick among
+        # the same eligible set: the 3:1 weight ratio is preserved closely.
+        self.assertEqual((interactive_done, cron_done), (13, 4))
+        snapshot = broker.analytics(policy, windows=(3_600,))
+        scheduler = snapshot["scheduler"]["windows"]["3600"]
+        self.assertAlmostEqual(
+            scheduler["sources"]["interactive"]["fairness_ratio"], 1.0, delta=0.1
+        )
+        self.assertAlmostEqual(
+            scheduler["sources"]["cron"]["fairness_ratio"], 1.0, delta=0.1
+        )
+
+    def test_fifo_within_source_is_preserved(self):
+        clock = MutableClock(1_000)
+        broker = self.make(["nemotron3:33b"], clock=clock)
+        policy = self.policy({"interactive": {"enabled": True, "weight": 1.0}})
+        ids = []
+        for index in range(3):
+            clock.value = 1_000 + index
+            ids.append(broker.submit("interactive", "generate", {"prompt": f"p{index}"})["id"])
+        for _ in ids:
+            self.assertTrue(broker.dispatch_once(policy=policy))
+        self.assertEqual([broker.status(job_id)["state"] for job_id in ids],
+                         ["completed"] * 3)
+        # Jobs completed in submission order (FIFO within the source).
+        finished = [broker.status(job_id)["finished"] for job_id in ids]
+        self.assertEqual(finished, sorted(finished))
+
+    def test_batch_is_bounded_by_job_count_and_time_window(self):
+        clock = MutableClock(1_000)
+        # A huge debt bound keeps the starvation guard out of this test.
+        broker = self.make(clock=clock, batch_max_jobs=2, batch_max_seconds=10,
+                           wait_debt_seconds=10_000)
+        policy = self.policy({"interactive": {"enabled": True, "weight": 1.0}})
+        ids = []
+        for index in range(3):
+            clock.value = 1_000 + index
+            ids.append(broker.submit("interactive", "generate", {"prompt": f"p{index}"})["id"])
+        broker.dispatch_once(policy=policy)   # batch starts (job 1/2)
+        broker.dispatch_once(policy=policy)   # batch continues (job 2/2)
+        clock.value = 2_000                   # window (10s) expired
+        broker.dispatch_once(policy=policy)   # must start a new batch
+        modes = [broker.attempts(job_id)[0]["scheduler_mode"] for job_id in ids]
+        self.assertEqual(modes, ["weighted_round_robin", "model_batch",
+                                 "weighted_round_robin"])
+
+    def test_priority_semantics_one_highest_ten_lowest(self):
+        clock = MutableClock(1_000)
+        broker = self.make(clock=clock, wait_debt_seconds=1_000)
+        # 1 is the highest priority (shortest wait debt), 10 the lowest.
+        self.assertEqual(broker._wait_debt_seconds({"priority": 1}), 100.0)
+        self.assertEqual(broker._wait_debt_seconds({"priority": 5}), 500.0)
+        self.assertEqual(broker._wait_debt_seconds({"priority": 10}), 1_000.0)
+        self.assertEqual(broker._wait_debt_seconds({"priority": None}), 1_000.0)
+        self.assertEqual(broker._wait_debt_seconds({"priority": 0}), 1_000.0)
+        # A higher-priority (lower-number) job is served before an older
+        # lower-priority job once it reaches its much shorter debt bound.
+        policy = self.policy({
+            "interactive": {"enabled": True, "weight": 1.0},
+            "olya": {"enabled": True, "weight": 1.0},
+        })
+        low = broker.submit("olya", "generate", {"prompt": "low"})["id"]  # p8
+        clock.value = 1_650
+        high = broker.submit("interactive", "generate", {"prompt": "high"})["id"]  # p1
+        clock.value = 1_770
+        # high (p1, debt 100s) waited 120s -> overdue; low (p8, debt 800s)
+        # waited 770s -> not overdue.  The starvation guard must serve high
+        # even though low is older.
+        broker.dispatch_once(policy=policy)
+        self.assertEqual(broker.status(high)["state"], "completed")
+        self.assertEqual(broker.status(low)["state"], "queued")
+        self.assertEqual(broker.attempts(high)[0]["scheduler_mode"], "overdue")
+
+    def test_forecast_is_read_only_deterministic_and_contingent(self):
+        clock = MutableClock(1_000)
+        broker = self.make(clock=clock)
+        policy = self.policy({
+            "interactive": {"enabled": True, "weight": 2.0},
+            "cron": {"enabled": True, "weight": 1.0},
+        })
+        ids = []
+        for index, (profile, prompt) in enumerate(
+            (("interactive", "i1"), ("interactive", "i2"), ("cron", "c1"))
+        ):
+            clock.value = 1_000 + index
+            ids.append(broker.submit(profile, "generate", {"prompt": prompt})["id"])
+        before_batch = dict(broker._batch_state or {})
+        before_accumulator = dict(broker._weight_accumulator)
+        before_states = [broker.status(job_id)["state"] for job_id in ids]
+        before_audit = broker.db.execute(
+            "SELECT count(*) FROM audit_events"
+        ).fetchone()[0]
+
+        first = broker.forecast(policy, limit=5)
+        second = broker.forecast(policy, limit=5)
+
+        self.assertEqual(first, second)
+        self.assertIs(first["contingent"], True)
+        self.assertIn("contingency", first)
+        self.assertIsNone(first["current_model"])  # nothing is running yet
+        # The projection covers the full bounded queue (deterministic order)
+        # and starts a batch on the highest-weight source's FIFO head.
+        self.assertEqual(
+            sorted(item["job_id"] for item in first["next_selections"]), sorted(ids)
+        )
+        self.assertEqual(first["next_selections"][0]["job_id"], ids[0])
+        self.assertEqual(first["next_selections"][0]["mode"], "weighted_round_robin")
+        self.assertEqual(
+            {item["mode"] for item in first["next_selections"][1:]}, {"model_batch"}
+        )
+        # Forecast is read-only: scheduler state and durable rows unchanged.
+        self.assertEqual(dict(broker._batch_state or {}), before_batch)
+        self.assertEqual(dict(broker._weight_accumulator), before_accumulator)
+        self.assertEqual([broker.status(job_id)["state"] for job_id in ids],
+                         before_states)
+        self.assertEqual(
+            broker.db.execute("SELECT count(*) FROM audit_events").fetchone()[0],
+            before_audit,
+        )
+        # And it is bounded by the requested limit.
+        self.assertLessEqual(len(first["next_selections"]), 5)
+
+    def test_forecast_reflects_an_active_batch_series(self):
+        clock = MutableClock(1_000)
+        broker = self.make(clock=clock)
+        policy = self.policy({
+            "interactive": {"enabled": True, "weight": 1.0},
+            "olya-vision": {"enabled": True, "weight": 1.0},
+        })
+        broker.submit("interactive", "generate", {"prompt": "i1"})
+        clock.value = 1_001
+        broker.submit("interactive", "generate", {"prompt": "i2"})
+        clock.value = 1_002
+        broker.submit(
+            "olya-vision-gemma", "generate",
+            {"prompt": "v", "images": ["aGVsbG8="], "format": {"type": "object"}},
+            source="olya-vision",
+        )
+        broker.dispatch_once(policy=policy)
+        forecast = broker.forecast(policy, limit=5)
+        # The nemotron batch is active with one job done; the next selection
+        # continues that series, and the other model follows only after.
+        self.assertEqual(forecast["current_series"]["model"], "nemotron3:33b")
+        self.assertEqual(forecast["current_series"]["count"], 1)
+        self.assertEqual(forecast["next_selections"][0]["mode"], "model_batch")
+        self.assertEqual(forecast["next_selections"][0]["model"], "nemotron3:33b")
+        self.assertEqual(forecast["next_selections"][1]["mode"], "weighted_round_robin")
+        self.assertEqual(forecast["next_selections"][1]["model"], "gemma4:12b")
+
+    def test_restart_resets_batch_but_preserves_durable_jobs(self):
+        path = tempfile.NamedTemporaryFile(suffix=".sqlite3").name
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        clock = MutableClock(1_000)
+        calls = []
+        policy = self.policy({"interactive": {"enabled": True, "weight": 1.0}})
+        first = Broker(path, FakeOllama(calls, ["nemotron3:33b"]),
+                       FakeWol(calls), clock=clock)
+        job_id = first.submit("interactive", "generate", {"prompt": "x"})["id"]
+        first.dispatch_once(policy=policy)
+        self.assertIsNotNone(first._batch_state)
+        first.db.close()
+
+        restarted = Broker(path, FakeOllama(calls, ["nemotron3:33b"]),
+                           FakeWol(calls), clock=clock)
+        self.assertEqual(restarted.status(job_id)["state"], "completed")
+        self.assertIsNone(restarted._batch_state)
+        # Dispatch still works after restart and starts a fresh batch.
+        clock.value = 1_100
+        next_id = restarted.submit("interactive", "generate", {"prompt": "y"})["id"]
+        self.assertTrue(restarted.dispatch_once(policy=policy))
+        self.assertEqual(restarted.status(next_id)["state"], "completed")
+        self.assertEqual(restarted.attempts(next_id)[0]["scheduler_mode"],
+                         "weighted_round_robin")
+
+    def test_hot_policy_reload_is_respected_without_losing_batch(self):
+        clock = MutableClock(1_000)
+        broker = self.make(["nemotron3:33b"], clock=clock)
+        policy = self.policy({
+            "interactive": {"enabled": True, "weight": 1.0},
+            "cron": {"enabled": True, "weight": 1.0},
+        })
+        interactive_one = broker.submit("interactive", "generate", {"prompt": "i1"})["id"]
+        clock.value = 1_001
+        cron = broker.submit("cron", "generate", {"prompt": "c"})["id"]
+        clock.value = 1_002
+        interactive_two = broker.submit("interactive", "generate", {"prompt": "i2"})["id"]
+        broker.dispatch_once(policy=policy)
+        # Equal weights pick interactive first (FIFO tie-break).
+        self.assertEqual(broker.status(interactive_one)["state"], "completed")
+        # Atomic hot reload flips cron's weight while the batch is active.
+        replacement = str(policy.path) + ".tmp"
+        with open(replacement, "w") as handle:
+            json.dump({"version": 1, "sources": {
+                "interactive": {"enabled": True, "weight": 1.0},
+                "cron": {"enabled": True, "weight": 10.0},
+            }}, handle)
+        os.replace(replacement, policy.path)
+        self.assertTrue(broker.dispatch_once(policy=policy))
+        # The reloaded weight is applied on the next same-model continuation
+        # pick, so cron wins the weighted choice over the queued interactive
+        # job; the batch itself is not lost by the reload.
+        self.assertEqual(broker.status(cron)["state"], "completed")
+        self.assertEqual(broker.status(interactive_two)["state"], "queued")
+        self.assertEqual(broker.attempts(cron)[0]["scheduler_mode"], "model_batch")
+        self.assertEqual(broker._last_scheduler_decision["selected_source"], "cron")
+
+    def test_disabled_source_never_enters_a_batch(self):
+        broker = self.make(["nemotron3:33b"])
+        policy = self.policy({
+            "interactive": {"enabled": True, "weight": 1.0},
+            "cron": {"enabled": False, "weight": 1.0},
+        })
+        blocked = broker.submit("cron", "generate", {"prompt": "c"})["id"]
+        allowed = broker.submit("interactive", "generate", {"prompt": "i"})["id"]
+        self.assertTrue(broker.dispatch_once(policy.enabled_sources(), policy))
+        self.assertEqual(broker.status(allowed)["state"], "completed")
+        self.assertEqual(broker.status(blocked)["state"], "queued")
+
+    def test_forecast_http_endpoint_is_read_only_and_bounded(self):
+        import threading
+        from urllib.request import urlopen
+
+        from broker.http import serve
+
+        clock = MutableClock(1_000)
+        broker = self.make(clock=clock)
+        policy = self.policy({"interactive": {"enabled": True, "weight": 1.0}})
+        for index in range(3):
+            clock.value = 1_000 + index
+            broker.submit("interactive", "generate", {"prompt": f"p{index}"})
+        server = serve(broker, port=0, policy=policy)
+        self.addCleanup(server.server_close)
+        worker = threading.Thread(target=server.handle_request)
+        worker.start()
+        try:
+            with urlopen(
+                f"http://127.0.0.1:{server.server_port}/v1/forecast?limit=2"
+            ) as response:
+                body = json.loads(response.read())
+        finally:
+            worker.join(timeout=1)
+        self.assertEqual(response.status, 200)
+        self.assertIs(body["contingent"], True)
+        self.assertEqual(len(body["next_selections"]), 2)  # bounded by limit
+        self.assertEqual(body["next_selections"][0]["priority"], 1)
+        self.assertNotIn("payload", json.dumps(body))
+        # The endpoint never dispatches: every job is still queued.
+        self.assertEqual(
+            broker.db.execute("SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0],
+            3,
+        )
+
+    def test_dashboard_html_renders_the_contingent_forecast(self):
+        from broker.dashboard import render
+
+        html = render({
+            "timestamp": 1_000,
+            "sources": [],
+            "active_jobs": [],
+            "overall": {
+                "states": {"completed": 0},
+                "completed_last_hour": 0,
+                "completed_last_24_hours": 0,
+            },
+            "forecast": {
+                "contingent": True,
+                "contingency": "read-only projection; it changes as jobs are admitted or complete",
+                "current_model": "nemotron3:33b",
+                "current_series": {
+                    "model": "nemotron3:33b", "count": 1,
+                    "started": 900, "until": 1_500,
+                },
+                "batch_limits": {"max_jobs": 8, "max_seconds": 600,
+                                  "wait_debt_seconds": 1_800},
+                "next_selections": [{
+                    "job_id": "job-1", "source": "interactive",
+                    "profile": "interactive", "model": "nemotron3:33b",
+                    "priority": 1, "mode": "model_batch",
+                    "reason": "batch nemotron3:33b job 2/8",
+                    "eligible_sources": ["interactive"], "wait_seconds": 5.0,
+                }],
+            },
+        }).decode()
+        self.assertIn("<h2>Forecast</h2>", html)
+        self.assertIn("Current model: <b>nemotron3:33b</b>", html)
+        self.assertIn("batch nemotron3:33b job 2/8", html)
+        self.assertIn("max batch 8 jobs / 600s", html)
+        self.assertIn("read-only projection; it changes as jobs are admitted", html)
+        self.assertIn(">job-1<", html)
+        self.assertIn(">model_batch<", html)
+
+    def test_forecast_unavailable_when_database_is_locked(self):
+        import sqlite3
+        from unittest.mock import patch
+
+        broker = self.make()
+        broker.submit("interactive", "generate", {"prompt": "x"})
+        with patch(
+            "broker.service.sqlite3.connect",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            forecast = broker.forecast()
+        self.assertIs(forecast["contingent"], True)
+        self.assertIs(forecast["unavailable"], True)
+        self.assertEqual(forecast["reason"], "database observer read unavailable")
+        self.assertNotIn("next_selections", forecast)
+
+
+if __name__ == "__main__":
+    unittest.main()
