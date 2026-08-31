@@ -25,6 +25,8 @@ from .policy import SourcePolicyError, normalize_source_policy
 
 LOGGER = logging.getLogger("ollama_inference_broker.audit")
 OBSERVER_READ_DEADLINE_SECONDS = 0.75
+SCHEDULING_HORIZON_SECONDS = 60 * 60
+FORECAST_DEFAULT_EXECUTION_SECONDS = 300.0
 
 class SourcePolicy:
     """Runtime-reloadable per-source weights and enablement.
@@ -161,7 +163,7 @@ class SourcePolicy:
 
 
 class Broker:
-    """One-resource scheduler with FIFO per source and weight-only sharing."""
+    """One-resource scheduler with FIFO source heads and time-weighted batches."""
     def __init__(self, database: str | Path, ollama, wol, clock=time.time,
                  lease_seconds=60):
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
@@ -179,8 +181,16 @@ class Broker:
         self._metrics_cache: dict[str, Any] = {
             "resource": "mainpc-gpu", "queue_depth": 0, "active": None,
         }
-        # In-memory weighted-round-robin state; policy changes never reset it.
+        # Kept as an inert compatibility attribute for observer users of older
+        # releases.  Policy scheduling is now time-budgeted rather than
+        # dispatch-count weighted round-robin.
         self._weight_accumulator: dict[str, float] = {}
+        # A cycle is deliberately process-local.  Queue durability and lease
+        # recovery stay in SQLite; a restart simply begins a fresh fair
+        # 60-minute allocation from the durable ready queue.
+        self._time_cycle: dict[str, Any] | None = None
+        self._duration_estimates: dict[tuple[str, str], float] = {}
+        self._active_time_batch: dict[str, Any] | None = None
         # Immutable copy written under the lock for the lock-free forecast.
         self._scheduler_snapshot: dict[str, Any] | None = None
         self._init_db()
@@ -724,14 +734,16 @@ class Broker:
             observation.update(error)
         return observation
 
-    def forecast(self, policy: SourcePolicy | None = None, limit: int = 5) -> dict:
+    def forecast(self, policy: SourcePolicy | None = None, limit: int = 10) -> dict:
         """Read-only projection of upcoming dispatcher selections.
 
         The projection never mutates the queue, leases, accumulators or batch
         state: it simulates the same ``_select_candidate`` routine on private
         copies and is explicitly contingent on later admissions and state
-        changes.  A locked database yields ``unavailable`` instead of fake
-        emptiness.  Bounded by ``limit`` (1..20) next selections.
+        changes.  It uses the same model/source time-batch selector as real
+        dispatch and advances only a private cycle copy with observed per-lane
+        duration estimates.  A locked database yields ``unavailable`` instead
+        of fake emptiness.  Bounded by ``limit`` (1..20) next selections.
         """
         now = self.clock()
         data, error = self._observer_read(
@@ -761,7 +773,17 @@ class Broker:
             limit_per_source=bounded,
         )
         snapshot = self._scheduler_snapshot or {}
-        accumulator = dict(snapshot.get("accumulator") or {})
+        cycle = deepcopy(snapshot.get("time_cycle"))
+        estimates = dict(snapshot.get("duration_estimates") or {})
+        active = snapshot.get("active_time_batch")
+        # The active lease will release before any projected selection.  Its
+        # true duration is unknown until completion, so forecast uses the same
+        # lane estimate it uses for all subsequent non-preemptive boundaries.
+        if policy is not None and running is not None and active is not None and cycle:
+            self._record_time_usage(
+                cycle, tuple(active["lane"]),
+                self._forecast_duration(tuple(active["lane"]), estimates),
+            )
         remaining = [dict(row) for row in candidates]
         selections: list[dict[str, Any]] = []
         for _ in range(bounded):
@@ -771,14 +793,18 @@ class Broker:
                 picked = remaining[0]
                 mode, reason = "fifo", "oldest queued job"
                 eligible = [picked["source"]]
+                decision: dict[str, Any] = {}
             else:
-                picked = self._weighted_pick(remaining, policy, accumulator)
+                picked, cycle, decision = self._time_batch_pick(
+                    remaining, policy, now, cycle,
+                )
                 if picked is None:
                     break
-                mode, reason = "weighted_round_robin", "weight-only source selection"
-                eligible = sorted({row["source"] for row in remaining})
+                mode, reason = decision["mode"], decision["reason"]
+                eligible = decision["eligible_sources"]
             queued_at = picked["queued_at"] if picked["queued_at"] is not None else picked["created"]
             wait = max(0.0, now - queued_at)
+            lane = self._lane_key(picked)
             selections.append({
                 "job_id": picked["id"],
                 "source": picked["source"],
@@ -791,11 +817,15 @@ class Broker:
                 "wait_seconds": round(wait, 3),
             })
             remaining = [row for row in remaining if row["id"] != picked["id"]]
+            if policy is not None:
+                self._record_time_usage(
+                    cycle, lane, self._forecast_duration(lane, estimates),
+                )
         return {
             "contingent": True,
             "contingency": (
-                "read-only post-completion projection; it changes as jobs are admitted, "
-                "complete and when the source policy reloads"
+                "read-only time-batch projection; non-preemptive boundaries use recent "
+                "execution estimates and change as jobs are admitted, complete or policy reloads"
             ),
             "current_model": PROFILES[running["profile"]].model if running else None,
             "next_selections": selections,
@@ -808,7 +838,7 @@ class Broker:
         snapshot, error = self._observer_read(
             lambda db: {
                 **dashboard_snapshot(db, now=now, policy_snapshot=policy_snapshot),
-                "forecast": self._forecast(db, policy, now, 8),
+                "forecast": self._forecast(db, policy, now, 10),
                 "history": self._terminal_history(db, limit=10),
             }
         )
@@ -926,46 +956,235 @@ class Broker:
                 candidates.append(row)
         return candidates
 
-    def _weighted_pick(self, candidates, policy: SourcePolicy, accumulator=None):
-        """Pick a candidate by weighted round-robin across sources.
+    @staticmethod
+    def _lane_key(row) -> tuple[str, str]:
+        return (str(row["source"]), PROFILES[row["profile"]].model)
 
-        Weights are relative shares of dispatch opportunities per source; the
-        first candidate of each source is ordered FIFO. A deterministic rotating accumulator keeps the
-        schedule fair and stable across policy reloads.  When the policy has
-        no entry for a source, the source keeps the default weight of 1.
-        ``accumulator`` may be a caller-owned dict for read-only projections;
-        the real dispatcher uses the broker-owned accumulator.
+    @staticmethod
+    def _source_heads(candidates) -> dict[tuple[str, str], Any]:
+        """Return exactly one FIFO-eligible job for each source/model lane.
+
+        A source's oldest eligible row is its only dispatchable head.  This is
+        important when one source has jobs targeting different models: model
+        affinity must not let a younger job overtake that source's FIFO head.
         """
-        by_source: dict[str, list] = {}
+        heads_by_source: dict[str, Any] = {}
         for row in candidates:
-            by_source.setdefault(row["source"], []).append(row)
-        if not by_source:
-            return None
-        if accumulator is None:
-            accumulator = getattr(self, "_weight_accumulator", None)
-            if accumulator is None:
-                accumulator = self._weight_accumulator = {}
-        total_weight = 0.0
-        for source in by_source:
-            configured = policy.weight(source) or 1.0
-            share = 1.0 / configured
-            total_weight += share
-            accumulator[source] = accumulator.get(source, 0.0) + share
-        # Ignore accumulator entries for sources no longer eligible after a
-        # hot policy reload or an emptied queue.
-        chosen_source = max(by_source, key=lambda source: accumulator[source])
-        accumulator[chosen_source] -= total_weight
-        return by_source[chosen_source][0]
+            heads_by_source.setdefault(row["source"], row)
+        return {
+            Broker._lane_key(row): row for row in heads_by_source.values()
+        }
+
+    @staticmethod
+    def _policy_signature(policy: SourcePolicy) -> tuple[tuple[str, float], ...]:
+        sources = policy.snapshot().get("sources", {})
+        return tuple(
+            (source, float(entry["weight"]))
+            for source, entry in sorted(sources.items())
+            if entry.get("enabled", True)
+        )
+
+    @staticmethod
+    def _lane_order(lanes: dict[tuple[str, str], dict[str, Any]]) -> list[tuple[str, str]]:
+        """Order full model blocks, then source/model lanes within a block."""
+        model_totals: dict[str, float] = {}
+        model_oldest: dict[str, tuple[float, str]] = {}
+        for key, lane in lanes.items():
+            source, model = key
+            model_totals[model] = model_totals.get(model, 0.0) + lane["weight"]
+            candidate_key = (lane["queued_at"], source)
+            if model not in model_oldest or candidate_key < model_oldest[model]:
+                model_oldest[model] = candidate_key
+        models = sorted(
+            model_totals,
+            key=lambda model: (-model_totals[model], model_oldest[model], model),
+        )
+        order: list[tuple[str, str]] = []
+        for model in models:
+            order.extend(sorted(
+                (key for key in lanes if key[1] == model),
+                key=lambda key: (-lanes[key]["weight"], lanes[key]["queued_at"], key[0]),
+            ))
+        return order
+
+    def _new_time_cycle(
+        self,
+        available: dict[tuple[str, str], Any],
+        policy: SourcePolicy,
+        now: float,
+        previous: dict[str, Any] | None = None,
+        *,
+        preserve_current: bool = False,
+    ) -> dict[str, Any]:
+        """Create/rebase a cycle from ready model/source FIFO heads.
+
+        Budgets are measured in actual claimed-job execution seconds.  When a
+        new lane becomes ready mid-cycle, only the *remaining* horizon is
+        divided again; execution already charged to a previous lane is never
+        erased.  That makes an empty lane work-conserving without allowing a
+        reactivated lane to wait forever.
+        """
+        previous = previous or {}
+        total_used = min(
+            SCHEDULING_HORIZON_SECONDS, float(previous.get("total_used", 0.0)),
+        )
+        remaining = max(0.0, SCHEDULING_HORIZON_SECONDS - total_used)
+        weights = {
+            key: float(policy.weight(row["source"]) or 1.0)
+            for key, row in available.items()
+        }
+        weight_total = sum(weights.values())
+        old_lanes = previous.get("lanes", {})
+        lanes: dict[tuple[str, str], dict[str, Any]] = {}
+        for key, row in available.items():
+            used = float(old_lanes.get(key, {}).get("used", 0.0))
+            lanes[key] = {
+                "source": key[0],
+                "model": key[1],
+                "weight": weights[key],
+                "queued_at": row["queued_at"] if row["queued_at"] is not None else row["created"],
+                "used": used,
+                "budget": used + (remaining * weights[key] / weight_total if weight_total else 0.0),
+            }
+        current = previous.get("current") if preserve_current else None
+        if current not in lanes:
+            current = None
+        return {
+            "started_at": previous.get("started_at", now),
+            "signature": self._policy_signature(policy),
+            "total_used": total_used,
+            "lanes": lanes,
+            "order": self._lane_order(lanes),
+            "current": current,
+        }
+
+    @staticmethod
+    def _budget_remaining(lane: dict[str, Any]) -> bool:
+        # A tiny tolerance avoids treating a floating-point round-off as a
+        # distinct dispatchable time slice.
+        return lane["used"] + 1e-9 < lane["budget"]
+
+    def _time_batch_pick(
+        self,
+        candidates,
+        policy: SourcePolicy,
+        now: float,
+        cycle: dict[str, Any] | None = None,
+    ) -> tuple[Any | None, dict[str, Any] | None, dict[str, Any]]:
+        """Select a source FIFO head using contiguous weighted time batches."""
+        available = self._source_heads(candidates)
+        if not available:
+            return None, cycle, {}
+        signature = self._policy_signature(policy)
+        if cycle is None or cycle.get("total_used", 0.0) >= SCHEDULING_HORIZON_SECONDS:
+            cycle = self._new_time_cycle(available, policy, now)
+        elif cycle.get("signature") != signature:
+            # A hot policy change takes effect at the next non-preemptive job
+            # boundary.  The active request has already completed here.
+            cycle = self._new_time_cycle(available, policy, now, cycle)
+        elif any(key not in cycle.get("lanes", {}) for key in available):
+            # A source/model lane became ready after an empty/failing period.
+            # Preserve the current contiguous batch, but divide the remaining
+            # horizon so the returning lane receives bounded service.
+            cycle = self._new_time_cycle(
+                available, policy, now, cycle, preserve_current=True,
+            )
+
+        selected_key = cycle.get("current")
+        if (
+            selected_key not in available
+            or selected_key not in cycle["lanes"]
+            or not self._budget_remaining(cycle["lanes"][selected_key])
+        ):
+            selected_key = next(
+                (
+                    key for key in cycle["order"]
+                    if key in available and self._budget_remaining(cycle["lanes"][key])
+                ),
+                None,
+            )
+        if selected_key is None:
+            # All ready planned lanes exhausted their allocations, or planned
+            # lanes are empty.  Start the next horizon from what is ready so
+            # no GPU time is intentionally left idle.
+            cycle = self._new_time_cycle(available, policy, now)
+            selected_key = next(
+                key for key in cycle["order"] if key in available
+            )
+
+        cycle["current"] = selected_key
+        selected = available[selected_key]
+        lane = cycle["lanes"][selected_key]
+        eligible_sources = sorted({row["source"] for row in available.values()})
+        decision = {
+            "mode": "time_batch",
+            "reason": "60-minute weighted time batch with model affinity",
+            "eligible_sources": eligible_sources,
+            "active_weights": {
+                source: weight for source, weight in self._policy_signature(policy)
+            },
+            "selected_source": selected["source"],
+            "selected_model": selected_key[1],
+            "horizon_seconds": SCHEDULING_HORIZON_SECONDS,
+            "time_budget_seconds": round(lane["budget"], 6),
+            "time_used_seconds": round(lane["used"], 6),
+        }
+        return selected, cycle, decision
+
+    @staticmethod
+    def _record_time_usage(
+        cycle: dict[str, Any] | None,
+        lane_key: tuple[str, str],
+        elapsed: float,
+    ) -> None:
+        if cycle is None or lane_key not in cycle.get("lanes", {}):
+            return
+        charged = max(0.0, float(elapsed))
+        lane = cycle["lanes"][lane_key]
+        lane["used"] += charged
+        cycle["total_used"] += charged
+
+    @staticmethod
+    def _forecast_duration(
+        lane_key: tuple[str, str], estimates: dict[tuple[str, str], float],
+    ) -> float:
+        return max(1.0, float(estimates.get(lane_key, FORECAST_DEFAULT_EXECUTION_SECONDS)))
+
+    def _publish_scheduler_snapshot(self) -> None:
+        self._scheduler_snapshot = {
+            "time_cycle": deepcopy(self._time_cycle),
+            "duration_estimates": dict(self._duration_estimates),
+            "active_time_batch": deepcopy(self._active_time_batch),
+            "last": dict(self._last_scheduler_decision)
+            if getattr(self, "_last_scheduler_decision", None) else None,
+        }
+
+    def _complete_time_batch(self, finished: float) -> None:
+        """Charge one completed non-preemptive attempt to its selected lane."""
+        active = self._active_time_batch
+        if active is None:
+            return
+        lane = tuple(active["lane"])
+        elapsed = max(0.0, float(finished) - float(active["started"]))
+        self._record_time_usage(self._time_cycle, lane, elapsed)
+        previous = self._duration_estimates.get(lane)
+        self._duration_estimates[lane] = (
+            elapsed if previous is None else ((previous + elapsed) / 2.0)
+        )
+        self._active_time_batch = None
+        self._publish_scheduler_snapshot()
 
     def _next(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None):
-        # With a policy, sources share the GPU only by their configured weight;
-        # each selected source contributes its FIFO head.
+        # Without policy, retain the durable global FIFO compatibility path.
+        # With policy, dispatch source FIFO heads in contiguous target-model
+        # batches charged against a recurring 60-minute execution horizon.
+        if policy is not None and allowed_sources is None:
+            allowed_sources = policy.enabled_sources()
         candidates = self._candidates(allowed_sources)
         if not candidates:
             self._last_scheduler_decision = None
             self._scheduler_snapshot = None
             return None
-        now = self.clock()
         if policy is None:
             selected = candidates[0]
             decision = {
@@ -974,34 +1193,15 @@ class Broker:
                 "eligible_sources": sorted({row["source"] for row in candidates}),
             }
         else:
-            selected = self._weighted_pick(candidates, policy)
+            selected, self._time_cycle, decision = self._time_batch_pick(
+                candidates, policy, self.clock(), self._time_cycle,
+            )
             if selected is None:
                 self._last_scheduler_decision = None
                 self._scheduler_snapshot = None
                 return None
-            decision = {
-                "mode": "weighted_round_robin",
-                "reason": "weight-only source selection",
-                "eligible_sources": sorted({row["source"] for row in candidates}),
-            }
-        policy_sources = policy.snapshot().get("sources", {}) if policy is not None else {}
-        active_weights = {
-            source: float(entry["weight"])
-            for source, entry in sorted(policy_sources.items())
-            if entry.get("enabled", True)
-        }
-        self._last_scheduler_decision = {
-            "mode": decision["mode"],
-            "reason": decision["reason"],
-            "eligible_sources": decision["eligible_sources"],
-            "active_weights": active_weights,
-            "selected_source": selected["source"],
-            "selected_model": PROFILES[selected["profile"]].model,
-        }
-        self._scheduler_snapshot = {
-            "accumulator": dict(self._weight_accumulator),
-            "last": dict(self._last_scheduler_decision),
-        }
+        self._last_scheduler_decision = dict(decision)
+        self._publish_scheduler_snapshot()
         return selected
 
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None) -> bool:
@@ -1045,6 +1245,12 @@ class Broker:
                 attempt_no=attempt_no, from_state="queued", to_state="running",
                 occurred=now, metadata={"lease_until": lease_until},
             )
+            if policy is not None:
+                self._active_time_batch = {
+                    "lane": self._lane_key(row),
+                    "started": now,
+                }
+                self._publish_scheduler_snapshot()
             interval = PROFILES[row["profile"]].min_interval_seconds
             if interval:
                 self.db.execute(
@@ -1066,6 +1272,7 @@ class Broker:
         except Exception as exc:
             with self.lock, self.db:
                 finished = self.clock()
+                self._complete_time_batch(finished)
                 self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (finished, str(exc), row["id"]))
                 self.db.execute(
                     "UPDATE job_attempts SET finished=?,outcome='failed',error=? "
@@ -1135,6 +1342,7 @@ class Broker:
                 attempt_no=attempt_no, from_state=state, to_state=final,
                 reason=reason, occurred=finished,
             )
+            self._complete_time_batch(finished)
             self._refresh_health_cache_locked()
             self.completed.notify_all()
 

@@ -2,8 +2,8 @@
 
 Этот слой нужен для сравнения scheduler algorithms на исторических данных. Он
 не меняет действующий выбор: без runtime policy остаётся global FIFO,
-с policy — model-aware batch scheduler (weighted выбор источника внутри
-модельного батча, FIFO внутри источника, starvation guard по wait-debt).
+с policy — model-aware scheduler с 60-минутными weighted time batches,
+FIFO head внутри source и non-preemptive границами batch.
 
 ## Что сохраняется
 
@@ -73,39 +73,23 @@ Correlation lookup возвращает только job/source/profile/state/ti
 - throughput completed/hour и success rate;
 - avg/p50/p95/max для трёх latency classes.
 
-Scheduler window показывает actual selection count/share и expected share.
-Expected share рассчитывается на каждом решении только среди sources, которые
-тогда действительно были hard-eligible. Weight `w` имеет expected share,
-пропорциональную `1 / w`; это не штрафует scheduler за пустую очередь,
-rate limit или disabled source.
-`fairness_ratio=1` и малый
-`absolute_share_error` означают близость actual share к доступной weighted цели.
-
-Пример: 12 dispatch opportunities при постоянно заполненных очередях, weights
-`source-a=2`, `source-b=6`:
-
-```json
-{
-  "selections": 12,
-  "modes": {"weighted_round_robin": 12},
-  "sources": {
-    "source-a": {"selected": 9, "fairness_ratio": 1.0},
-    "source-b": {"selected": 3, "fairness_ratio": 1.0}
-  }
-}
-```
-
-Lower numeric Weight получает большую share; на коротком окне дискретность
-закономерно даёт отклонение. Для оценки нужны
-одновременно 5 минут, 30 минут, 3 часа и 24 часа.
+Scheduler window сохраняет actual selection count/share и mode. Для
+`time_batch` fairness нельзя выводить из числа jobs: scheduler context каждого
+`scheduler.selected` содержит `horizon_seconds`, `time_budget_seconds` и
+накопленное время lane на момент выбора. Цель — доля **execution time**,
+пропорциональная прямому Weight среди ready lanes. Поэтому при постоянно
+заполненных weights `10` и `8` один 3600-секундный horizon имеет targets
+2000s и 1600s; последний non-preemptive job может дать документированный
+overrun. Disabled, пустые и rate-limited sources не делают GPU idle и не
+считаются нарушением доли.
 
 ## Что сравнивать позже
 
 Алгоритм нельзя менять до накопления baseline и отдельного rollout. Затем на
 одинаковом replay workload безопасно сравниваются:
 
-- reciprocal-weight scheduler — текущий baseline: weight-only выбор source и
-  FIFO внутри source;
+- time-batch scheduler — текущий baseline: 60-минутная прямая доля времени,
+  model affinity и FIFO внутри source;
 - deficit round robin — лучше учитывает разную стоимость job, если появится
   надёжная оценка cost;
 - weighted fair queue — полезен при нескольких непрерывно загруженных sources,

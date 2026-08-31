@@ -94,8 +94,8 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
 - `GET /dashboard` — локальная auto-refresh HTML-панель очереди без payload,
   результатов и ошибок. Она показывает policy (`enabled`, `weight`),
   состояния, lease, retry/delay, активные jobs, completed total/1h/24h и
-  read-only **Forecast** под активными jobs: текущую модель и bounded список
-  следующих weight-only выборов с configured Weight. Forecast помечен как
+  read-only **Forecast** под активными jobs: текущую модель и список следующих
+  десяти выборов тех же model-aware time batches с configured Weight. Forecast помечен как
   contingent: он меняется при новых admissions, завершениях и hot reload
   policy, и никогда не мутирует очередь/leases/аккумуляторы. Машинный
   payload-free снимок доступен как `GET /v1/dashboard` (тот же `forecast`),
@@ -107,7 +107,7 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
   ноль: в текущей модели broker исчерпанная работа —
   terminal `failed`, отдельного state `dead` нет.
 - `GET /v1/forecast` — read-only проекция ближайших выборов scheduler
-  (bounded, по умолчанию 5, максимум 20): текущая модель и следующие
+  (bounded, по умолчанию 10, максимум 20): текущая модель и следующие
   selections с source/model/weight/mode/reason/wait. Проекция
   не пишет в БД и не меняет состояние scheduler; при занятой БД возвращает
   `unavailable` вместо вымышленной пустоты.
@@ -176,10 +176,16 @@ durable `queued`. Это позволяет включить обратимый 
 }
 ```
 
-Выбор при наличии policy — только weighted round-robin по source. Weight `1`
-самый важный: effective share равна `1 / weight`, поэтому Weight `2` получает
-примерно в три раза больше выборов, чем Weight `6`, пока оба hard-eligible.
-Внутри source сохраняется FIFO; возраст job и модель не меняют долю.
+При наличии policy scheduler строит повторяющийся 60-минутный execution-time
+horizon для готовых FIFO heads, сгруппированных по `(source, target model)`.
+Weight — прямая доля времени: при готовых Olya Vision / Gemma `10` и
+Shutterstock Video / Nemotron `8` их budgets равны `10/18` = 33m20s и
+`8/18` = 26m40s. Внутри source сохраняется FIFO, а одинаковые target model
+исполняются непрерывным batch, чтобы не unload/load модель после каждого job.
+Job не preempt-ится: целиком измеренное `finished - started` списывается с
+текущего batch, поэтому последний job вправе пересечь его границу. Если lane
+пуста, disabled или временно не eligible, другой ready lane берёт capacity;
+вернувшаяся lane получает долю оставшегося horizon на ближайшей job boundary.
 
 ### Safe dispatcher drain
 
@@ -195,9 +201,9 @@ systemctl --user reload ollama-inference-broker.service
 эта команда сигнализирует весь service cgroup, включая дочерний `curl` активного
 inference, и может прервать job.
 
-Источники делят GPU через deterministic reciprocal-weight round-robin с
-вращающимся accumulator; hard eligibility включает FIFO, per-source concurrency
-и min-interval backpressure. Waiting time никогда не меняет долю и не вызывает
+Источники делят GPU через model-affine weighted time batches; hard eligibility
+включает FIFO, per-source concurrency и min-interval backpressure. Время
+учитывается по исполнению, а не по числу jobs; waiting time не вызывает
 preemption.
 Итоговый allowlist берётся из `enabled`-записей файла, а не из env.
 `GET /v1/sources` отдаёт текущий снапшот политики (без секретов). При
@@ -206,15 +212,15 @@ preemption.
 Канонический production policy хранится в `config/sources.production.json`:
 веса Shutterstock Video / Olya Vision / Olya Decision остаются `3/8/6`, а
 отдельный source `syncopia-telegram-memory` имеет scheduler weight ровно `4`.
-`weight` — единственный scheduling-параметр: он задаёт долю source в weighted
-scheduler. Policy с неизвестным ключом отклоняется, чтобы конфигурация не могла
+`weight` — единственный scheduling-параметр: он задаёт прямую долю source в
+time-batch scheduler. Policy с неизвестным ключом отклоняется, чтобы конфигурация не могла
 молча стать default `1.0`.
 
-### User-facing Weight (1 highest … 10 lowest)
+### User-facing Weight (1 lowest … 10 highest)
 
-Weight — единственный soft scheduling input. **1 — самый важный, 10 — самый
-низкий**; lower numeric Weight получает большую относительную частоту. Weight
-не является deadline и не меняется с возрастом job.
+Weight — единственный soft scheduling input. **10 — самая большая доля
+execution time, 1 — самая маленькая**. Weight не является deadline и не
+меняется с возрастом job.
 
 `POST /v1/shutterstock-video/generate` — синхронный bounded контракт локального
 видео-чанка (profile `shutterstock-video`, `nemotron3:33b`): принимает `prompt`,

@@ -240,8 +240,8 @@ def render(data: dict[str, Any]) -> bytes:
             ) or "<tr><td colspan=7>None queued</td></tr>"
             forecast_html = (
                 "<h2>Forecast</h2>"
-                f"<p>Current model: <b>{current_model}</b> · Weight 1 is most important; "
-                "lower Weight receives a larger scheduling share.</p>"
+                f"<p>Current model: <b>{current_model}</b> · Higher Weight receives a "
+                "larger 60-minute execution-time allocation.</p>"
                 "<table><thead><tr><th>Job</th><th>Source</th><th>Model</th>"
                 "<th>Weight</th><th>Mode</th><th>Reason</th><th>Wait</th></tr></thead>"
                 f"<tbody>{selection_rows}</tbody></table>"

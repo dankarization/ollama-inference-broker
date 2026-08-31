@@ -192,7 +192,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                     self._json(400, {"error":"window must be positive seconds up to one year"})
             elif path == "/v1/forecast":
                 try:
-                    limit = int(query.get("limit", ["5"])[0])
+                    limit = int(query.get("limit", ["10"])[0])
                     self._json(200, broker.forecast(policy, limit=limit))
                 except ValueError:
                     self._json(400, {"error":"limit must be an integer"})
