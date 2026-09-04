@@ -28,6 +28,17 @@ OBSERVER_READ_DEADLINE_SECONDS = 0.75
 SCHEDULING_HORIZON_SECONDS = 60 * 60
 FORECAST_DEFAULT_EXECUTION_SECONDS = 300.0
 
+
+class SourceAdmissionBlocked(Exception):
+    """A source policy rejected admission before a job was persisted."""
+
+    code = "source_admission_blocked"
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+        super().__init__(f"new admissions are blocked for source {source!r}")
+
+
 class SourcePolicy:
     """Runtime-reloadable per-source weights and enablement.
 
@@ -102,10 +113,15 @@ class SourcePolicy:
             entry = self._sources.get(source)
             return entry["weight"] if entry else None
 
-    def set_weight(self, source: str, weight: Any) -> int:
-        """Atomically update one configured source with a dashboard-safe weight."""
-        if isinstance(weight, bool) or not isinstance(weight, int) or not 1 <= weight <= 10:
-            raise SourcePolicyError("weight must be an integer from 1 through 10")
+    def admission_allowed(self, source: str) -> bool:
+        """Default old policy entries and unknown sources to admission allowed."""
+        with self._lock:
+            self._load_locked()
+            entry = self._sources.get(source)
+            return True if entry is None else entry["admission_allowed"]
+
+    def _mutate_source(self, source: str, field: str, value: Any) -> Any:
+        """Serialize and durably atomically replace one source policy field."""
         with self._lock:
             try:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
@@ -114,10 +130,10 @@ class SourcePolicy:
                 raise SourcePolicyError("policy is unavailable or invalid") from error
             if source not in normalized:
                 raise SourcePolicyError(f"source {source!r} is not configured")
-
-            raw["sources"][source]["weight"] = weight
+            raw["sources"][source][field] = value
+            temporary: str | None = None
             try:
-                original_mode = self.path.stat().st_mode & 0o7777
+                mode = self.path.stat().st_mode & 0o7777
                 descriptor, temporary = tempfile.mkstemp(
                     prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent,
                 )
@@ -126,40 +142,39 @@ class SourcePolicy:
                     handle.write("\n")
                     handle.flush()
                     os.fsync(handle.fileno())
-                os.chmod(temporary, original_mode)
+                os.chmod(temporary, mode)
                 os.replace(temporary, self.path)
-            except OSError as error:
+                directory = os.open(self.path.parent, os.O_RDONLY)
                 try:
-                    os.unlink(temporary)
-                except (OSError, UnboundLocalError):
-                    pass
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            except OSError as error:
+                if temporary is not None:
+                    try:
+                        os.unlink(temporary)
+                    except OSError:
+                        pass
                 raise SourcePolicyError("unable to save policy") from error
             self._signature = None
             self._load_locked()
-            return weight
+            return value
+
+    def set_weight(self, source: str, weight: Any) -> int:
+        """Atomically update one configured source with a dashboard-safe weight."""
+        if isinstance(weight, bool) or not isinstance(weight, int) or not 1 <= weight <= 10:
+            raise SourcePolicyError("weight must be an integer from 1 through 10")
+        return self._mutate_source(source, "weight", weight)
 
     def set_enabled(self, source: str, enabled: Any) -> bool:
         if not isinstance(enabled, bool):
             raise SourcePolicyError("enabled must be a boolean")
-        with self._lock:
-            try:
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
-                normalized = normalize_source_policy(raw)
-            except (OSError, ValueError, SourcePolicyError) as error:
-                raise SourcePolicyError("policy is unavailable or invalid") from error
-            if source not in normalized:
-                raise SourcePolicyError(f"source {source!r} is not configured")
-            raw["sources"][source]["enabled"] = enabled
-            try:
-                mode = self.path.stat().st_mode & 0o7777
-                descriptor, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent)
-                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    json.dump(raw, handle, indent=2, sort_keys=True); handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
-                os.chmod(temporary, mode); os.replace(temporary, self.path)
-            except OSError as error:
-                raise SourcePolicyError("unable to save policy") from error
-            self._signature = None; self._load_locked()
-            return enabled
+        return self._mutate_source(source, "enabled", enabled)
+
+    def set_admission_allowed(self, source: str, allowed: Any) -> bool:
+        if not isinstance(allowed, bool):
+            raise SourcePolicyError("allowed must be a boolean")
+        return self._mutate_source(source, "admission_allowed", allowed)
 
 
 class Broker:
@@ -193,10 +208,25 @@ class Broker:
         self._active_time_batch: dict[str, Any] | None = None
         # Immutable copy written under the lock for the lock-free forecast.
         self._scheduler_snapshot: dict[str, Any] | None = None
+        self.source_policy: SourcePolicy | None = None
         self._init_db()
         self.recover()
         with self.lock:
             self._refresh_health_cache_locked()
+
+    def use_source_policy(self, policy: SourcePolicy | None) -> None:
+        """Install the shared hot-reload policy used by HTTP admissions."""
+        self.source_policy = policy
+
+    def audit_source_control(
+        self, event_type: str, source: str, metadata: dict[str, Any]
+    ) -> None:
+        """Persist payload-free evidence of a successful source policy change."""
+        with self.lock, self.db:
+            self._audit(
+                event_type, source=source, reason="runtime source policy changed",
+                metadata=metadata,
+            )
 
     def _refresh_health_cache_locked(self) -> None:
         queued = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0]
@@ -505,6 +535,19 @@ class Broker:
         external_id = self._correlation_value("external_id", external_id)
         job_id, now = str(uuid.uuid4()), self.clock()
         with self.lock, self.db:
+            if self.source_policy is not None and not self.source_policy.admission_allowed(source):
+                self._audit(
+                    "admission.rejected", source=source,
+                    reason="source admission policy blocked new jobs", occurred=now,
+                    metadata={
+                        "code": SourceAdmissionBlocked.code,
+                        "profile": profile,
+                        "kind": kind,
+                    },
+                )
+                # Rejection itself is durable observability, despite aborting admission.
+                self.db.commit()
+                raise SourceAdmissionBlocked(source)
             if source in {"olya-vision", "olya-decision", "syncopia-telegram-memory"} and external_id is not None:
                 existing = self.db.execute(
                     "SELECT id FROM jobs WHERE source=? AND external_id=? "
@@ -531,6 +574,79 @@ class Broker:
             )
             self._refresh_health_cache_locked()
         return self.status(job_id)
+
+    @staticmethod
+    def _bulk_source(source: str) -> str:
+        if not isinstance(source, str) or not source.strip() or len(source) > 256:
+            raise ValueError("source must be a non-empty string up to 256 characters")
+        return source.strip()
+
+    def bulk_cancel_queued(self, source: str) -> dict[str, Any]:
+        """Cancel only queued jobs for one exact source in one transaction."""
+        source = self._bulk_source(source)
+        now = self.clock()
+        with self.lock, self.db:
+            rows = list(self.db.execute(
+                "SELECT id,attempt_count FROM jobs WHERE source=? AND state='queued' "
+                "ORDER BY queued_at,id", (source,),
+            ))
+            for row in rows:
+                self.db.execute(
+                    "UPDATE jobs SET state='cancelled',finished=? "
+                    "WHERE id=? AND state='queued'", (now, row["id"]),
+                )
+                self._audit(
+                    "job.cancelled", job_id=row["id"], source=source,
+                    attempt_no=row["attempt_count"] or None,
+                    from_state="queued", to_state="cancelled",
+                    reason="bulk source cancellation", occurred=now,
+                )
+            count = len(rows)
+            self._audit(
+                "source.bulk_cancel", source=source,
+                reason="bulk queued cancellation", occurred=now,
+                metadata={"cancelled": count},
+            )
+            self._refresh_health_cache_locked()
+            self.completed.notify_all()
+        return {"source": source, "cancelled": count}
+
+    def bulk_retry_failed(self, source: str) -> dict[str, Any]:
+        """Requeue only failed jobs while retaining attempts and audit history."""
+        source = self._bulk_source(source)
+        now = self.clock()
+        with self.lock, self.db:
+            rows = list(self.db.execute(
+                "SELECT id,attempt_count FROM jobs WHERE source=? AND state='failed' "
+                "ORDER BY finished,id", (source,),
+            ))
+            for row in rows:
+                attempt_no = row["attempt_count"] or None
+                self._audit(
+                    "job.retry_requested", job_id=row["id"], source=source,
+                    attempt_no=attempt_no, from_state="failed",
+                    reason="bulk source retry", occurred=now,
+                )
+                self.db.execute(
+                    "UPDATE jobs SET state='queued',queued_at=?,started=NULL,finished=NULL,"
+                    "lease_until=NULL,error=NULL,switch_reason=NULL,result_json=NULL,"
+                    "retry_count=retry_count+1 WHERE id=? AND state='failed'",
+                    (now, row["id"]),
+                )
+                self._audit(
+                    "job.requeued", job_id=row["id"], source=source,
+                    attempt_no=attempt_no, from_state="failed", to_state="queued",
+                    reason="bulk source retry", occurred=now,
+                )
+            count = len(rows)
+            self._audit(
+                "source.bulk_retry", source=source,
+                reason="bulk failed retry", occurred=now,
+                metadata={"retried": count},
+            )
+            self._refresh_health_cache_locked()
+            self.completed.notify_all()
+        return {"source": source, "retried": count}
 
     @staticmethod
     def _correlation_value(name: str, value: str | None) -> str | None:

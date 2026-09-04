@@ -170,8 +170,8 @@ durable `queued`. Это позволяет включить обратимый 
 {
   "version": 1,
   "sources": {
-    "shutterstock-video": {"enabled": true, "weight": 2.0},
-    "pilot-mainpc":      {"enabled": true, "weight": 1.0}
+    "shutterstock-video": {"enabled": true, "admission_allowed": true, "weight": 2.0},
+    "pilot-mainpc":      {"enabled": true, "admission_allowed": true, "weight": 1.0}
   }
 }
 ```
@@ -208,6 +208,38 @@ preemption.
 Итоговый allowlist берётся из `enabled`-записей файла, а не из env.
 `GET /v1/sources` отдаёт текущий снапшот политики (без секретов). При
 отсутствии policy поведение — env-allowlist + global FIFO.
+
+### Runtime controls: dispatch и admission — разные состояния
+
+`enabled=false` означает **dispatch pause**: уже queued jobs не меняются,
+текущий running job не прерывается, но после его завершения source не получает
+новую lease. `POST /v1/sources/{source}/dispatch` принимает только
+`{"paused":true|false}`; старый `POST .../enabled` сохраняется без изменения
+контракта. Resume применяется на следующем scheduler tick без рестарта.
+
+`admission_allowed=false` означает **admission block**: все HTTP endpoints,
+которые создают job для этого source, отклоняются до durable job insert с HTTP
+`403` и `error.code="source_admission_blocked"`. Существующая очередь и running
+job не меняются. Поле обратно совместимо: если `admission_allowed` отсутствует
+(или source отсутствует в policy), admission разрешён. Управление:
+`POST /v1/sources/{source}/admission` с `{"allowed":true|false}`.
+
+Bulk operations требуют точное имя configured source и серверное подтверждение
+`{"confirm":true}`:
+
+- `POST /v1/sources/{source}/queued/cancel` переводит только `queued` этого
+  source в `cancelled` и возвращает `cancelled` count;
+- `POST /v1/sources/{source}/failed/retry` переводит только `failed` этого
+  source в новый dispatchable `queued`, увеличивает `retry_count`, сохраняет
+  `attempt_count`, `job_attempts` и audit history и возвращает `retried` count.
+
+Обе операции транзакционны, идемпотентны при повторе и не затрагивают jobs
+другого source либо состояния `running`, `cancel_requested`, `completed` и
+`cancelled`. Каждая policy mutation сериализована, записывается через
+fsync + atomic rename + directory fsync и hot-reloadится. Dashboard показывает
+Dispatch, Admission, counts и подтверждение перед bulk-действиями. Audit events
+содержат только source/job/state/count metadata — payload, result, correlation
+values и error text в control events не копируются.
 
 Канонический production policy хранится в `config/sources.production.json`:
 веса Shutterstock Video / Olya Vision / Olya Decision остаются `3/8/6`, а

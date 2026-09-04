@@ -416,10 +416,10 @@ class SourcePolicyTests(unittest.TestCase):
         from broker.service import SourcePolicy
         policy_path = Path(__file__).resolve().parents[1] / "config" / "sources.production.json"
         self.assertEqual(SourcePolicy(policy_path).snapshot()["sources"], {
-            "shutterstock-video": {"enabled": True, "weight": 3.0},
-            "olya-vision": {"enabled": True, "weight": 8.0},
-            "olya-decision": {"enabled": True, "weight": 6.0},
-            "syncopia-telegram-memory": {"enabled": True, "weight": 4.0},
+            "shutterstock-video": {"enabled": True, "weight": 3.0, "admission_allowed": True},
+            "olya-vision": {"enabled": True, "weight": 8.0, "admission_allowed": True},
+            "olya-decision": {"enabled": True, "weight": 6.0, "admission_allowed": True},
+            "syncopia-telegram-memory": {"enabled": True, "weight": 4.0, "admission_allowed": True},
         })
 
 class WeightedDispatchTests(unittest.TestCase):
