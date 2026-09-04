@@ -57,7 +57,9 @@ class StatusReporterTests(unittest.TestCase):
         handle.close()
         self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
         self.assertEqual(_policy(handle.name), {
-            "defaulted": {"enabled": True, "weight": 1.0},
+            "defaulted": {
+                "enabled": True, "weight": 1.0, "admission_allowed": True,
+            },
         })
 
     def test_policy_rejects_unknown_keys_like_the_dispatcher(self):

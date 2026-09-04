@@ -22,16 +22,25 @@ def normalize_source_policy(raw: Any) -> dict[str, dict[str, Any]]:
             raise SourcePolicyError("source names must be non-empty strings")
         if not isinstance(entry, dict):
             raise SourcePolicyError(f"source {name!r} must be an object")
-        unknown = set(entry) - {"enabled", "weight"}
+        unknown = set(entry) - {"enabled", "weight", "admission_allowed"}
         if unknown:
             raise SourcePolicyError(
                 f"source {name!r} has unknown keys: {', '.join(sorted(unknown))}"
             )
         enabled = entry.get("enabled", True)
+        admission_allowed = entry.get("admission_allowed", True)
         weight = entry.get("weight", 1.0)
         if not isinstance(enabled, bool):
             raise SourcePolicyError(f"source {name!r} enabled must be a boolean")
+        if not isinstance(admission_allowed, bool):
+            raise SourcePolicyError(
+                f"source {name!r} admission_allowed must be a boolean"
+            )
         if isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0:
             raise SourcePolicyError(f"source {name!r} weight must be a positive number")
-        normalized[name] = {"enabled": enabled, "weight": float(weight)}
+        normalized[name] = {
+            "enabled": enabled,
+            "weight": float(weight),
+            "admission_allowed": admission_allowed,
+        }
     return normalized

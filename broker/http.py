@@ -9,13 +9,27 @@ from .compat import (CompatibilityError, stream_frames, submit as submit_compati
 from .profiles import PROFILES
 from .dashboard import render as render_dashboard
 from .policy import SourcePolicyError
+from .service import SourceAdmissionBlocked
+
 
 def serve(broker, host="127.0.0.1", port=8088, policy=None):
+    broker.use_source_policy(policy)
     class Handler(BaseHTTPRequestHandler):
         def _json(self, status, value):
             encoded=json.dumps(value).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
         def _stream(self, status, frames):
             encoded=b"".join(frames); self.send_response(status); self.send_header("Content-Type","application/x-ndjson"); self.send_header("Content-Length",str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
+        def _admission_blocked(self, error):
+            self._json(403, {
+                "error": {"code": error.code, "message": str(error)},
+                "source": error.source,
+                "admission_allowed": False,
+            })
+        def _configured_source(self, source):
+            if policy is None:
+                raise SourcePolicyError("source policy is not configured")
+            if source not in policy.snapshot()["sources"]:
+                raise SourcePolicyError(f"source {source!r} is not configured")
         def do_POST(self):
             size=int(self.headers.get("Content-Length", 0))
             try:
@@ -29,6 +43,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                     self._json(202, broker.submit(body["profile"], body["kind"], body.get("payload", {}),
                                                   body.get("source"), body.get("source_item_id"),
                                                   body.get("external_id")))
+                except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except (KeyError, ValueError) as e: self._json(400, {"error": str(e)})
             elif path.startswith("/v1/jobs/") and path.endswith("/cancel"):
                 result=broker.cancel(path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
@@ -44,6 +59,9 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                     if policy is None:
                         raise SourcePolicyError("source policy is not configured")
                     weight = policy.set_weight(source, body["weight"])
+                    broker.audit_source_control(
+                        "source.weight_changed", source, {"weight": weight}
+                    )
                     self._json(200, {"source": source, "weight": weight})
                 except SourcePolicyError as error:
                     self._json(400, {"error": str(error)})
@@ -53,14 +71,68 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                     if not isinstance(body, dict) or set(body) != {"enabled"}:
                         raise SourcePolicyError("request body must contain only enabled")
                     if policy is None: raise SourcePolicyError("source policy is not configured")
-                    self._json(200, {"source": source, "enabled": policy.set_enabled(source, body["enabled"])})
+                    enabled = policy.set_enabled(source, body["enabled"])
+                    broker.audit_source_control(
+                        "source.dispatch_changed", source,
+                        {"enabled": enabled, "paused": not enabled},
+                    )
+                    self._json(200, {"source": source, "enabled": enabled})
                 except SourcePolicyError as error:
+                    self._json(400, {"error": str(error)})
+            elif path.startswith("/v1/sources/") and path.endswith("/dispatch"):
+                source = unquote(path[len("/v1/sources/"):-len("/dispatch")]).strip("/")
+                try:
+                    if not isinstance(body, dict) or set(body) != {"paused"}:
+                        raise SourcePolicyError("request body must contain only paused")
+                    if not isinstance(body["paused"], bool):
+                        raise SourcePolicyError("paused must be a boolean")
+                    if policy is None: raise SourcePolicyError("source policy is not configured")
+                    enabled = policy.set_enabled(source, not body["paused"])
+                    broker.audit_source_control(
+                        "source.dispatch_changed", source,
+                        {"enabled": enabled, "paused": not enabled},
+                    )
+                    self._json(200, {"source": source, "paused": not enabled, "enabled": enabled})
+                except SourcePolicyError as error:
+                    self._json(400, {"error": str(error)})
+            elif path.startswith("/v1/sources/") and path.endswith("/admission"):
+                source = unquote(path[len("/v1/sources/"):-len("/admission")]).strip("/")
+                try:
+                    if not isinstance(body, dict) or set(body) != {"allowed"}:
+                        raise SourcePolicyError("request body must contain only allowed")
+                    if policy is None: raise SourcePolicyError("source policy is not configured")
+                    allowed = policy.set_admission_allowed(source, body["allowed"])
+                    broker.audit_source_control(
+                        "source.admission_changed", source,
+                        {"admission_allowed": allowed},
+                    )
+                    self._json(200, {"source": source, "admission_allowed": allowed})
+                except SourcePolicyError as error:
+                    self._json(400, {"error": str(error)})
+            elif path.startswith("/v1/sources/") and path.endswith("/queued/cancel"):
+                source = unquote(path[len("/v1/sources/"):-len("/queued/cancel")]).strip("/")
+                try:
+                    if not isinstance(body, dict) or body != {"confirm": True}:
+                        raise SourcePolicyError("bulk cancellation requires {\"confirm\": true}")
+                    self._configured_source(source)
+                    self._json(200, broker.bulk_cancel_queued(source))
+                except (SourcePolicyError, ValueError) as error:
+                    self._json(400, {"error": str(error)})
+            elif path.startswith("/v1/sources/") and path.endswith("/failed/retry"):
+                source = unquote(path[len("/v1/sources/"):-len("/failed/retry")]).strip("/")
+                try:
+                    if not isinstance(body, dict) or body != {"confirm": True}:
+                        raise SourcePolicyError("bulk retry requires {\"confirm\": true}")
+                    self._configured_source(source)
+                    self._json(200, broker.bulk_retry_failed(source))
+                except (SourcePolicyError, ValueError) as error:
                     self._json(400, {"error": str(error)})
             elif path in {"/api/chat", "/api/generate"}:
                 try:
                     job=submit_compatibility(broker, path.rsplit("/", 1)[-1], body)
                     if body.get("stream", True): self._stream(202, stream_frames(job))
                     else: self._json(202, job)
+                except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
             elif path == "/v1/shutterstock-canary/generate":
                 try:
@@ -78,6 +150,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                         self._json(502, {"error": "broker job failed", "job_id": job["id"]})
                     else:
                         self._json(504, {"error": "broker job timed out", "job_id": job["id"]})
+                except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
             elif path == "/v1/shutterstock-video/generate":
                 try:
@@ -95,6 +168,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                         self._json(502, {"error": "broker job failed", "job_id": job["id"]})
                     else:
                         self._json(504, {"error": "broker job timed out", "job_id": job["id"]})
+                except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
             elif path == "/v1/olya-vision/generate":
                 try:
@@ -120,6 +194,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                         self._json(502, {"error": "broker job failed", "job_id": job["id"]})
                     else:
                         self._json(504, {"error": "broker job timed out", "job_id": job["id"]})
+                except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
             elif path == "/v1/olya-decision/generate":
                 try:
@@ -141,6 +216,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                         self._json(502, {"error": "broker job failed", "job_id": job["id"]})
                     else:
                         self._json(504, {"error": "broker job timed out", "job_id": job["id"]})
+                except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
             elif path == "/v1/syncopia-memory/extract":
                 try:
@@ -163,6 +239,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                         self._json(502, {"error": "broker job failed", "job_id": job["id"]})
                     else:
                         self._json(504, {"error": "broker job timed out", "job_id": job["id"]})
+                except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
             else: self._json(404, {"error":"not found"})
         def do_GET(self):

@@ -109,6 +109,8 @@ def snapshot(
             "source": source,
             "scheduler": {
                 "enabled": configured.get("enabled") if isinstance(configured, dict) else (False if policy_active else None),
+                "dispatch_paused": (not configured.get("enabled", True)) if isinstance(configured, dict) else (True if policy_active else None),
+                "admission_allowed": configured.get("admission_allowed", True) if isinstance(configured, dict) else True,
                 "weight": configured.get("weight") if isinstance(configured, dict) else None,
                 "next_allowed": next_allowed,
             },
@@ -181,10 +183,30 @@ def render(data: dict[str, Any]) -> bytes:
         if value is None: return "<td>—</td>"
         source_attribute = html.escape(source, quote=True)
         return (f'<td><form class="enabled-form" data-source="{source_attribute}">'
-                f'<select name="enabled" aria-label="Enabled for {source_attribute}">'
-                f'<option value="true"{" selected" if value else ""}>yes</option>'
-                f'<option value="false"{" selected" if not value else ""}>no</option></select>'
+                f'<select name="enabled" aria-label="Dispatch enabled for {source_attribute}">'
+                f'<option value="true"{" selected" if value else ""}>running</option>'
+                f'<option value="false"{" selected" if not value else ""}>paused</option></select>'
                 '<span class="enabled-feedback" aria-live="polite"></span></form></td>')
+
+    def admission_cell(source: str, value: bool) -> str:
+        source_attribute = html.escape(source, quote=True)
+        return (f'<td><form class="admission-form" data-source="{source_attribute}">'
+                f'<select name="admission" aria-label="Admission for {source_attribute}">'
+                f'<option value="true"{" selected" if value else ""}>allowed</option>'
+                f'<option value="false"{" selected" if not value else ""}>blocked</option></select>'
+                '<span class="admission-feedback" aria-live="polite"></span></form></td>')
+
+    def bulk_cell(source: str, queued: int, failed: int) -> str:
+        source_attribute = html.escape(source, quote=True)
+        return (
+            f'<td><button class="bulk-action" data-source="{source_attribute}" '
+            f'data-action="queued/cancel" data-count="{queued}"'
+            f'{" disabled" if not queued else ""}>Cancel queued ({queued})</button> '
+            f'<button class="bulk-action" data-source="{source_attribute}" '
+            f'data-action="failed/retry" data-count="{failed}"'
+            f'{" disabled" if not failed else ""}>Retry failed ({failed})</button>'
+            '<span class="bulk-feedback" aria-live="polite"></span></td>'
+        )
 
     rows = []
     for item in data["sources"]:
@@ -192,12 +214,14 @@ def render(data: dict[str, Any]) -> bytes:
         rows.append("<tr>" + "".join((
             f"<td>{cell(item['source'])}</td>",
             enabled_cell(item["source"], scheduler['enabled']),
+            admission_cell(item["source"], scheduler["admission_allowed"]),
             weight_cell(item["source"], scheduler["weight"]),
             *(f"<td>{cell(value)}</td>" for value in (
             states["queued"], states["running"], states["lease"], states["retry"], states["delayed"],
             states["failed"], states["cancelled"], states["completed"],
             item["completed_last_hour"], item["completed_last_24_hours"],
             )),
+            bulk_cell(item["source"], states["queued"], states["failed"]),
         )) + "</tr>")
     active = data["active_jobs"]
     active_rows = "".join(
@@ -250,12 +274,12 @@ def render(data: dict[str, Any]) -> bytes:
     overall = data["overall"]
     document = f"""<!doctype html><html lang=en><meta charset=utf-8>
 <meta http-equiv=refresh content=15><title>Ollama broker queue</title>
-<style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}.weight-form{{display:flex;gap:.35rem;align-items:center;justify-content:flex-end}}.weight-feedback{{min-width:4rem;text-align:left}}.weight-feedback.error{{color:#a00}}</style>
+<style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}.weight-form,.enabled-form,.admission-form{{display:flex;gap:.35rem;align-items:center;justify-content:flex-end}}.weight-feedback,.enabled-feedback,.admission-feedback,.bulk-feedback{{min-width:4rem;text-align:left}}.error{{color:#a00}}button{{margin:.15rem}}</style>
 <h1>Ollama inference broker queue</h1><p>Snapshot timestamp: {timestamp_cell(data['timestamp'], tag='code')} · refreshes every 15 seconds.</p>
 {('<p class=error>Showing stale data: ' + html.escape(str(observation.get('reason', 'database observer read unavailable'))) + '.</p>') if observation['state'] == 'stale' else ''}
 <p class=summary>Completed: <b>{overall['states']['completed']}</b> total · <b>{overall['completed_last_hour']}</b> last hour · <b>{overall['completed_last_24_hours']}</b> last 24 hours.</p>
-<h2>Sources</h2><table><thead><tr><th>Source</th><th>Enabled</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=13>None</td></tr>'}</tbody></table>
-<p><small>Delayed queued jobs are blocked by a source min-interval.</small></p>
+<h2>Sources</h2><table><thead><tr><th>Source</th><th>Dispatch</th><th>Admission</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th><th>Bulk actions</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=15>None</td></tr>'}</tbody></table>
+<p><small>Dispatch pause preserves queued jobs and lets a running job finish. Admission block rejects new jobs and does not change the queue. Delayed jobs are waiting for a source min-interval.</small></p>
 <h2>Active jobs</h2><table><thead><tr><th>ID</th><th>Source</th><th>State</th><th>Started</th><th>Lease until</th><th>Attempts</th><th>Retries</th></tr></thead><tbody>{active_rows}</tbody></table>
 {forecast_html}
 <h2>History</h2><table><thead><tr><th>ID</th><th>Source</th><th>Profile</th><th>State</th><th>Finished</th><th>Attempts</th></tr></thead><tbody id=history-body>{history_rows}</tbody></table><div id=history-sentinel data-cursor="{html.escape(str((data.get('history') or [{}])[-1].get('finished','')) + ':' + str((data.get('history') or [{}])[-1].get('id','')), quote=True)}"></div>
@@ -263,6 +287,9 @@ def render(data: dict[str, Any]) -> bytes:
 const bindPolicySelect=(form, field)=>{{ const select=form.elements[field], feedback=form.querySelector('.'+field+'-feedback'); let saved=select.value, desired=saved, saving=false; const flush=async()=>{{ if(saving)return; saving=true; while(desired!==saved){{ const value=desired; feedback.className=field+'-feedback'; feedback.textContent='Saving…'; try {{ const response=await fetch('/v1/sources/'+encodeURIComponent(form.dataset.source)+'/'+field,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{[field]:field==='weight'?Number(value):value==='true'}})}}); const result=await response.json(); if(!response.ok)throw new Error(result.error||'save failed'); saved=String(result[field]); if(desired===value){{ select.value=saved; feedback.textContent='Saved'; }} }} catch(error) {{ if(desired===value){{ select.value=saved; feedback.className=field+'-feedback error'; feedback.textContent=error.message||'Save failed'; break; }} }} }} saving=false; }}; select.addEventListener('change',()=>{{ desired=select.value; flush(); }}); }};
 document.querySelectorAll('.weight-form').forEach(form=>bindPolicySelect(form,'weight'));
 document.querySelectorAll('.enabled-form').forEach(form=>bindPolicySelect(form,'enabled'));
+const bindAdmissionSelect=form=>{{ const select=form.elements.admission, feedback=form.querySelector('.admission-feedback'); let saved=select.value, desired=saved, saving=false; const flush=async()=>{{ if(saving)return; saving=true; while(desired!==saved){{ const value=desired; feedback.className='admission-feedback'; feedback.textContent='Saving…'; try {{ const response=await fetch('/v1/sources/'+encodeURIComponent(form.dataset.source)+'/admission',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{allowed:value==='true'}})}}); const result=await response.json(); if(!response.ok)throw new Error(result.error||'save failed'); saved=String(result.admission_allowed); if(desired===value){{ select.value=saved; feedback.textContent='Saved'; }} }} catch(error) {{ if(desired===value){{ select.value=saved; feedback.className='admission-feedback error'; feedback.textContent=error.message||'Save failed'; break; }} }} }} saving=false; }}; select.addEventListener('change',()=>{{desired=select.value;flush();}}); }};
+document.querySelectorAll('.admission-form').forEach(bindAdmissionSelect);
+document.querySelectorAll('.bulk-action').forEach(button=>button.addEventListener('click',async()=>{{ const count=Number(button.dataset.count), source=button.dataset.source, action=button.dataset.action; if(!window.confirm(action==='queued/cancel'?'Cancel '+count+' queued jobs for '+source+'?':'Retry '+count+' failed jobs for '+source+'?'))return; const feedback=button.parentElement.querySelector('.bulk-feedback'); button.parentElement.querySelectorAll('button').forEach(item=>item.disabled=true); try {{ const response=await fetch('/v1/sources/'+encodeURIComponent(source)+'/'+action,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{confirm:true}})}}); const result=await response.json(); if(!response.ok)throw new Error(result.error||'operation failed'); feedback.textContent=String(result.cancelled??result.retried)+' changed'; }} catch(error) {{ feedback.className='bulk-feedback error'; feedback.textContent=error.message||'Operation failed'; }} }}));
 const sentinel=document.querySelector('#history-sentinel'); let loading=false; const historyBody=document.querySelector('#history-body'); const displayTime=value=>new Date(Number(value)*1000).toLocaleString('en-GB',{{timeZone:'Asia/Tbilisi'}}); new IntersectionObserver(async entries => {{ if(loading||!entries[0].isIntersecting||!sentinel.dataset.cursor) return; loading=true; const response=await fetch('/v1/history?limit=30&cursor='+encodeURIComponent(sentinel.dataset.cursor)); const page=await response.json(); (page.items||[]).forEach(row=>{{ const tr=document.createElement('tr'); tr.dataset.historyId=row.id; [row.id,row.source,row.profile,row.state,displayTime(row.finished),row.attempt_count].forEach(value=>{{ const td=document.createElement('td'); td.textContent=String(value); tr.append(td); }}); historyBody.append(tr); }}); sentinel.dataset.cursor=page.next_cursor||''; loading=false; }}).observe(sentinel);
 </script>
 """

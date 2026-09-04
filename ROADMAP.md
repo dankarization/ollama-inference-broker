@@ -61,6 +61,10 @@ order.
   payload-free correlation lookup, per-source latency/throughput/error metrics,
   scheduler decision context и fairness windows. Действующий scheduler не
   изменён.
+- [x] Добавлены независимые hot runtime controls: dispatch pause/resume без
+  прерывания running job, admission allow/block до durable insert, exact-source
+  bulk cancel queued и bulk retry failed с сохранением attempt/audit history.
+  Policy writes атомарны и сериализованы; dashboard требует подтверждение bulk.
 - [ ] Добавить health checks за пределами локального `/healthz`, dashboards и
   alerts поверх накопленной истории.
 - [ ] Публиковать данные MAIN-PC о VRAM и loaded models только при отдельно
