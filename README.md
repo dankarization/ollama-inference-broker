@@ -244,6 +244,12 @@ values и error text в control events не копируются.
 Канонический production policy хранится в `config/sources.production.json`:
 веса Shutterstock Video / Olya Vision / Olya Decision остаются `3/8/6`, а
 отдельный source `syncopia-telegram-memory` имеет scheduler weight ровно `4`.
+Изолированный text-only source `uncensored-eval` принимает только семь
+server-owned Qwen 3.8 comparison profiles. Для них `num_ctx=65536` — нормальный
+режим сравнения; caller может явно выбрать до `131072` только для stress-test.
+Output ограничен `8192`, concurrency `1`, а MTP/draft-параметры и изображения
+fail-closed. Его production weight настраивается отдельно и не задаётся этим
+feature commit.
 `weight` — единственный scheduling-параметр: он задаёт прямую долю source в
 time-batch scheduler. Policy с неизвестным ключом отклоняется, чтобы конфигурация не могла
 молча стать default `1.0`.

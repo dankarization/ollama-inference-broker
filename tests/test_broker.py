@@ -110,6 +110,52 @@ class BrokerTests(unittest.TestCase):
                 "prompt": "photo", "images": ["aGVsbG8="], "format": {},
             }, source="shutterstock")
 
+    def test_uncensored_eval_profiles_are_source_scoped_text_only_and_128k_bounded(self):
+        cases = {
+            "uncensored-eval-rvn-iq2m": "qwen3.8:unc-rvn-iq2m",
+            "uncensored-eval-rvn-iq2s": "qwen3.8:unc-rvn-iq2s",
+            "uncensored-eval-rvn-iq2xs": "qwen3.8:unc-rvn-iq2xs",
+            "uncensored-eval-rvn-iq2xxs": "qwen3.8:unc-rvn-iq2xxs",
+            "uncensored-eval-huihui-q2kxl": "qwen3.8:unc-huihui-q2kxl",
+            "uncensored-eval-unleashed-q2kxl": "qwen3.8:unc-unleashed-q2kxl",
+            "uncensored-eval-hauhau-iq2m": "qwen3.8:unc-hauhau-iq2m",
+        }
+        for profile, model in cases.items():
+            with self.subTest(profile=profile):
+                broker = self.make([model])
+                job = broker.submit(
+                    profile, "generate", {"prompt": "compare", "options": {"num_ctx": 999_999}},
+                    source="uncensored-eval",
+                )
+                self.assertEqual(job["source"], "uncensored-eval")
+                self.assertTrue(broker.dispatch_once(frozenset({"uncensored-eval"})))
+                request = next(
+                    call[2] for call in self.ol.calls
+                    if isinstance(call, tuple) and call[0] == "run" and call[2].get("prompt") == "compare"
+                )
+                self.assertEqual(request["model"], model)
+                self.assertEqual(request["options"], {"num_ctx": 131_072, "num_predict": 8_192})
+                self.assertEqual(request["_broker_timeout_seconds"], 7_200)
+
+        broker = self.make([cases["uncensored-eval-rvn-iq2s"]])
+        job = broker.submit(
+            "uncensored-eval-rvn-iq2s", "generate", {"prompt": "normal"},
+            source="uncensored-eval",
+        )
+        broker.dispatch_once(frozenset({"uncensored-eval"}))
+        request = next(
+            call[2] for call in self.ol.calls
+            if isinstance(call, tuple) and call[0] == "run" and call[2].get("prompt") == "normal"
+        )
+        self.assertEqual(request["options"], {"num_ctx": 65_536, "num_predict": 8_192})
+        self.assertEqual(broker.status(job["id"])["state"], "completed")
+        with self.assertRaisesRegex(ValueError, "source uncensored-eval"):
+            broker.submit("uncensored-eval-rvn-iq2s", "generate", {"prompt": "wrong"}, source="olya-decision")
+        with self.assertRaisesRegex(ValueError, "text-only"):
+            broker.submit("uncensored-eval-rvn-iq2s", "generate", {"prompt": "media", "images": ["aGVsbG8="]}, source="uncensored-eval")
+        with self.assertRaisesRegex(ValueError, "MTP/draft"):
+            broker.submit("uncensored-eval-rvn-iq2s", "generate", {"prompt": "draft", "options": {"num_draft": 4}}, source="uncensored-eval")
+
     def test_dispatch_allowlist_leaves_non_pilot_work_queued(self):
         b=self.make(["nemotron3:33b"])
         blocked=b.submit("interactive", "generate", {"prompt":"do not run"})["id"]

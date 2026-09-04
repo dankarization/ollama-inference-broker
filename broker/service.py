@@ -14,11 +14,13 @@ from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
 from .dashboard import snapshot as dashboard_snapshot
-from .compat import (CompatibilityError, validate_olya_decision_payload,
+from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES,
+                     validate_olya_decision_payload,
                      validate_olya_vision_payload,
                      validate_shutterstock_canary_payload,
                      validate_shutterstock_video_payload,
-                     validate_syncopia_memory_payload)
+                     validate_syncopia_memory_payload,
+                     validate_uncensored_eval_payload)
 from .profiles import PROFILES
 from .policy import SourcePolicyError, normalize_source_policy
 
@@ -529,6 +531,13 @@ class Broker:
                     "tools": [],
                     "stream": False,
                 })
+            except CompatibilityError as exc:
+                raise ValueError(str(exc)) from exc
+        if profile in UNCENSORED_EVAL_PROFILES:
+            if source != "uncensored-eval":
+                raise ValueError("uncensored evaluation profiles must use source uncensored-eval")
+            try:
+                payload = validate_uncensored_eval_payload(payload)
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
         source_item_id = self._correlation_value("source_item_id", source_item_id)
@@ -1429,7 +1438,8 @@ class Broker:
             raise RuntimeError("target model did not become ready")
         payload = json.loads(row["payload"])
         options = dict(payload.get("options", {}))
-        options["num_ctx"] = min(int(options.get("num_ctx", profile.max_context)), profile.max_context)
+        default_context = profile.default_context or profile.max_context
+        options["num_ctx"] = min(int(options.get("num_ctx", default_context)), profile.max_context)
         options["num_predict"] = min(int(options.get("num_predict", profile.max_output)), profile.max_output)
         request = {k: v for k, v in payload.items() if k not in {"model", "keep_alive"}}
         request.update({"model": profile.model, "stream": False, "options": options,
