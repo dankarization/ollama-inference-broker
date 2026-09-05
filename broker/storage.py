@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 import logging
@@ -12,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
+
+from .policy import normalize_source_policy, source_policy_write_lock
 
 
 LOGGER = logging.getLogger("ollama_inference_broker.storage")
@@ -30,6 +33,11 @@ PRODUCER_STORAGE_JOB_PREDICATE = (
     "(producer_attempt_id IS NOT NULL "
     "OR input_storage_mode!='broker_temporary' "
     "OR result_storage_mode!='broker_temporary')"
+)
+PUBLIC_JOB_PREDICATE = (
+    "producer_attempt_id IS NULL "
+    "AND input_storage_mode='broker_temporary' "
+    "AND result_storage_mode='broker_temporary'"
 )
 
 
@@ -122,6 +130,30 @@ def migrate_storage_schema(
             db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {declaration}")
             added.append(name)
 
+    db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        occurred REAL NOT NULL,
+        event_type TEXT NOT NULL,
+        job_id TEXT,
+        source TEXT,
+        attempt_no INTEGER,
+        from_state TEXT,
+        to_state TEXT,
+        reason TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        producer_storage INTEGER NOT NULL DEFAULT 0)""")
+    audit_visibility_added = False
+    if "producer_storage" not in _column_names(db, "audit_events"):
+        db.execute(
+            "ALTER TABLE audit_events ADD COLUMN producer_storage "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+        db.execute(
+            "UPDATE audit_events SET producer_storage=1 WHERE job_id IN "
+            f"(SELECT id FROM jobs WHERE {PRODUCER_STORAGE_JOB_PREDICATE})"
+        )
+        audit_visibility_added = True
+
     db.execute("""CREATE TABLE IF NOT EXISTS job_artifacts (
         id TEXT PRIMARY KEY,
         job_id TEXT NOT NULL,
@@ -173,6 +205,18 @@ def migrate_storage_schema(
         "ON job_delivery_ack_conflicts(job_id,occurred)"
     )
     db.execute(
+        "CREATE INDEX IF NOT EXISTS audit_events_public_sequence "
+        "ON audit_events(sequence DESC) WHERE producer_storage=0"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS audit_events_public_source_sequence "
+        "ON audit_events(source,sequence DESC) WHERE producer_storage=0"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS audit_events_public_job_sequence "
+        "ON audit_events(job_id,sequence DESC) WHERE producer_storage=0"
+    )
+    db.execute(
         "CREATE INDEX IF NOT EXISTS jobs_storage_compaction "
         "ON jobs(source,compaction_state,compaction_after,id) "
         "WHERE delivery_state='acked' AND ack_required=1 "
@@ -187,6 +231,19 @@ def migrate_storage_schema(
         "CREATE INDEX IF NOT EXISTS jobs_storage_quarantined "
         "ON jobs(id) WHERE compaction_state='quarantined'"
     )
+    history_columns = {
+        "finished", "id", "state", "source", "profile", "created", "started",
+        "attempt_count", "retry_count",
+    }
+    if history_columns <= _column_names(db, "jobs"):
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS jobs_public_terminal_history "
+            "ON jobs(finished DESC,id DESC,state,source,profile,created,started,"
+            "attempt_count,retry_count,producer_attempt_id,input_storage_mode,"
+            "result_storage_mode) WHERE state IN "
+            "('completed','failed','cancelled') AND finished IS NOT NULL AND "
+            + PUBLIC_JOB_PREDICATE
+        )
     db.execute(
         "INSERT OR IGNORE INTO broker_schema_migrations(version,name) VALUES(?,?)",
         (STORAGE_SCHEMA_VERSION, "producer_owned_storage_receipts"),
@@ -194,6 +251,7 @@ def migrate_storage_schema(
     return {
         "schema_version": STORAGE_SCHEMA_VERSION,
         "added_columns": added,
+        "audit_visibility_added": audit_visibility_added,
         "wal_autocheckpoint_pages": effective_wal_autocheckpoint_pages,
         "journal_size_limit_bytes": effective_journal_size_limit_bytes,
     }
@@ -350,6 +408,45 @@ class StorageManager:
             return policy.storage_config(source)
         except (OSError, ValueError) as exc:
             raise StorageContractError("source policy is unavailable or invalid") from exc
+
+    @contextmanager
+    def _maintenance_source_config(self, source: str):
+        """Hold the policy writer lock while a destructive decision is applied."""
+        policy = self.policy_getter()
+        if policy is None:
+            yield self._source_config(source)
+            return
+        stack = ExitStack()
+        try:
+            stack.enter_context(source_policy_write_lock(policy.path))
+            raw = json.loads(Path(policy.path).read_text(encoding="utf-8"))
+            entry = normalize_source_policy(raw).get(source)
+        except (OSError, ValueError) as exc:
+            stack.close()
+            raise StorageContractError("source policy is unavailable or invalid") from exc
+        config = (
+            {
+                "producer_storage_enabled": False,
+                "producer_storage_mode": "broker_temporary",
+                "ack_required": False,
+                "compaction_enabled": False,
+                "legacy_result_fallback": True,
+                "compaction_grace_seconds": 86400,
+                "quarantine_grace_seconds": 86400,
+            }
+            if entry is None
+            else {
+                key: entry[key]
+                for key in (
+                    "producer_storage_enabled", "producer_storage_mode",
+                    "ack_required", "compaction_enabled",
+                    "legacy_result_fallback", "compaction_grace_seconds",
+                    "quarantine_grace_seconds",
+                )
+            }
+        )
+        with stack:
+            yield config
 
     def prepare_admission(
         self, source: str, payload: dict[str, Any], capability: Any,
@@ -847,7 +944,19 @@ class StorageManager:
             or not 1 <= max_bytes <= 64 * 1024 * 1024
         ):
             raise StorageContractError("max_bytes must be from 1 through 67108864")
-        config = self._source_config(source)
+        # Lock order is broker -> policy file. Runtime writers release the
+        # policy file before recording their broker audit event, so this
+        # revalidation cannot deadlock or race a kill-switch update.
+        with self.lock, self._maintenance_source_config(source) as config:
+            return self._maintenance_locked(
+                source, operation=operation, limit=limit, confirm=confirm,
+                max_bytes=max_bytes, config=config,
+            )
+
+    def _maintenance_locked(
+        self, source: str, *, operation: str, limit: int, confirm: bool,
+        max_bytes: int, config: dict[str, Any],
+    ) -> dict[str, Any]:
         guards = {
             "producer_storage_enabled": bool(config["producer_storage_enabled"]),
             "ack_required": bool(config["ack_required"]),

@@ -123,6 +123,9 @@ counts use dedicated partial indexes, so polling does not scan payload-heavy
 legacy history while holding the broker lock.
 Startup and the migration CLI reject pragma values outside SQLite's signed
 integer ranges and verify that SQLite applied both values exactly.
+The shared migration also backfills producer-storage audit visibility and
+builds the same public audit/history partial indexes used after restart, so a
+copy preflight exercises the complete startup schema cost.
 
 Apply the schema to an explicit safe copy and write a payload-free report:
 
@@ -173,7 +176,8 @@ python3 -m broker.rollback_guard \
 
 The tool accepts only the reviewed parent `broker/service.py` hash, copies the
 release without Git/cache state, injects the same 22-field legacy response
-filter, compiles the patched source, fsyncs every regular file and directory
+filter, blocks its legacy dispatcher from claiming queued producer-storage
+jobs, compiles the patched source, fsyncs every regular file and directory
 before publishing the artifact, and reports only paths and hashes. The output
 must be outside the source release tree. Verify the rollback copy with
 `compileall` and the legacy API test before continuing.

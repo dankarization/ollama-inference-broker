@@ -29,6 +29,7 @@ from .storage import (
     DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
     DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
     DEFAULT_WAL_BUDGET_BYTES,
+    PUBLIC_JOB_PREDICATE,
     PRODUCER_STORAGE_JOB_PREDICATE,
     StorageManager,
     migrate_storage_schema,
@@ -347,30 +348,6 @@ class Broker:
                 wal_autocheckpoint_pages=self.wal_autocheckpoint_pages,
                 journal_size_limit_bytes=self.journal_size_limit_bytes,
             )
-            self.db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                occurred REAL NOT NULL,
-                event_type TEXT NOT NULL,
-                job_id TEXT,
-                source TEXT,
-                attempt_no INTEGER,
-                from_state TEXT,
-                to_state TEXT,
-                reason TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                producer_storage INTEGER NOT NULL DEFAULT 0)""")
-            audit_columns = {
-                row[1] for row in self.db.execute("PRAGMA table_info(audit_events)")
-            }
-            if "producer_storage" not in audit_columns:
-                self.db.execute(
-                    "ALTER TABLE audit_events ADD COLUMN producer_storage "
-                    "INTEGER NOT NULL DEFAULT 0"
-                )
-                self.db.execute(
-                    "UPDATE audit_events SET producer_storage=1 WHERE job_id IN "
-                    f"(SELECT id FROM jobs WHERE {PRODUCER_STORAGE_JOB_PREDICATE})"
-                )
             self.db.execute("""CREATE TABLE IF NOT EXISTS job_attempts (
                 job_id TEXT NOT NULL,
                 attempt_no INTEGER NOT NULL,
@@ -392,18 +369,6 @@ class Broker:
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS audit_events_source_time "
                 "ON audit_events(source,occurred,event_type)"
-            )
-            self.db.execute(
-                "CREATE INDEX IF NOT EXISTS audit_events_public_sequence "
-                "ON audit_events(sequence DESC) WHERE producer_storage=0"
-            )
-            self.db.execute(
-                "CREATE INDEX IF NOT EXISTS audit_events_public_source_sequence "
-                "ON audit_events(source,sequence DESC) WHERE producer_storage=0"
-            )
-            self.db.execute(
-                "CREATE INDEX IF NOT EXISTS audit_events_public_job_sequence "
-                "ON audit_events(job_id,sequence DESC) WHERE producer_storage=0"
             )
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_source_state ON jobs(source,state,created)"
@@ -1192,13 +1157,14 @@ class Broker:
             # keyset predicate into a multi-index OR that needs a temp sort.
             clause = " AND (finished,id) < (?,?)"
             values.extend(cursor)
-        storage_clause = (
-            "" if include_producer_storage
-            else f" AND NOT {PRODUCER_STORAGE_JOB_PREDICATE}"
+        storage_clause = "" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE
+        history_index = (
+            "jobs_terminal_history_v3" if include_producer_storage
+            else "jobs_public_terminal_history"
         )
         rows = db.execute(
             "SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count "
-            "FROM jobs INDEXED BY jobs_terminal_history_v3 "
+            f"FROM jobs INDEXED BY {history_index} "
             "WHERE state IN ('completed','failed','cancelled') AND finished IS NOT NULL"
             + storage_clause + clause +
             " ORDER BY finished DESC,id DESC LIMIT ?",

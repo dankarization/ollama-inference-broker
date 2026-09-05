@@ -31,6 +31,15 @@ SERIALIZER_GUARD = (
     "        for field in LEGACY_HIDDEN_STORAGE_FIELDS:\n"
     "            data.pop(field, None)\n"
 )
+DISPATCH_ANCHOR = (
+    '            "FROM jobs INDEXED BY jobs_queued_candidates WHERE state=\'queued\'"\n'
+)
+DISPATCH_GUARD = (
+    '            "FROM jobs INDEXED BY jobs_queued_candidates WHERE state=\'queued\' "\n'
+    '            "AND producer_attempt_id IS NULL "\n'
+    '            "AND input_storage_mode=\'broker_temporary\' "\n'
+    '            "AND result_storage_mode=\'broker_temporary\'"\n'
+)
 
 
 def _sha256(content: bytes) -> str:
@@ -66,6 +75,8 @@ def harden_legacy_service(source: str) -> str:
         raise ValueError("legacy service logging anchor is missing or ambiguous")
     if source.count(SERIALIZER_ANCHOR) != 1:
         raise ValueError("legacy service serializer anchor is missing or ambiguous")
+    if source.count(DISPATCH_ANCHOR) != 1:
+        raise ValueError("legacy service dispatch anchor is missing or ambiguous")
     declaration = (
         DECLARATION_ANCHOR
         + "LEGACY_HIDDEN_STORAGE_FIELDS = frozenset({\n"
@@ -76,6 +87,7 @@ def harden_legacy_service(source: str) -> str:
     hardened = hardened.replace(
         SERIALIZER_ANCHOR, SERIALIZER_ANCHOR + SERIALIZER_GUARD, 1,
     )
+    hardened = hardened.replace(DISPATCH_ANCHOR, DISPATCH_GUARD, 1)
     compile(hardened, "broker/service.py", "exec")
     return hardened
 
@@ -139,6 +151,7 @@ def prepare_rollback_release(
         "source_service_sha256": original_hash,
         "rollback_service_sha256": hardened_hash,
         "hidden_storage_fields": len(LEGACY_HIDDEN_STORAGE_FIELDS),
+        "producer_storage_dispatch_blocked": True,
         "payloads_in_report": False,
     }
 

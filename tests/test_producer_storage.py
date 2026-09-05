@@ -13,7 +13,11 @@ from urllib.request import Request, urlopen
 
 from broker.http import serve
 from broker.migration import main as migration_main
-from broker.policy import SourcePolicyError, normalize_source_policy
+from broker.policy import (
+    SourcePolicyError,
+    normalize_source_policy,
+    source_policy_write_lock,
+)
 from broker.rollback_guard import (
     LEGACY_HIDDEN_STORAGE_FIELDS,
     _fsync_tree,
@@ -23,6 +27,7 @@ from broker.service import Broker, SourcePolicy
 from broker.storage import (
     MAX_JOURNAL_SIZE_LIMIT_BYTES,
     MAX_WAL_AUTOCHECKPOINT_PAGES,
+    PUBLIC_JOB_PREDICATE,
     ReceiptConflict,
     StorageContractError,
     content_evidence,
@@ -150,11 +155,28 @@ class ProducerStorageTests(unittest.TestCase):
             ("one", "legacy", '"PRIVATE-PAYLOAD-SENTINEL"', "completed",
              '"PRIVATE-RESULT-SENTINEL"'),
         )
+        db.execute("""CREATE TABLE audit_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            occurred REAL NOT NULL,
+            event_type TEXT NOT NULL,
+            job_id TEXT,
+            source TEXT,
+            attempt_no INTEGER,
+            from_state TEXT,
+            to_state TEXT,
+            reason TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}')""")
+        db.execute(
+            "INSERT INTO audit_events(occurred,event_type,job_id,source) "
+            "VALUES(1,'admission.accepted','one','legacy')"
+        )
         with db:
             first = migrate_storage_schema(db)
             second = migrate_storage_schema(db)
         self.assertIn("producer_attempt_id", first["added_columns"])
+        self.assertTrue(first["audit_visibility_added"])
         self.assertEqual(second["added_columns"], [])
+        self.assertFalse(second["audit_visibility_added"])
         self.assertEqual(
             db.execute("SELECT payload,result_json FROM jobs WHERE id='one'").fetchone(),
             ('"PRIVATE-PAYLOAD-SENTINEL"', '"PRIVATE-RESULT-SENTINEL"'),
@@ -180,6 +202,25 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertEqual(health_indexes, {
             "jobs_storage_unacked_terminal", "jobs_storage_quarantined",
         })
+        self.assertEqual(
+            db.execute(
+                "SELECT producer_storage FROM audit_events WHERE job_id='one'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            {
+                row[0] for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND name LIKE 'audit_events_public_%'"
+                )
+            },
+            {
+                "audit_events_public_sequence",
+                "audit_events_public_source_sequence",
+                "audit_events_public_job_sequence",
+            },
+        )
         db.close()
 
     def test_migration_rejects_report_aliasing_database(self):
@@ -238,7 +279,13 @@ class ProducerStorageTests(unittest.TestCase):
             '            data.pop("result_json", None)\n'
             '        if data["state"] == "queued":\n'
             '            data["queue_position"] = self._position(row)\n'
-            '        return data\n',
+            '        return data\n\n'
+            '    def _candidates(self):\n'
+            '        query = (\n'
+            '            "SELECT id,profile,source,created,queued_at,attempt_count "\n'
+            '            "FROM jobs INDEXED BY jobs_queued_candidates WHERE state=\'queued\'"\n'
+            '        )\n'
+            '        return query\n',
             encoding="utf-8",
         )
         source_hash = hashlib.sha256(service.read_bytes()).hexdigest()
@@ -273,6 +320,11 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertEqual(
             report["hidden_storage_fields"], len(LEGACY_HIDDEN_STORAGE_FIELDS),
         )
+        self.assertTrue(report["producer_storage_dispatch_blocked"])
+        hardened = (output / "broker" / "service.py").read_text(encoding="utf-8")
+        self.assertIn("AND producer_attempt_id IS NULL", hardened)
+        self.assertIn("AND input_storage_mode='broker_temporary'", hardened)
+        self.assertIn("AND result_storage_mode='broker_temporary'", hardened)
         self.assertFalse(report["payloads_in_report"])
 
     def test_policy_rejects_non_finite_storage_grace_periods(self):
@@ -600,6 +652,45 @@ class ProducerStorageTests(unittest.TestCase):
         preview = self.broker.storage_maintenance("producer", max_bytes=1024)
         self.assertEqual(preview["job_ids"], [jobs[1]["id"]])
         self.assertEqual(preview["skipped_oversize"], 1)
+
+    def test_compaction_revalidates_kill_switch_after_waiting_for_broker_lock(self):
+        self._write_policy(
+            ack_required=True, compaction_enabled=True, legacy_result_fallback=False,
+        )
+        job = self._admit(external_id="policy-race")
+        status = self._complete(job)
+        self._ack_input(job)
+        self.broker.acknowledge_result(job["id"], self._ack(job, status))
+        started = threading.Event()
+        errors = []
+
+        def compact():
+            started.set()
+            try:
+                self.broker.storage_maintenance(
+                    "producer", operation="quarantine", confirm=True,
+                )
+            except Exception as error:
+                errors.append(error)
+
+        with self.broker.lock:
+            thread = threading.Thread(target=compact)
+            thread.start()
+            self.assertTrue(started.wait(1))
+            with source_policy_write_lock(self.policy_path):
+                self._write_policy(
+                    ack_required=True,
+                    compaction_enabled=False,
+                    legacy_result_fallback=False,
+                )
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], StorageContractError)
+        self.assertIn("guards are not all enabled", str(errors[0]))
+        self.assertEqual(
+            self.broker.compact_status(job["id"])["compaction_state"], "full",
+        )
 
     def test_cleanup_does_not_adopt_jobs_with_legacy_admission_guards(self):
         jobs = []
@@ -1031,6 +1122,33 @@ class ProducerStorageTests(unittest.TestCase):
         )
         self.assertIn("audit_events_public_sequence", plan)
         self.assertNotIn("CORRELATED", plan)
+
+        with self.broker.db:
+            self.broker.db.execute(
+                "UPDATE jobs SET state='completed',finished=1 WHERE id=?",
+                (legacy["id"],),
+            )
+            self.broker.db.execute(
+                "UPDATE jobs SET state='completed',finished=2 WHERE id=?",
+                (protected["id"],),
+            )
+        history = self.broker.terminal_history(
+            limit=30, include_producer_storage=False,
+        )["items"]
+        self.assertIn(legacy["id"], {item["id"] for item in history})
+        self.assertNotIn(protected["id"], {item["id"] for item in history})
+        history_plan = " ".join(
+            str(row[3]) for row in self.broker.db.execute(
+                "EXPLAIN QUERY PLAN SELECT id,source,profile,state,created,started,"
+                "finished,attempt_count,retry_count FROM jobs INDEXED BY "
+                "jobs_public_terminal_history WHERE state IN "
+                "('completed','failed','cancelled') AND finished IS NOT NULL AND "
+                + PUBLIC_JOB_PREDICATE
+                + " ORDER BY finished DESC,id DESC LIMIT 30"
+            )
+        )
+        self.assertIn("COVERING INDEX jobs_public_terminal_history", history_plan)
+        self.assertNotIn("USE TEMP B-TREE", history_plan)
 
     def test_http_compact_status_ack_receipt_and_storage_health(self):
         job = self._admit()
