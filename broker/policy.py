@@ -2,12 +2,31 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 import math
-from typing import Any
+import os
+from pathlib import Path
+from typing import Any, Iterator
 
 
 class SourcePolicyError(ValueError):
     pass
+
+
+@contextmanager
+def source_policy_write_lock(path: str | Path) -> Iterator[None]:
+    """Serialize every cooperating writer for one source-policy file."""
+    policy_path = Path(path)
+    lock_path = policy_path.with_name(f".{policy_path.name}.lock")
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def normalize_source_policy(raw: Any) -> dict[str, dict[str, Any]]:
@@ -69,10 +88,14 @@ def normalize_source_policy(raw: Any) -> dict[str, dict[str, Any]]:
             ("compaction_grace_seconds", compaction_grace_seconds),
             ("quarantine_grace_seconds", quarantine_grace_seconds),
         ):
+            try:
+                finite = math.isfinite(value)
+            except (OverflowError, TypeError):
+                finite = False
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
-                or not math.isfinite(value)
+                or not finite
                 or value < 0
             ):
                 raise SourcePolicyError(

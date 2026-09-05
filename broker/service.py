@@ -22,7 +22,7 @@ from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES,
                      validate_syncopia_memory_payload,
                      validate_uncensored_eval_payload)
 from .profiles import PROFILES
-from .policy import SourcePolicyError, normalize_source_policy
+from .policy import SourcePolicyError, normalize_source_policy, source_policy_write_lock
 from .rollback_guard import LEGACY_HIDDEN_STORAGE_FIELDS
 from .storage import (
     DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
@@ -159,38 +159,40 @@ class SourcePolicy:
         """Serialize and durably atomically replace one source policy field."""
         with self._lock:
             try:
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
-                normalized = normalize_source_policy(raw)
-            except (OSError, ValueError, SourcePolicyError) as error:
-                raise SourcePolicyError("policy is unavailable or invalid") from error
-            if source not in normalized:
-                raise SourcePolicyError(f"source {source!r} is not configured")
-            raw["sources"][source][field] = value
-            temporary: str | None = None
-            try:
-                mode = self.path.stat().st_mode & 0o7777
-                descriptor, temporary = tempfile.mkstemp(
-                    prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent,
-                )
-                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    json.dump(raw, handle, indent=2, sort_keys=True)
-                    handle.write("\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.chmod(temporary, mode)
-                os.replace(temporary, self.path)
-                directory = os.open(self.path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
-            except OSError as error:
-                if temporary is not None:
+                with source_policy_write_lock(self.path):
+                    raw = json.loads(self.path.read_text(encoding="utf-8"))
+                    normalized = normalize_source_policy(raw)
+                    if source not in normalized:
+                        raise SourcePolicyError(f"source {source!r} is not configured")
+                    raw["sources"][source][field] = value
+                    temporary: str | None = None
                     try:
-                        os.unlink(temporary)
-                    except OSError:
-                        pass
-                raise SourcePolicyError("unable to save policy") from error
+                        mode = self.path.stat().st_mode & 0o7777
+                        descriptor, temporary = tempfile.mkstemp(
+                            prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent,
+                        )
+                        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                            json.dump(raw, handle, indent=2, sort_keys=True)
+                            handle.write("\n")
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        os.chmod(temporary, mode)
+                        os.replace(temporary, self.path)
+                        directory = os.open(self.path.parent, os.O_RDONLY)
+                        try:
+                            os.fsync(directory)
+                        finally:
+                            os.close(directory)
+                    finally:
+                        if temporary is not None and os.path.exists(temporary):
+                            try:
+                                os.unlink(temporary)
+                            except OSError:
+                                pass
+            except SourcePolicyError:
+                raise
+            except (OSError, ValueError) as error:
+                raise SourcePolicyError("policy is unavailable or invalid") from error
             self._signature = None
             self._load_locked()
             return value
@@ -626,6 +628,8 @@ class Broker:
                 if existing is not None:
                     if producer_storage is not None:
                         checks = {
+                            "profile": profile,
+                            "kind": kind,
                             "producer_attempt_id": storage_fields["producer_attempt_id"],
                             "input_ref": storage_fields["input_ref"],
                             "input_hash": storage_fields["input_hash"],

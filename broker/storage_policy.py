@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .policy import normalize_source_policy
+from .policy import normalize_source_policy, source_policy_write_lock
 
 
 SOURCE_STORAGE_MODES = {
@@ -99,35 +99,36 @@ def write_atomic(
     *,
     expected_fingerprint: tuple[int, int, int, int, int, str] | None = None,
 ) -> None:
-    try:
-        mode = path.stat().st_mode & 0o7777
-    except OSError as exc:
-        raise ConcurrentPolicyUpdateError(
-            "policy disappeared after staging; refusing to replace it"
-        ) from exc
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, mode)
-        if expected_fingerprint is not None:
-            _, current_fingerprint = read_snapshot(path)
-            if current_fingerprint != expected_fingerprint:
-                raise ConcurrentPolicyUpdateError(
-                    "policy changed after staging; refusing to replace it"
-                )
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
+    with source_policy_write_lock(path):
         try:
-            os.fsync(directory)
+            mode = path.stat().st_mode & 0o7777
+        except OSError as exc:
+            raise ConcurrentPolicyUpdateError(
+                "policy disappeared after staging; refusing to replace it"
+            ) from exc
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(value, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, mode)
+            if expected_fingerprint is not None:
+                _, current_fingerprint = read_snapshot(path)
+                if current_fingerprint != expected_fingerprint:
+                    raise ConcurrentPolicyUpdateError(
+                        "policy changed after staging; refusing to replace it"
+                    )
+            os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         finally:
-            os.close(directory)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 def same_file(left: Path, right: Path) -> bool:

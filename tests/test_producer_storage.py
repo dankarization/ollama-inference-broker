@@ -28,6 +28,7 @@ from broker.storage import (
     storage_schema_report,
 )
 from broker.storage_policy import main as storage_policy_main, stage_storage_policy
+from broker.storage_policy import read_snapshot, write_atomic
 
 
 class FakeOllama:
@@ -82,11 +83,12 @@ class ProducerStorageTests(unittest.TestCase):
 
     def _admit(
         self, external_id="external-1", producer_attempt_id="attempt-1", input_ref=None,
+        profile="interactive", kind="generate",
     ):
         payload = {"prompt": external_id}
         input_hash, input_bytes = content_evidence(payload)
         return self.broker.submit(
-            "interactive", "generate", payload, source="producer",
+            profile, kind, payload, source="producer",
             source_item_id=external_id, external_id=external_id,
             producer_storage={
                 "producer_attempt_id": producer_attempt_id,
@@ -161,6 +163,12 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertNotIn("PRIVATE-RESULT-SENTINEL", encoded)
         self.assertFalse(report["report_contains_payloads"])
         self.assertEqual(report["quick_check"], "ok")
+        index_sql = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' "
+            "AND name='jobs_storage_compaction'"
+        ).fetchone()[0]
+        self.assertIn("WHERE delivery_state='acked' AND ack_required=1", index_sql)
+        self.assertIn("legacy_result_fallback=0", index_sql)
         db.close()
 
     def test_migration_rejects_report_aliasing_database(self):
@@ -239,7 +247,7 @@ class ProducerStorageTests(unittest.TestCase):
 
     def test_policy_rejects_non_finite_storage_grace_periods(self):
         for field in ("compaction_grace_seconds", "quarantine_grace_seconds"):
-            for value in (float("nan"), float("inf"), float("-inf")):
+            for value in (float("nan"), float("inf"), float("-inf"), 10 ** 1000):
                 raw = {
                     "sources": {"producer": {field: value}},
                 }
@@ -247,6 +255,9 @@ class ProducerStorageTests(unittest.TestCase):
                     SourcePolicyError, "finite non-negative",
                 ):
                     normalize_source_policy(raw)
+        last_known_good = self.policy.storage_config("producer")
+        self._write_policy(compaction_grace_seconds=10 ** 1000)
+        self.assertEqual(self.policy.storage_config("producer"), last_known_good)
 
     def test_non_string_storage_mode_is_rejected_and_hot_reload_keeps_policy(self):
         for value in ([], {}):
@@ -310,6 +321,28 @@ class ProducerStorageTests(unittest.TestCase):
                 receipt["receipt_id"],
             )
         self.assertEqual(len(self.broker.receipt(job["id"])["conflicts"]), len(cases))
+        attempts = self.broker.compact_status(job["id"])["delivery_attempt_count"]
+        audit_count = self.broker.db.execute(
+            "SELECT count(*) FROM audit_events "
+            "WHERE job_id=? AND event_type='delivery.ack_conflict'",
+            (job["id"],),
+        ).fetchone()[0]
+        with self.assertRaises(ReceiptConflict):
+            self.broker.acknowledge_result(
+                job["id"], self._ack(job, status, **cases[-1]),
+            )
+        self.assertEqual(len(self.broker.receipt(job["id"])["conflicts"]), len(cases))
+        self.assertEqual(
+            self.broker.compact_status(job["id"])["delivery_attempt_count"], attempts,
+        )
+        self.assertEqual(
+            self.broker.db.execute(
+                "SELECT count(*) FROM audit_events "
+                "WHERE job_id=? AND event_type='delivery.ack_conflict'",
+                (job["id"],),
+            ).fetchone()[0],
+            audit_count,
+        )
         self.assertEqual(self.broker.acknowledge_result(job["id"], body), receipt)
         self.assertEqual(self.broker.compact_status(job["id"])["delivery_state"], "conflict")
         self.assertEqual(self.broker.storage.reconcile(), 0)
@@ -355,6 +388,10 @@ class ProducerStorageTests(unittest.TestCase):
             self._admit(producer_attempt_id="attempt-2")
         with self.assertRaisesRegex(ValueError, "idempotency conflict"):
             self._admit(input_ref="producer://inputs/changed")
+        with self.assertRaisesRegex(ValueError, "idempotency conflict"):
+            self._admit(profile="cron")
+        with self.assertRaisesRegex(ValueError, "idempotency conflict"):
+            self._admit(kind="chat")
         self.assertEqual(
             self.broker.compact_status(first["id"])["producer_attempt_id"], "attempt-1",
         )
@@ -611,6 +648,65 @@ class ProducerStorageTests(unittest.TestCase):
             storage_policy_main()
         self.assertEqual(caught.exception.code, 2)
         self.assertEqual(json.loads(live.read_text(encoding="utf-8")), concurrent)
+
+    def test_storage_policy_apply_serializes_with_runtime_writer(self):
+        live = self.root / "live-serialized-sources.json"
+        original = {
+            "version": 1,
+            "sources": {"olya-vision": {"enabled": True, "weight": 8}},
+        }
+        live.write_text(json.dumps(original), encoding="utf-8")
+        encoded, fingerprint = read_snapshot(live)
+        staged, _ = stage_storage_policy(json.loads(encoded))
+        policy = SourcePolicy(live)
+        checked = threading.Event()
+        release_check = threading.Event()
+        writer_started = threading.Event()
+        writer_finished = threading.Event()
+        errors = []
+        real_read_snapshot = read_snapshot
+
+        def gated_read_snapshot(path):
+            snapshot = real_read_snapshot(path)
+            checked.set()
+            if not release_check.wait(2):
+                raise AssertionError("test did not release policy fingerprint check")
+            return snapshot
+
+        def cli_writer():
+            try:
+                write_atomic(live, staged, expected_fingerprint=fingerprint)
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        def runtime_writer():
+            writer_started.set()
+            try:
+                policy.set_admission_allowed("olya-vision", False)
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+            finally:
+                writer_finished.set()
+
+        with patch(
+            "broker.storage_policy.read_snapshot", side_effect=gated_read_snapshot,
+        ):
+            cli_thread = threading.Thread(target=cli_writer)
+            cli_thread.start()
+            self.assertTrue(checked.wait(2))
+            runtime_thread = threading.Thread(target=runtime_writer)
+            runtime_thread.start()
+            self.assertTrue(writer_started.wait(2))
+            self.assertFalse(writer_finished.wait(0.1))
+            release_check.set()
+            cli_thread.join(2)
+            runtime_thread.join(2)
+        self.assertFalse(cli_thread.is_alive())
+        self.assertFalse(runtime_thread.is_alive())
+        self.assertEqual(errors, [])
+        persisted = json.loads(live.read_text(encoding="utf-8"))
+        self.assertTrue(persisted["sources"]["olya-vision"]["producer_storage_enabled"])
+        self.assertFalse(persisted["sources"]["olya-vision"]["admission_allowed"])
 
     def test_storage_health_excludes_non_ack_capable_legacy_results(self):
         legacy = self.broker.submit(

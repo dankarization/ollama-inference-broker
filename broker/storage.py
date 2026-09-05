@@ -157,7 +157,9 @@ def migrate_storage_schema(
     )
     db.execute(
         "CREATE INDEX IF NOT EXISTS jobs_storage_compaction "
-        "ON jobs(source,delivery_state,compaction_state,compaction_after,id)"
+        "ON jobs(source,compaction_state,compaction_after,id) "
+        "WHERE delivery_state='acked' AND ack_required=1 "
+        "AND legacy_result_fallback=0"
     )
     db.execute(
         "INSERT OR IGNORE INTO broker_schema_migrations(version,name) VALUES(?,?)",
@@ -440,11 +442,23 @@ class StorageManager:
     def _conflict(
         self, row: sqlite3.Row, body: dict[str, Any], reason: str, now: float,
     ) -> None:
+        identity = (
+            row["id"], body.get("producer"), body.get("producer_attempt_id"),
+            body.get("storage_ref"), body.get("result_hash"), reason,
+        )
+        duplicate = self.db.execute(
+            "SELECT 1 FROM job_delivery_ack_conflicts WHERE job_id=? "
+            "AND producer IS ? AND producer_attempt_id IS ? "
+            "AND candidate_storage_ref IS ? AND candidate_result_hash IS ? "
+            "AND reason=? LIMIT 1",
+            identity,
+        ).fetchone()
+        if duplicate is not None:
+            return
         self.db.execute(
             "INSERT INTO job_delivery_ack_conflicts(job_id,producer,producer_attempt_id,"
             "candidate_storage_ref,candidate_result_hash,reason,occurred) VALUES(?,?,?,?,?,?,?)",
-            (row["id"], body.get("producer"), body.get("producer_attempt_id"),
-             body.get("storage_ref"), body.get("result_hash"), reason, now),
+            (*identity, now),
         )
         self.db.execute(
             "UPDATE jobs SET delivery_state='conflict',"

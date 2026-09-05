@@ -38,8 +38,8 @@ locally with mode `0600`; it is not stored in Git or operational evidence.
 
 Hashes cover UTF-8 JSON encoded with sorted keys and compact separators. Input
 hash and byte size must match the canonical broker payload. A repeated
-correlation with different capability identity fails closed and preserves the
-original job.
+correlation with a different profile, request kind, or capability identity
+fails closed and preserves the original job.
 
 `POST /v1/jobs/{id}/input-received` confirms the declared input reference,
 hash, size, source, and producer attempt. `GET /v1/jobs/{id}/status` returns a
@@ -68,7 +68,8 @@ an internal URI without query, fragment, or credentials. The exact repeat
 returns the same durable receipt. A disagreement returns HTTP 409 with
 `ack_conflict`, records bounded payload-free diagnostics, and retains the full
 broker result. `GET /v1/jobs/{id}/receipt` recovers the receipt after a timeout
-or restart.
+or restart. An identical conflicting retry is idempotent: it does not append a
+second conflict row or audit event.
 
 ## Compaction guards
 
@@ -135,7 +136,9 @@ and `uncensored-eval` sources untouched, and always stages ACK optional,
 legacy fallback on, and compaction off. `--apply` performs an fsync + atomic
 replace after the operator preserves the original policy for rollback. The
 apply aborts if any process replaces or modifies the live policy after it was
-read, preserving concurrent source-control changes.
+read. It also takes the same adjacent owner-only lock used by runtime
+source-control writers, closing the compare/replace race and preserving
+concurrent source-control changes.
 
 ## Rollout and rollback
 
