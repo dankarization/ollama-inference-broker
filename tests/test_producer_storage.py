@@ -2,6 +2,7 @@ import json
 import io
 import hashlib
 import os
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -280,6 +281,28 @@ class ProducerStorageTests(unittest.TestCase):
             '            (timestamp, event_type, job_id, source, attempt_no, from_state,\n'
             '             to_state, reason, json.dumps(safe_metadata, sort_keys=True)),\n'
             '        )\n\n'
+            '    def bulk_cancel_queued(self, source):\n'
+            '        rows = list(self.db.execute(\n'
+            '                "SELECT id,attempt_count FROM jobs WHERE source=? AND state=\'queued\' "\n'
+            '                "ORDER BY queued_at,id", (source,),\n'
+            '            ))\n'
+            '        return rows\n\n'
+            '    def bulk_retry_failed(self, source):\n'
+            '        rows = list(self.db.execute(\n'
+            '                "SELECT id,attempt_count FROM jobs WHERE source=? AND state=\'failed\' "\n'
+            '                "ORDER BY finished,id", (source,),\n'
+            '            ))\n'
+            '        return rows\n\n'
+            '    def cancel(self, job_id):\n'
+            '        row = self.db.execute(\n'
+            '                "SELECT state,source,attempt_count FROM jobs WHERE id=?", (job_id,)\n'
+            '            ).fetchone()\n'
+            '        return row\n\n'
+            '    def retry(self, job_id):\n'
+            '        row = self.db.execute(\n'
+            '                "SELECT state,source,attempt_count FROM jobs WHERE id=?", (job_id,)\n'
+            '            ).fetchone()\n'
+            '        return row\n\n'
             '    def _job(self, row):\n'
             '        data = dict(row)\n'
             '        data.pop("priority", None)  # inert historic column is never public\n'
@@ -297,6 +320,16 @@ class ProducerStorageTests(unittest.TestCase):
             '            "FROM jobs INDEXED BY jobs_queued_candidates WHERE state=\'queued\'"\n'
             '        )\n'
             '        return query\n',
+            encoding="utf-8",
+        )
+        analytics = source / "broker" / "analytics.py"
+        analytics.write_text(
+            'from typing import Any\n\n'
+            'def audit_history(db, *, limit=100, job_id=None, source=None, '
+            'since=None) -> list[dict[str, Any]]:\n'
+            '    clauses: list[str] = []\n'
+            '    values: list[Any] = []\n'
+            '    return clauses\n',
             encoding="utf-8",
         )
         sibling = source / "broker" / "http.py"
@@ -318,6 +351,25 @@ class ProducerStorageTests(unittest.TestCase):
                 expected_release_sha256=source_release_hash,
             )
         self.assertFalse((self.root / "hybrid-rejected").exists())
+        sibling.write_text("reviewed parent\n", encoding="utf-8")
+        original_copytree = shutil.copytree
+        def mutate_during_copy(*args, **kwargs):
+            sibling.write_text("raced parent\n", encoding="utf-8")
+            return original_copytree(*args, **kwargs)
+        raced = self.root / "race-rejected"
+        with (
+            patch(
+                "broker.rollback_guard.shutil.copytree",
+                side_effect=mutate_during_copy,
+            ),
+            self.assertRaisesRegex(ValueError, "staged release does not match"),
+        ):
+            prepare_rollback_release(
+                source, raced,
+                expected_service_sha256=source_hash,
+                expected_release_sha256=source_release_hash,
+            )
+        self.assertFalse(raced.exists())
         sibling.write_text("reviewed parent\n", encoding="utf-8")
         output = self.root / "rollback-protected"
         with patch(
@@ -394,13 +446,25 @@ class ProducerStorageTests(unittest.TestCase):
             report["hidden_storage_fields"], len(LEGACY_HIDDEN_STORAGE_FIELDS),
         )
         self.assertTrue(report["producer_storage_dispatch_blocked"])
+        self.assertTrue(report["producer_storage_mutations_blocked"])
         self.assertTrue(report["producer_storage_bodies_suppressed"])
         self.assertTrue(report["producer_storage_audit_classified"])
+        self.assertTrue(report["producer_storage_audit_hidden"])
         self.assertEqual(report["source_release_sha256"], source_release_hash)
+        self.assertEqual(report["staged_source_release_sha256"], source_release_hash)
         hardened = (output / "broker" / "service.py").read_text(encoding="utf-8")
         self.assertIn("AND producer_attempt_id IS NULL", hardened)
         self.assertIn("AND input_storage_mode='broker_temporary'", hardened)
         self.assertIn("AND result_storage_mode='broker_temporary'", hardened)
+        hardened_analytics = (output / "broker" / "analytics.py").read_text(
+            encoding="utf-8",
+        )
+        analytics_namespace = {}
+        exec(hardened_analytics, analytics_namespace)
+        self.assertEqual(
+            analytics_namespace["audit_history"](None),
+            ["producer_storage=0"],
+        )
         self.assertFalse(report["payloads_in_report"])
 
     def test_policy_rejects_non_finite_storage_grace_periods(self):

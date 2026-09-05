@@ -73,6 +73,37 @@ AUDIT_INSERT_GUARD = (
     "             producer_storage),\n"
     "        )\n"
 )
+MUTATION_JOB_ANCHOR = (
+    '                "SELECT state,source,attempt_count FROM jobs WHERE id=?", (job_id,)\n'
+)
+MUTATION_JOB_GUARD = (
+    '                "SELECT state,source,attempt_count FROM jobs WHERE id=? "\n'
+    '                "AND producer_attempt_id IS NULL "\n'
+    '                "AND input_storage_mode=\'broker_temporary\' "\n'
+    '                "AND result_storage_mode=\'broker_temporary\'", (job_id,)\n'
+)
+BULK_CANCEL_ANCHOR = (
+    '                "SELECT id,attempt_count FROM jobs WHERE source=? AND state=\'queued\' "\n'
+    '                "ORDER BY queued_at,id", (source,),\n'
+)
+BULK_CANCEL_GUARD = (
+    '                "SELECT id,attempt_count FROM jobs WHERE source=? AND state=\'queued\' "\n'
+    '                "AND producer_attempt_id IS NULL "\n'
+    '                "AND input_storage_mode=\'broker_temporary\' "\n'
+    '                "AND result_storage_mode=\'broker_temporary\' "\n'
+    '                "ORDER BY queued_at,id", (source,),\n'
+)
+BULK_RETRY_ANCHOR = (
+    '                "SELECT id,attempt_count FROM jobs WHERE source=? AND state=\'failed\' "\n'
+    '                "ORDER BY finished,id", (source,),\n'
+)
+BULK_RETRY_GUARD = (
+    '                "SELECT id,attempt_count FROM jobs WHERE source=? AND state=\'failed\' "\n'
+    '                "AND producer_attempt_id IS NULL "\n'
+    '                "AND input_storage_mode=\'broker_temporary\' "\n'
+    '                "AND result_storage_mode=\'broker_temporary\' "\n'
+    '                "ORDER BY finished,id", (source,),\n'
+)
 DISPATCH_ANCHOR = (
     '            "FROM jobs INDEXED BY jobs_queued_candidates WHERE state=\'queued\'"\n'
 )
@@ -81,6 +112,16 @@ DISPATCH_GUARD = (
     '            "AND producer_attempt_id IS NULL "\n'
     '            "AND input_storage_mode=\'broker_temporary\' "\n'
     '            "AND result_storage_mode=\'broker_temporary\'"\n'
+)
+AUDIT_READER_ANCHOR = (
+    ") -> list[dict[str, Any]]:\n"
+    "    clauses: list[str] = []\n"
+    "    values: list[Any] = []\n"
+)
+AUDIT_READER_GUARD = (
+    ") -> list[dict[str, Any]]:\n"
+    "    clauses: list[str] = ['producer_storage=0']\n"
+    "    values: list[Any] = []\n"
 )
 
 
@@ -146,6 +187,12 @@ def harden_legacy_service(source: str) -> str:
         raise ValueError("legacy service audit metadata anchor is missing or ambiguous")
     if source.count(AUDIT_INSERT_ANCHOR) != 1:
         raise ValueError("legacy service audit insert anchor is missing or ambiguous")
+    if source.count(MUTATION_JOB_ANCHOR) != 2:
+        raise ValueError("legacy per-job mutation anchor is missing or ambiguous")
+    if source.count(BULK_CANCEL_ANCHOR) != 1:
+        raise ValueError("legacy bulk cancel anchor is missing or ambiguous")
+    if source.count(BULK_RETRY_ANCHOR) != 1:
+        raise ValueError("legacy bulk retry anchor is missing or ambiguous")
     if source.count(DISPATCH_ANCHOR) != 1:
         raise ValueError("legacy service dispatch anchor is missing or ambiguous")
     declaration = (
@@ -164,8 +211,19 @@ def harden_legacy_service(source: str) -> str:
         1,
     )
     hardened = hardened.replace(AUDIT_INSERT_ANCHOR, AUDIT_INSERT_GUARD, 1)
+    hardened = hardened.replace(MUTATION_JOB_ANCHOR, MUTATION_JOB_GUARD)
+    hardened = hardened.replace(BULK_CANCEL_ANCHOR, BULK_CANCEL_GUARD, 1)
+    hardened = hardened.replace(BULK_RETRY_ANCHOR, BULK_RETRY_GUARD, 1)
     hardened = hardened.replace(DISPATCH_ANCHOR, DISPATCH_GUARD, 1)
     compile(hardened, "broker/service.py", "exec")
+    return hardened
+
+
+def harden_legacy_analytics(source: str) -> str:
+    if source.count(AUDIT_READER_ANCHOR) != 1:
+        raise ValueError("legacy audit reader anchor is missing or ambiguous")
+    hardened = source.replace(AUDIT_READER_ANCHOR, AUDIT_READER_GUARD, 1)
+    compile(hardened, "broker/analytics.py", "exec")
     return hardened
 
 
@@ -200,8 +258,6 @@ def prepare_rollback_release(
             "source release does not match the complete reviewed rollback parent: "
             + source_release_hash
         )
-    hardened = harden_legacy_service(original_bytes.decode("utf-8"))
-
     output_release.parent.mkdir(parents=True, exist_ok=True)
     temporary_root = Path(tempfile.mkdtemp(
         prefix=f".{output_release.name}.", dir=output_release.parent,
@@ -214,10 +270,24 @@ def prepare_rollback_release(
             symlinks=True,
             ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache"),
         )
+        staged_source_hash = _release_manifest_sha256(staged)
+        if staged_source_hash != expected_release_sha256:
+            raise ValueError(
+                "staged release does not match the complete reviewed rollback parent: "
+                + staged_source_hash
+            )
         target_service = staged / "broker" / "service.py"
+        hardened = harden_legacy_service(target_service.read_text(encoding="utf-8"))
         mode = target_service.stat().st_mode & 0o7777
         target_service.write_text(hardened, encoding="utf-8")
         os.chmod(target_service, mode)
+        target_analytics = staged / "broker" / "analytics.py"
+        analytics_mode = target_analytics.stat().st_mode & 0o7777
+        target_analytics.write_text(
+            harden_legacy_analytics(target_analytics.read_text(encoding="utf-8")),
+            encoding="utf-8",
+        )
+        os.chmod(target_analytics, analytics_mode)
         _fsync_tree(staged)
         os.replace(staged, output_release)
         directory = os.open(output_release.parent, os.O_RDONLY)
@@ -236,11 +306,14 @@ def prepare_rollback_release(
         "source_service_sha256": original_hash,
         "rollback_service_sha256": hardened_hash,
         "source_release_sha256": source_release_hash,
+        "staged_source_release_sha256": staged_source_hash,
         "rollback_release_sha256": rollback_release_hash,
         "hidden_storage_fields": len(LEGACY_HIDDEN_STORAGE_FIELDS),
         "producer_storage_dispatch_blocked": True,
+        "producer_storage_mutations_blocked": True,
         "producer_storage_bodies_suppressed": True,
         "producer_storage_audit_classified": True,
+        "producer_storage_audit_hidden": True,
         "payloads_in_report": False,
     }
 

@@ -178,13 +178,16 @@ The tool accepts only the complete reviewed parent release manifest and its
 `broker/service.py` hash, then copies the release without Git/cache state. It
 injects the same 22-field legacy response filter, suppresses payload/result
 bodies for producer-storage rows, marks rollback-time audit events with the
-persisted producer-storage visibility bit, and blocks the legacy dispatcher
-from claiming queued producer-storage jobs. It compiles the patched source,
-fsyncs every regular file and directory before publishing the artifact, and
-reports only paths and hashes. The output must be outside the source release
-tree. Build the source from the exact reviewed parent archive; any added,
-missing, or changed release file fails the manifest check. Verify the rollback
-copy with `compileall` and the legacy API test before continuing.
+persisted producer-storage visibility bit, suppresses those audit rows from
+legacy public reads, and blocks unauthenticated per-job/bulk mutation plus
+legacy dispatch for producer-storage jobs. After copying, it verifies the
+staged pre-patch tree against the same complete manifest, closing source-copy
+races. It then compiles the patched source, fsyncs every regular file and
+directory before publishing the artifact, and reports only paths and hashes.
+The output must be outside the source release tree. Build the source from the
+exact reviewed parent archive; any added, missing, changed, or concurrently
+replaced release file fails the manifest check. Verify the rollback copy with
+`compileall` and the legacy API test before continuing.
 Deploy a new immutable release and atomically switch the service working
 directory. After restart verify HTTP health,
 payload-free storage health, unchanged source weights, state counts, receipt
