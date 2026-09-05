@@ -75,4 +75,21 @@ order.
 - [ ] Rollout по классам callers, настройка profile limits/keepalive по данным
   очереди и VRAM и проверенный rollback к serialized lock-and-queue.
 
+## Фаза 5 — producer-owned storage
+
+- [x] Реализованы additive schema, canonical input/result evidence, opt-in
+  producer capabilities, durable ACK receipts, compact status/receipt APIs,
+  crash-restart reconciliation и payload-free conflict diagnostics.
+- [x] Quarantine/compaction защищены source allowlist, `ack_required`,
+  отключением legacy fallback, matching input/result receipts, двумя grace
+  periods и лимитом bytes/rows на транзакцию. Без явного переключения данные
+  не удаляются.
+- [x] WAL policy использует bounded autocheckpoint/journal limit и только
+  `PASSIVE` checkpoint; `TRUNCATE`, in-place `VACUUM`, historical compaction и
+  adoption накопленных строк отсутствуют.
+- [ ] Producer adapters, source canaries и включение `ack_required` выполняются
+  отдельными source-owned этапами после read-back hash proof.
+- [ ] Historical adoption/compaction и controlled rebuild остаются отдельным
+  проектом с внешним backup target.
+
 Эта фаза требует отдельного production authorization.

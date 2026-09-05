@@ -10,7 +10,10 @@ from unittest.mock import patch
 from urllib.request import urlopen
 
 from broker.http import serve
-from broker.__main__ import dispatch_enabled, dispatch_sources, install_drain_handler
+from broker.__main__ import (
+    dispatch_enabled, dispatch_sources, install_drain_handler, positive_integer,
+    positive_number, storage_token,
+)
 from broker.adapters import OllamaHTTP
 from broker.service import Broker
 
@@ -61,6 +64,30 @@ class BrokerTests(unittest.TestCase):
     def test_ollama_timeout_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "must be positive"):
             OllamaHTTP(timeout_seconds=0)
+
+    def test_wal_integer_limits_reject_fractional_and_zero_values(self):
+        self.assertEqual(positive_integer(None, 4096, "WAL"), 4096)
+        self.assertEqual(positive_integer("1024", 4096, "WAL"), 1024)
+        for value in ("0", "1.5", "invalid"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "positive integer"):
+                positive_integer(value, 4096, "WAL")
+
+    def test_wal_checkpoint_interval_requires_a_finite_positive_number(self):
+        self.assertEqual(positive_number("1.5", 60, "WAL interval"), 1.5)
+        for value in ("0", "nan", "inf", "-inf", "invalid"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "positive number"):
+                positive_number(value, 60, "WAL interval")
+
+    def test_storage_token_file_must_be_owner_only(self):
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as handle:
+            handle.write("x" * 32)
+            path = Path(handle.name)
+        self.addCleanup(path.unlink)
+        path.chmod(0o600)
+        self.assertEqual(storage_token(str(path)), "x" * 32)
+        path.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "owner-only"):
+            storage_token(str(path))
 
     def test_systemd_drain_reload_targets_only_the_broker_main_pid(self):
         root = Path(__file__).resolve().parents[1]
@@ -461,12 +488,21 @@ class SourcePolicyTests(unittest.TestCase):
         from pathlib import Path
         from broker.service import SourcePolicy
         policy_path = Path(__file__).resolve().parents[1] / "config" / "sources.production.json"
-        self.assertEqual(SourcePolicy(policy_path).snapshot()["sources"], {
-            "shutterstock-video": {"enabled": True, "weight": 3.0, "admission_allowed": True},
-            "olya-vision": {"enabled": True, "weight": 8.0, "admission_allowed": True},
-            "olya-decision": {"enabled": True, "weight": 6.0, "admission_allowed": True},
-            "syncopia-telegram-memory": {"enabled": True, "weight": 4.0, "admission_allowed": True},
-        })
+        sources = SourcePolicy(policy_path).snapshot()["sources"]
+        self.assertEqual(
+            {name: entry["weight"] for name, entry in sources.items()},
+            {"shutterstock-video": 3.0, "olya-vision": 8.0,
+             "olya-decision": 6.0, "syncopia-telegram-memory": 4.0},
+        )
+        for name, entry in sources.items():
+            with self.subTest(source=name):
+                self.assertTrue(entry["enabled"])
+                self.assertTrue(entry["admission_allowed"])
+                self.assertTrue(entry["producer_storage_enabled"])
+                self.assertFalse(entry["ack_required"])
+                self.assertFalse(entry["compaction_enabled"])
+                self.assertTrue(entry["legacy_result_fallback"])
+        self.assertEqual(sources["syncopia-telegram-memory"]["producer_storage_mode"], "hybrid")
 
 class WeightedDispatchTests(unittest.TestCase):
     def make(self, loaded=None):

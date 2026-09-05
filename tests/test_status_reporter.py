@@ -59,6 +59,13 @@ class StatusReporterTests(unittest.TestCase):
         self.assertEqual(_policy(handle.name), {
             "defaulted": {
                 "enabled": True, "weight": 1.0, "admission_allowed": True,
+                "producer_storage_enabled": False,
+                "producer_storage_mode": "broker_temporary",
+                "ack_required": False,
+                "compaction_enabled": False,
+                "legacy_result_fallback": True,
+                "compaction_grace_seconds": 86400.0,
+                "quarantine_grace_seconds": 86400.0,
             },
         })
 

@@ -42,7 +42,10 @@ curl -sS 'http://127.0.0.1:8088/v1/correlations?source=olya-vision&external_id=I
 `window` задаётся в секундах, максимум один год. History limit ограничен 1000.
 Correlation lookup возвращает только job/source/profile/state/timestamps и
 идентификаторы, без payload/result. `GET /v1/jobs/{id}` оставлен без изменений
-ради обратной совместимости.
+для legacy jobs. Producer-storage jobs и их audit metadata видны через эти
+read endpoints только с owner-only storage bearer token; unauthenticated
+history/audit/correlation ответы их исключают через persisted visibility marker
+и partial indexes, а legacy analytics остаётся доступной как прежде.
 
 Новые callers могут передавать в `POST /v1/jobs`:
 
@@ -57,9 +60,14 @@ Correlation lookup возвращает только job/source/profile/state/ti
 ```
 
 Повтор failed/cancelled job доступен явно через
-`POST /v1/jobs/{id}/retry`. Lease renewal подготовлен как broker method для
-будущего внешнего executor contract; текущий синхронный dispatcher его не
-вызывает и работает как прежде.
+`POST /v1/jobs/{id}/retry`; для producer-storage job endpoint требует тот же
+owner-only bearer token, что и status/receipt. Lease renewal подготовлен как
+broker method для будущего внешнего executor contract; текущий синхронный
+dispatcher его не вызывает и работает как прежде.
+
+Bulk cancel/retry сохраняет legacy behavior, но если выбранный набор содержит
+producer-storage job, весь mutation требует storage bearer token и до проверки
+не изменяет ни одной строки.
 
 ## Метрики
 
