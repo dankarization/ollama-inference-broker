@@ -83,12 +83,12 @@ class ProducerStorageTests(unittest.TestCase):
 
     def _admit(
         self, external_id="external-1", producer_attempt_id="attempt-1", input_ref=None,
-        profile="interactive", kind="generate",
+        profile="interactive", kind="generate", source="producer",
     ):
         payload = {"prompt": external_id}
         input_hash, input_bytes = content_evidence(payload)
         return self.broker.submit(
-            profile, kind, payload, source="producer",
+            profile, kind, payload, source=source,
             source_item_id=external_id, external_id=external_id,
             producer_storage={
                 "producer_attempt_id": producer_attempt_id,
@@ -395,6 +395,43 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertEqual(
             self.broker.compact_status(first["id"])["producer_attempt_id"], "attempt-1",
         )
+
+    def test_producer_storage_retry_cannot_drop_capability_or_bypass_auth(self):
+        external_id = "protected-retry"
+        policy = json.loads(self.policy_path.read_text(encoding="utf-8"))
+        policy["sources"]["olya-vision"] = dict(policy["sources"]["producer"])
+        self.policy_path.write_text(json.dumps(policy), encoding="utf-8")
+        job = self._admit(external_id=external_id, source="olya-vision")
+        self.assertTrue(self.broker.dispatch_once(frozenset({"olya-vision"})))
+        self.assertEqual(self.broker.status(job["id"])["state"], "completed")
+        server = serve(
+            self.broker, port=0, policy=self.policy,
+            storage_token="test-storage-token-with-at-least-32-characters",
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        request = Request(
+            f"http://127.0.0.1:{server.server_port}/v1/jobs",
+            data=json.dumps({
+                "profile": "interactive",
+                "kind": "generate",
+                "payload": {"prompt": external_id},
+                "source": "olya-vision",
+                "source_item_id": external_id,
+                "external_id": external_id,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request)
+        self.assertEqual(caught.exception.code, 400)
+        response = json.loads(caught.exception.read())
+        self.assertIn("producer storage idempotency conflict", response["error"])
+        self.assertNotIn(job["id"], json.dumps(response))
+        self.assertNotIn(external_id, json.dumps(response))
 
     def test_cleanup_requires_all_source_and_receipt_guards(self):
         self._write_policy(ack_required=True, legacy_result_fallback=False)

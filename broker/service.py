@@ -613,36 +613,44 @@ class Broker:
                 # Rejection itself is durable observability, despite aborting admission.
                 self.db.commit()
                 raise SourceAdmissionBlocked(source)
-            if (
-                external_id is not None
-                and (
-                    source in {"olya-vision", "olya-decision", "syncopia-telegram-memory"}
-                    or producer_storage is not None
-                )
-            ):
+            if external_id is not None:
                 existing = self.db.execute(
                     "SELECT * FROM jobs WHERE source=? AND external_id=? "
                     "ORDER BY created DESC,id DESC LIMIT 1",
                     (source, external_id),
                 ).fetchone()
                 if existing is not None:
-                    if producer_storage is not None:
-                        checks = {
-                            "profile": profile,
-                            "kind": kind,
-                            "producer_attempt_id": storage_fields["producer_attempt_id"],
-                            "input_ref": storage_fields["input_ref"],
-                            "input_hash": storage_fields["input_hash"],
-                            "input_bytes": storage_fields["input_bytes"],
-                            "input_storage_mode": storage_fields["input_storage_mode"],
-                            "result_storage_mode": storage_fields["result_storage_mode"],
-                            "artifact_schema_version": storage_fields["artifact_schema_version"],
-                        }
-                        if any(existing[key] != value for key, value in checks.items()):
+                    existing_has_producer_storage = (
+                        existing["producer_attempt_id"] is not None
+                        or existing["input_storage_mode"] != "broker_temporary"
+                        or existing["result_storage_mode"] != "broker_temporary"
+                    )
+                    if (
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory"}
+                        or producer_storage is not None
+                        or existing_has_producer_storage
+                    ):
+                        if (producer_storage is not None) != existing_has_producer_storage:
                             raise ValueError(
                                 "producer storage idempotency conflict for existing correlation"
                             )
-                    return self.status(existing["id"])
+                        if producer_storage is not None:
+                            checks = {
+                                "profile": profile,
+                                "kind": kind,
+                                "producer_attempt_id": storage_fields["producer_attempt_id"],
+                                "input_ref": storage_fields["input_ref"],
+                                "input_hash": storage_fields["input_hash"],
+                                "input_bytes": storage_fields["input_bytes"],
+                                "input_storage_mode": storage_fields["input_storage_mode"],
+                                "result_storage_mode": storage_fields["result_storage_mode"],
+                                "artifact_schema_version": storage_fields["artifact_schema_version"],
+                            }
+                            if any(existing[key] != value for key, value in checks.items()):
+                                raise ValueError(
+                                    "producer storage idempotency conflict for existing correlation"
+                                )
+                        return self.status(existing["id"])
             self.db.execute(
                 "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
                 "queued_at,source_item_id,external_id,input_storage_mode,input_ref,input_hash,"

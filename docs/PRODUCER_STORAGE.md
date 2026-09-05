@@ -39,7 +39,10 @@ locally with mode `0600`; it is not stored in Git or operational evidence.
 Hashes cover UTF-8 JSON encoded with sorted keys and compact separators. Input
 hash and byte size must match the canonical broker payload. A repeated
 correlation with a different profile, request kind, or capability identity
-fails closed and preserves the original job.
+fails closed and preserves the original job. After a correlation is admitted
+with `producer_storage`, a retry that omits the capability is also a conflict;
+it cannot recover the producer-owned job through the unauthenticated legacy
+admission path.
 
 `POST /v1/jobs/{id}/input-received` confirms the declared input reference,
 hash, size, source, and producer attempt. `GET /v1/jobs/{id}/status` returns a
