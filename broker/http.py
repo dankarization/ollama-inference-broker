@@ -32,15 +32,19 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 raise SourcePolicyError("source policy is not configured")
             if source not in policy.snapshot()["sources"]:
                 raise SourcePolicyError(f"source {source!r} is not configured")
+        def _storage_authenticated(self):
+            if storage_token is None:
+                return False
+            prefix = "Bearer "
+            authorization = self.headers.get("Authorization", "")
+            return authorization.startswith(prefix) and hmac.compare_digest(
+                authorization[len(prefix):], storage_token,
+            )
         def _storage_authorized(self):
             if storage_token is None:
                 self._json(503, {"error": {"code": "storage_api_unavailable"}})
                 return False
-            prefix = "Bearer "
-            authorization = self.headers.get("Authorization", "")
-            if not authorization.startswith(prefix) or not hmac.compare_digest(
-                authorization[len(prefix):], storage_token,
-            ):
+            if not self._storage_authenticated():
                 self._json(401, {"error": {"code": "storage_auth_required"}})
                 return False
             return True
@@ -335,7 +339,10 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     limit = int(query.get("limit", ["30"])[0])
                     raw = query.get("cursor", [None])[0]
                     cursor = None if raw is None else (float(raw.rsplit(":", 1)[0]), raw.rsplit(":", 1)[1])
-                    body = broker.terminal_history(limit=limit, cursor=cursor)
+                    body = broker.terminal_history(
+                        limit=limit, cursor=cursor,
+                        include_producer_storage=self._storage_authenticated(),
+                    )
                     if body.get("next_cursor"):
                         body["next_cursor"] = f"{body['next_cursor'][0]}:{body['next_cursor'][1]}"
                     self._json(200, body)
@@ -350,6 +357,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                         job_id=query.get("job_id", [None])[0],
                         source=query.get("source", [None])[0],
                         since=float(since) if since is not None else None,
+                        include_producer_storage=self._storage_authenticated(),
                     )})
                 except ValueError:
                     self._json(400, {"error":"limit and since must be numeric"})
@@ -360,6 +368,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                         source_item_id=query.get("source_item_id", [None])[0],
                         external_id=query.get("external_id", [None])[0],
                         limit=int(query.get("limit", ["100"])[0]),
+                        include_producer_storage=self._storage_authenticated(),
                     )})
                 except ValueError as error:
                     self._json(400, {"error":str(error)})
@@ -369,7 +378,10 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 else:
                     self._json(200, {"policy": policy.snapshot()})
             elif path.startswith("/v1/jobs/") and path.endswith("/attempts"):
-                result=broker.attempts(path.split("/")[3]); self._json(200 if result is not None else 404, {"attempts":result} if result is not None else {"error":"not found"})
+                job_id = path.split("/")[3]
+                if broker.producer_storage_job(job_id) and not self._storage_authorized():
+                    return
+                result=broker.attempts(job_id); self._json(200 if result is not None else 404, {"attempts":result} if result is not None else {"error":"not found"})
             elif path.startswith("/v1/jobs/") and path.endswith("/receipt"):
                 if not self._storage_authorized():
                     return
@@ -379,7 +391,10 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     return
                 result=broker.compact_status(path.split("/")[3]); self._json(200 if result is not None else 404, result if result is not None else {"error":"not found"})
             elif path.startswith("/v1/jobs/"):
-                result=broker.status(path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
+                job_id = path.split("/")[3]
+                if broker.producer_storage_job(job_id) and not self._storage_authorized():
+                    return
+                result=broker.status(job_id); self._json(200 if result else 404, result or {"error":"not found"})
             else: self._json(404, {"error":"not found"})
         def log_message(self, *_): pass
     return ThreadingHTTPServer((host, port), Handler)

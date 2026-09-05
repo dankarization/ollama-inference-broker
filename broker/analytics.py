@@ -6,6 +6,8 @@ import sqlite3
 from collections import defaultdict
 from typing import Any, Iterable
 
+from .storage import PRODUCER_STORAGE_JOB_PREDICATE
+
 
 DEFAULT_WINDOWS = (300, 1_800, 10_800, 86_400)
 
@@ -39,6 +41,7 @@ def audit_history(
     job_id: str | None = None,
     source: str | None = None,
     since: float | None = None,
+    include_producer_storage: bool = True,
 ) -> list[dict[str, Any]]:
     clauses: list[str] = []
     values: list[Any] = []
@@ -51,6 +54,12 @@ def audit_history(
     if since is not None:
         clauses.append("occurred>=?")
         values.append(since)
+    if not include_producer_storage:
+        clauses.append(
+            "(job_id IS NULL OR NOT EXISTS (SELECT 1 FROM jobs "
+            "WHERE jobs.id=audit_events.job_id AND "
+            f"{PRODUCER_STORAGE_JOB_PREDICATE}))"
+        )
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     bounded_limit = max(1, min(int(limit), 1_000))
     rows = db.execute(

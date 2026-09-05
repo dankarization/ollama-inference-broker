@@ -42,12 +42,18 @@ correlation with a different profile, request kind, or capability identity
 fails closed and preserves the original job. After a correlation is admitted
 with `producer_storage`, a retry that omits the capability is also a conflict;
 it cannot recover the producer-owned job through the unauthenticated legacy
-admission path.
+admission path. An exact retry is resolved against the durable capability
+identity before current source storage/admission policy, so a lost admission
+response remains recoverable after a safe policy rollback.
 
 `POST /v1/jobs/{id}/input-received` confirms the declared input reference,
 hash, size, source, and producer attempt. `GET /v1/jobs/{id}/status` returns a
 payload-free lifecycle and artifact view. Existing `GET /v1/jobs/{id}` remains
-the legacy full-result API.
+the legacy full-result API for legacy jobs; a job admitted with
+`producer_storage` requires the storage bearer token before this endpoint or
+its attempt history can return data. Unauthenticated history, audit, and
+correlation reads omit producer-storage jobs, while authenticated reads retain
+the complete operational evidence.
 
 ## Result ACK
 
@@ -108,7 +114,9 @@ The broker configures `wal_autocheckpoint=4096` pages, a 64 MiB
 `journal_size_limit`, a 128 MiB alert budget, and periodic non-destructive
 `PASSIVE` checkpoints. It never runs `TRUNCATE` or `VACUUM`. Inspect
 `GET /v1/storage/health` and `GET /v1/metrics` for DB/WAL bytes, configured
-limits, and the last checkpoint result.
+limits, and the last checkpoint result. The unacked and quarantined health
+counts use dedicated partial indexes, so polling does not scan payload-heavy
+legacy history while holding the broker lock.
 
 Apply the schema to an explicit safe copy and write a payload-free report:
 

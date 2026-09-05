@@ -42,7 +42,10 @@ curl -sS 'http://127.0.0.1:8088/v1/correlations?source=olya-vision&external_id=I
 `window` задаётся в секундах, максимум один год. History limit ограничен 1000.
 Correlation lookup возвращает только job/source/profile/state/timestamps и
 идентификаторы, без payload/result. `GET /v1/jobs/{id}` оставлен без изменений
-ради обратной совместимости.
+для legacy jobs. Producer-storage jobs и их audit metadata видны через эти
+read endpoints только с owner-only storage bearer token; unauthenticated
+history/audit/correlation ответы их исключают, а legacy analytics остаётся
+доступной как прежде.
 
 Новые callers могут передавать в `POST /v1/jobs`:
 

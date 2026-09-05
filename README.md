@@ -263,7 +263,9 @@ Broker поддерживает opt-in capability `producer_storage` при `POS
 payload-free `GET /v1/jobs/{id}/status`, durable result receipt через
 `POST /v1/jobs/{id}/ack` и recovery через `GET /v1/jobs/{id}/receipt`.
 Старый `GET /v1/jobs/{id}` сохраняет полный payload/result, пока для source
-включён `legacy_result_fallback`.
+включён `legacy_result_fallback`, но для producer-storage job требует тот же
+owner-only bearer token. Без токена history/audit/correlation reads исключают
+такие jobs и их storage evidence; legacy jobs остаются доступны как прежде.
 
 Production policy allowlist уже описывает допустимый storage mode каждого
 известного producer, но безопасные начальные флаги остаются

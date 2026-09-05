@@ -29,6 +29,7 @@ from .storage import (
     DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
     DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
     DEFAULT_WAL_BUDGET_BYTES,
+    PRODUCER_STORAGE_JOB_PREDICATE,
     StorageManager,
     migrate_storage_schema,
 )
@@ -597,22 +598,10 @@ class Broker:
                 raise ValueError(str(exc)) from exc
         source_item_id = self._correlation_value("source_item_id", source_item_id)
         external_id = self._correlation_value("external_id", external_id)
-        storage_fields = self.storage.prepare_admission(source, payload, producer_storage)
         job_id, now = str(uuid.uuid4()), self.clock()
         with self.lock, self.db:
-            if self.source_policy is not None and not self.source_policy.admission_allowed(source):
-                self._audit(
-                    "admission.rejected", source=source,
-                    reason="source admission policy blocked new jobs", occurred=now,
-                    metadata={
-                        "code": SourceAdmissionBlocked.code,
-                        "profile": profile,
-                        "kind": kind,
-                    },
-                )
-                # Rejection itself is durable observability, despite aborting admission.
-                self.db.commit()
-                raise SourceAdmissionBlocked(source)
+            existing = None
+            existing_has_producer_storage = False
             if external_id is not None:
                 existing = self.db.execute(
                     "SELECT * FROM jobs WHERE source=? AND external_id=? "
@@ -635,6 +624,9 @@ class Broker:
                                 "producer storage idempotency conflict for existing correlation"
                             )
                         if producer_storage is not None:
+                            storage_fields = self.storage.prepare_admission(
+                                source, payload, producer_storage, persisted=existing,
+                            )
                             checks = {
                                 "profile": profile,
                                 "kind": kind,
@@ -651,6 +643,22 @@ class Broker:
                                     "producer storage idempotency conflict for existing correlation"
                                 )
                         return self.status(existing["id"])
+            storage_fields = self.storage.prepare_admission(source, payload, producer_storage)
+            if self.source_policy is not None and not self.source_policy.admission_allowed(source):
+                self._audit(
+                    "admission.rejected", source=source,
+                    reason="source admission policy blocked new jobs", occurred=now,
+                    metadata={
+                        "code": SourceAdmissionBlocked.code,
+                        "profile": profile,
+                        "kind": kind,
+                    },
+                )
+                # Rejection itself is durable observability, despite aborting admission.
+                self.db.commit()
+                raise SourceAdmissionBlocked(source)
+            if existing is not None:
+                return self.status(existing["id"])
             self.db.execute(
                 "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
                 "queued_at,source_item_id,external_id,input_storage_mode,input_ref,input_hash,"
@@ -798,6 +806,13 @@ class Broker:
     def storage_health(self) -> dict[str, Any]:
         return self.storage.health()
 
+    def producer_storage_job(self, job_id: str) -> bool:
+        with self.lock:
+            return self.db.execute(
+                f"SELECT 1 FROM jobs WHERE id=? AND {PRODUCER_STORAGE_JOB_PREDICATE}",
+                (job_id,),
+            ).fetchone() is not None
+
     def _job(self, row):
         data = dict(row)
         data.pop("priority", None)  # inert historic column is never public
@@ -924,10 +939,12 @@ class Broker:
     def audit_events(
         self, *, limit: int = 100, job_id: str | None = None,
         source: str | None = None, since: float | None = None,
+        include_producer_storage: bool = True,
     ) -> list[dict[str, Any]]:
         with self.lock:
             return audit_history(
-                self.db, limit=limit, job_id=job_id, source=source, since=since
+                self.db, limit=limit, job_id=job_id, source=source, since=since,
+                include_producer_storage=include_producer_storage,
             )
 
     def analytics(
@@ -1114,7 +1131,10 @@ class Broker:
         # An observer timeout or lock is not evidence that the queue is empty.
         return {"observation": self._observation("unavailable", now, error)}
 
-    def _terminal_history(self, db, *, limit: int, cursor: tuple[float, str] | None = None):
+    def _terminal_history(
+        self, db, *, limit: int, cursor: tuple[float, str] | None = None,
+        include_producer_storage: bool = True,
+    ):
         values: list[Any] = []
         clause = ""
         if cursor is not None:
@@ -1122,17 +1142,28 @@ class Broker:
             # keyset predicate into a multi-index OR that needs a temp sort.
             clause = " AND (finished,id) < (?,?)"
             values.extend(cursor)
+        storage_clause = (
+            "" if include_producer_storage
+            else f" AND NOT {PRODUCER_STORAGE_JOB_PREDICATE}"
+        )
         rows = db.execute(
             "SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count "
             "FROM jobs INDEXED BY jobs_terminal_history_v3 "
-            "WHERE state IN ('completed','failed','cancelled') AND finished IS NOT NULL" + clause +
+            "WHERE state IN ('completed','failed','cancelled') AND finished IS NOT NULL"
+            + storage_clause + clause +
             " ORDER BY finished DESC,id DESC LIMIT ?",
             (*values, max(1, min(limit, 30))),
         )
         return [dict(row) for row in rows]
 
-    def terminal_history(self, *, limit: int = 30, cursor: tuple[float, str] | None = None):
-        data, error = self._observer_read(lambda db: self._terminal_history(db, limit=limit, cursor=cursor))
+    def terminal_history(
+        self, *, limit: int = 30, cursor: tuple[float, str] | None = None,
+        include_producer_storage: bool = True,
+    ):
+        data, error = self._observer_read(lambda db: self._terminal_history(
+            db, limit=limit, cursor=cursor,
+            include_producer_storage=include_producer_storage,
+        ))
         if data is None:
             return {"unavailable": True, "reason": (error or {}).get("reason")}
         next_cursor = None if not data else [data[-1]["finished"], data[-1]["id"]]
@@ -1141,6 +1172,7 @@ class Broker:
     def correlations(
         self, *, source: str | None = None, source_item_id: str | None = None,
         external_id: str | None = None, limit: int = 100,
+        include_producer_storage: bool = True,
     ) -> list[dict[str, Any]]:
         if source_item_id is None and external_id is None:
             raise ValueError("source_item_id or external_id is required")
@@ -1155,6 +1187,8 @@ class Broker:
                 clauses.append(f"{column}=?")
                 values.append(value)
         bounded_limit = max(1, min(int(limit), 1_000))
+        if not include_producer_storage:
+            clauses.append(f"NOT {PRODUCER_STORAGE_JOB_PREDICATE}")
         with self.lock:
             rows = self.db.execute(
                 "SELECT id AS job_id,source,profile,state,created,finished,"

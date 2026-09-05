@@ -24,6 +24,11 @@ HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 SCHEMA_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ATTEMPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 STORAGE_MODES = frozenset({"broker_temporary", "producer_owned", "hybrid"})
+PRODUCER_STORAGE_JOB_PREDICATE = (
+    "(producer_attempt_id IS NOT NULL "
+    "OR input_storage_mode!='broker_temporary' "
+    "OR result_storage_mode!='broker_temporary')"
+)
 
 
 class StorageContractError(ValueError):
@@ -160,6 +165,15 @@ def migrate_storage_schema(
         "ON jobs(source,compaction_state,compaction_after,id) "
         "WHERE delivery_state='acked' AND ack_required=1 "
         "AND legacy_result_fallback=0"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS jobs_storage_unacked_terminal "
+        "ON jobs(state,result_storage_mode,delivery_state,id) WHERE state='completed' "
+        "AND result_storage_mode!='broker_temporary' AND delivery_state!='acked'"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS jobs_storage_quarantined "
+        "ON jobs(id) WHERE compaction_state='quarantined'"
     )
     db.execute(
         "INSERT OR IGNORE INTO broker_schema_migrations(version,name) VALUES(?,?)",
@@ -331,6 +345,7 @@ class StorageManager:
 
     def prepare_admission(
         self, source: str, payload: dict[str, Any], capability: Any,
+        *, persisted: sqlite3.Row | None = None,
     ) -> dict[str, Any]:
         payload_hash, payload_bytes = content_evidence(payload)
         defaults = {
@@ -352,8 +367,8 @@ class StorageManager:
             raise StorageContractError(
                 "producer_storage must contain only producer_attempt_id, input, and result"
             )
-        config = self._source_config(source)
-        if not config["producer_storage_enabled"]:
+        config = self._source_config(source) if persisted is None else None
+        if config is not None and not config["producer_storage_enabled"]:
             raise StorageContractError(f"producer storage is not enabled for source {source!r}")
         attempt = _attempt(capability.get("producer_attempt_id"))
         input_spec = capability.get("input", {})
@@ -365,19 +380,24 @@ class StorageManager:
         if not isinstance(result_spec, dict) or set(result_spec) - {"mode", "schema_version"}:
             raise StorageContractError("producer_storage.result has unsupported fields")
         input_mode = input_spec.get("mode", "broker_temporary")
-        result_mode = result_spec.get("mode", config["producer_storage_mode"])
+        default_result_mode = (
+            config["producer_storage_mode"]
+            if config is not None else persisted["result_storage_mode"]
+        )
+        result_mode = result_spec.get("mode", default_result_mode)
         for field, mode in (("input.mode", input_mode), ("result.mode", result_mode)):
             if mode not in STORAGE_MODES:
                 raise StorageContractError(f"producer_storage.{field} is invalid")
-        allowed_mode = config["producer_storage_mode"]
-        if result_mode not in {"broker_temporary", allowed_mode}:
-            raise StorageContractError(
-                f"result storage mode {result_mode!r} is not allowed for source {source!r}"
-            )
-        if input_mode not in {"broker_temporary", allowed_mode}:
-            raise StorageContractError(
-                f"input storage mode {input_mode!r} is not allowed for source {source!r}"
-            )
+        if config is not None:
+            allowed_mode = config["producer_storage_mode"]
+            if result_mode not in {"broker_temporary", allowed_mode}:
+                raise StorageContractError(
+                    f"result storage mode {result_mode!r} is not allowed for source {source!r}"
+                )
+            if input_mode not in {"broker_temporary", allowed_mode}:
+                raise StorageContractError(
+                    f"input storage mode {input_mode!r} is not allowed for source {source!r}"
+                )
         input_ref = input_spec.get("storage_ref")
         if input_mode != "broker_temporary":
             input_ref = _storage_ref(input_ref)
@@ -399,8 +419,14 @@ class StorageManager:
             "result_storage_mode": result_mode,
             "artifact_schema_version": schema_version,
             "producer_attempt_id": attempt,
-            "ack_required": int(bool(config["ack_required"] and result_mode != "broker_temporary")),
-            "legacy_result_fallback": int(bool(config["legacy_result_fallback"])),
+            "ack_required": int(bool(
+                (config["ack_required"] if config is not None else persisted["ack_required"])
+                and result_mode != "broker_temporary"
+            )),
+            "legacy_result_fallback": int(bool(
+                config["legacy_result_fallback"]
+                if config is not None else persisted["legacy_result_fallback"]
+            )),
         }
 
     def record_admission(
@@ -965,10 +991,12 @@ class StorageManager:
                 "SELECT "
                 "(SELECT count(*) FROM job_delivery_acks) AS receipts,"
                 "(SELECT count(*) FROM job_delivery_ack_conflicts) AS conflicts,"
-                "(SELECT count(*) FROM jobs WHERE state='completed' "
+                "(SELECT count(*) FROM jobs INDEXED BY jobs_storage_unacked_terminal "
+                "WHERE state='completed' "
                 "AND result_storage_mode!='broker_temporary' AND delivery_state!='acked') "
                 "AS unacked_terminal,"
-                "(SELECT count(*) FROM jobs WHERE compaction_state='quarantined') AS quarantined"
+                "(SELECT count(*) FROM jobs INDEXED BY jobs_storage_quarantined "
+                "WHERE compaction_state='quarantined') AS quarantined"
             ).fetchone())
             effective_wal_autocheckpoint_pages = int(
                 self.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0]

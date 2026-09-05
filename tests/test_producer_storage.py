@@ -169,6 +169,15 @@ class ProducerStorageTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertIn("WHERE delivery_state='acked' AND ack_required=1", index_sql)
         self.assertIn("legacy_result_fallback=0", index_sql)
+        health_indexes = {
+            row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name IN ('jobs_storage_unacked_terminal','jobs_storage_quarantined')"
+            )
+        }
+        self.assertEqual(health_indexes, {
+            "jobs_storage_unacked_terminal", "jobs_storage_quarantined",
+        })
         db.close()
 
     def test_migration_rejects_report_aliasing_database(self):
@@ -395,6 +404,24 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertEqual(
             self.broker.compact_status(first["id"])["producer_attempt_id"], "attempt-1",
         )
+
+    def test_exact_admission_retry_survives_current_policy_rollback(self):
+        first = self._admit(external_id="rollback-retry")
+        self._write_policy(
+            producer_storage_enabled=False,
+            producer_storage_mode="hybrid",
+            admission_allowed=False,
+        )
+        self.assertEqual(
+            self._admit(external_id="rollback-retry")["id"], first["id"],
+        )
+        with self.assertRaisesRegex(ValueError, "idempotency conflict"):
+            self._admit(
+                external_id="rollback-retry",
+                input_ref="producer://inputs/changed-after-rollback",
+            )
+        with self.assertRaisesRegex(StorageContractError, "not enabled"):
+            self._admit(external_id="new-after-rollback")
 
     def test_producer_storage_retry_cannot_drop_capability_or_bypass_auth(self):
         external_id = "protected-retry"
@@ -754,6 +781,84 @@ class ProducerStorageTests(unittest.TestCase):
         producer = self._admit(external_id="producer-health")
         self._complete(producer)
         self.assertEqual(self.broker.storage_health()["unacked_terminal"], 1)
+        query_plans = {
+            "unacked": self.broker.db.execute(
+                "EXPLAIN QUERY PLAN SELECT count(*) FROM jobs "
+                "INDEXED BY jobs_storage_unacked_terminal "
+                "WHERE state='completed' AND result_storage_mode!='broker_temporary' "
+                "AND delivery_state!='acked'"
+            ).fetchall(),
+            "quarantined": self.broker.db.execute(
+                "EXPLAIN QUERY PLAN SELECT count(*) FROM jobs "
+                "INDEXED BY jobs_storage_quarantined "
+                "WHERE compaction_state='quarantined'"
+            ).fetchall(),
+        }
+        self.assertIn(
+            "jobs_storage_unacked_terminal",
+            " ".join(str(row[3]) for row in query_plans["unacked"]),
+        )
+        self.assertIn(
+            "COVERING INDEX",
+            " ".join(str(row[3]) for row in query_plans["unacked"]),
+        )
+        self.assertIn(
+            "jobs_storage_quarantined",
+            " ".join(str(row[3]) for row in query_plans["quarantined"]),
+        )
+
+    def test_public_reads_protect_producer_jobs_and_storage_evidence(self):
+        job = self._admit(external_id="protected-public-read")
+        status = self._complete(job)
+        self._ack_input(job)
+        self.broker.acknowledge_result(job["id"], self._ack(job, status))
+        legacy = self.broker.submit(
+            "interactive", "generate", {"prompt": "legacy-public-read"},
+            source="producer", source_item_id="legacy-public-read",
+            external_id="legacy-public-read",
+        )
+        self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
+
+        token = "test-storage-token-with-at-least-32-characters"
+        authorization = {"Authorization": f"Bearer {token}"}
+        server = serve(self.broker, port=0, policy=self.policy, storage_token=token)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def get(path, headers=None):
+            with urlopen(Request(f"{base}{path}", headers=headers or {})) as response:
+                return json.loads(response.read())
+
+        for suffix in ("", "/attempts"):
+            with self.subTest(suffix=suffix), self.assertRaises(HTTPError) as caught:
+                get(f"/v1/jobs/{job['id']}{suffix}")
+            self.assertEqual(caught.exception.code, 401)
+        protected = get(f"/v1/jobs/{job['id']}", authorization)
+        self.assertEqual(protected["id"], job["id"])
+        self.assertIn("payload", protected)
+        self.assertIn("result", protected)
+
+        correlation_path = (
+            "/v1/correlations?source=producer&external_id=protected-public-read"
+        )
+        self.assertEqual(get(correlation_path)["jobs"], [])
+        self.assertEqual(
+            get(correlation_path, authorization)["jobs"][0]["job_id"], job["id"],
+        )
+        audit_path = f"/v1/audit-events?job_id={job['id']}&limit=100"
+        self.assertEqual(get(audit_path)["events"], [])
+        protected_audit = get(audit_path, authorization)["events"]
+        self.assertTrue(any(event["event_type"] == "delivery.acked" for event in protected_audit))
+        self.assertIn(status["result_hash"], json.dumps(protected_audit))
+
+        public_history = get("/v1/history?limit=30")["items"]
+        protected_history = get("/v1/history?limit=30", authorization)["items"]
+        self.assertIn(legacy["id"], {item["id"] for item in public_history})
+        self.assertNotIn(job["id"], {item["id"] for item in public_history})
+        self.assertIn(job["id"], {item["id"] for item in protected_history})
 
     def test_http_compact_status_ack_receipt_and_storage_health(self):
         job = self._admit()
