@@ -16,6 +16,7 @@ from broker.migration import main as migration_main
 from broker.policy import SourcePolicyError, normalize_source_policy
 from broker.rollback_guard import (
     LEGACY_HIDDEN_STORAGE_FIELDS,
+    _fsync_tree,
     prepare_rollback_release,
 )
 from broker.service import Broker, SourcePolicy
@@ -203,10 +204,21 @@ class ProducerStorageTests(unittest.TestCase):
             encoding="utf-8",
         )
         source_hash = hashlib.sha256(service.read_bytes()).hexdigest()
+        descendant = source / "rollback-protected"
+        with self.assertRaisesRegex(ValueError, "outside source release"):
+            prepare_rollback_release(
+                source, descendant, expected_service_sha256=source_hash,
+            )
+        self.assertFalse(descendant.exists())
         output = self.root / "rollback-protected"
-        report = prepare_rollback_release(
-            source, output, expected_service_sha256=source_hash,
-        )
+        with patch(
+            "broker.rollback_guard._fsync_tree", wraps=_fsync_tree,
+        ) as fsync_tree:
+            report = prepare_rollback_release(
+                source, output, expected_service_sha256=source_hash,
+            )
+        self.assertEqual(fsync_tree.call_count, 1)
+        self.assertEqual(fsync_tree.call_args.args[0].name, "release")
         namespace = {}
         exec((output / "broker" / "service.py").read_text(encoding="utf-8"), namespace)
         row = {
@@ -235,6 +247,24 @@ class ProducerStorageTests(unittest.TestCase):
                     SourcePolicyError, "finite non-negative",
                 ):
                     normalize_source_policy(raw)
+
+    def test_non_string_storage_mode_is_rejected_and_hot_reload_keeps_policy(self):
+        for value in ([], {}):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                SourcePolicyError, "producer_storage_mode must be",
+            ):
+                normalize_source_policy({
+                    "sources": {"producer": {"producer_storage_mode": value}},
+                })
+        self.assertEqual(
+            self.policy.storage_config("producer")["producer_storage_mode"],
+            "producer_owned",
+        )
+        self._write_policy(producer_storage_mode=[])
+        self.assertEqual(
+            self.policy.storage_config("producer")["producer_storage_mode"],
+            "producer_owned",
+        )
 
     def test_legacy_callers_still_admit_dispatch_and_fetch_full_result(self):
         job = self.broker.submit(
@@ -378,6 +408,40 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertNotEqual(self.broker.status(running["id"])["payload"], {})
         self.assertNotEqual(self.broker.status(cancel_requested["id"])["payload"], {})
         self.assertFalse(compacted["vacuum_performed"])
+
+    def test_cleanup_preserves_broker_temporary_inputs_without_durable_copy(self):
+        self._write_policy(ack_required=True, legacy_result_fallback=False)
+        jobs = []
+        for external_id, explicit_input in (
+            ("omitted-temporary-input", False),
+            ("explicit-temporary-input", True),
+        ):
+            payload = {"prompt": external_id}
+            capability = {
+                "producer_attempt_id": "attempt-1",
+                "result": {"mode": "producer_owned", "schema_version": "result-v1"},
+            }
+            if explicit_input:
+                capability["input"] = {"mode": "broker_temporary"}
+            job = self.broker.submit(
+                "interactive", "generate", payload, source="producer",
+                source_item_id=external_id, external_id=external_id,
+                producer_storage=capability,
+            )
+            status = self._complete(job)
+            self.broker.acknowledge_result(job["id"], self._ack(job, status))
+            jobs.append((job, payload))
+        self._write_policy(
+            ack_required=True, compaction_enabled=True, legacy_result_fallback=False,
+        )
+        preview = self.broker.storage_maintenance("producer")
+        self.assertEqual(preview["job_ids"], [])
+        for job, payload in jobs:
+            self.assertEqual(self.broker.status(job["id"])["payload"], payload)
+            self.assertIn("result", self.broker.status(job["id"]))
+            self.assertEqual(
+                self.broker.compact_status(job["id"])["compaction_state"], "full",
+            )
 
     def test_oversized_compaction_candidate_does_not_starve_later_jobs(self):
         self._write_policy(
@@ -603,6 +667,45 @@ class ProducerStorageTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as caught:
             urlopen(conflict)
         self.assertEqual(caught.exception.code, 409)
+
+    def test_malformed_storage_refs_return_json_400(self):
+        job = self._admit(external_id="malformed-storage-ref")
+        status = self._complete(job)
+        token = "test-storage-token-with-at-least-32-characters"
+        authorization = {"Authorization": f"Bearer {token}"}
+        server = serve(
+            self.broker, port=0, policy=self.policy, storage_token=token,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_port}"
+        input_status = self.broker.compact_status(job["id"])
+        cases = (
+            ("input-received", {
+                "job_id": job["id"],
+                "producer": "producer",
+                "producer_attempt_id": "attempt-1",
+                "storage_ref": "http://[broken",
+                "input_hash": input_status["input_hash"],
+                "input_bytes": input_status["input_bytes"],
+                "persisted_at": "2026-09-05T03:59:00Z",
+            }),
+            ("ack", self._ack(job, status, storage_ref="http://[broken")),
+        )
+        for suffix, body in cases:
+            request = Request(
+                f"{base}/v1/jobs/{job['id']}/{suffix}",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json", **authorization},
+                method="POST",
+            )
+            with self.subTest(suffix=suffix), self.assertRaises(HTTPError) as caught:
+                urlopen(request)
+            self.assertEqual(caught.exception.code, 400)
+            response = json.loads(caught.exception.read())
+            self.assertIn("storage_ref", response["error"])
 
     def test_storage_mutations_require_configured_token(self):
         job = self._admit()

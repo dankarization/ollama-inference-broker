@@ -83,9 +83,12 @@ Mutation requires `confirm=true`. All four source guards must be true:
 The job must also have persisted `ack_required=true` and
 `legacy_result_fallback=false` from its own admission, be `completed`, have a
 matching durable receipt and ACKed result artifact, and pass the configured
-grace periods. Enabling destructive source flags later never adopts jobs
-admitted under additive/legacy defaults. `quarantine` only marks eligibility.
-`compact` removes inline payload/result after quarantine.
+grace periods. It must also have a producer-owned input artifact with a
+matching durable input receipt; broker-temporary inputs never qualify because
+the inline payload is their only durable copy. Enabling destructive source
+flags later never adopts jobs admitted under additive/legacy defaults.
+`quarantine` only marks eligibility. `compact` removes inline payload/result
+after quarantine.
 Each compact transaction is capped by both `limit` (default 100 rows) and
 `max_bytes` (default 16 MiB, hard maximum 64 MiB); an individually oversized
 row is held for explicit operator handling rather than violating the WAL
@@ -150,8 +153,10 @@ python3 -m broker.rollback_guard \
 
 The tool accepts only the reviewed parent `broker/service.py` hash, copies the
 release without Git/cache state, injects the same 22-field legacy response
-filter, compiles the patched source, and reports only paths and hashes. Verify
-the rollback copy with `compileall` and the legacy API test before continuing.
+filter, compiles the patched source, fsyncs every regular file and directory
+before publishing the artifact, and reports only paths and hashes. The output
+must be outside the source release tree. Verify the rollback copy with
+`compileall` and the legacy API test before continuing.
 Deploy a new immutable release and atomically switch the service working
 directory. After restart verify HTTP health,
 payload-free storage health, unchanged source weights, state counts, receipt

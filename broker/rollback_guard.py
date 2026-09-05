@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 
@@ -34,6 +35,30 @@ SERIALIZER_GUARD = (
 
 def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def _fsync_tree(root: Path) -> None:
+    directories: list[Path] = []
+    for current, _subdirectories, filenames in os.walk(root, followlinks=False):
+        directory = Path(current)
+        directories.append(directory)
+        for filename in filenames:
+            path = directory / filename
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                continue
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    for directory in reversed(directories):
+        descriptor = os.open(
+            directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def harden_legacy_service(source: str) -> str:
@@ -70,6 +95,8 @@ def prepare_rollback_release(
         raise ValueError("output rollback release already exists")
     if source_release == output_release:
         raise ValueError("output rollback release must differ from source release")
+    if source_release in output_release.parents:
+        raise ValueError("output rollback release must be outside source release")
     original_bytes = source_service.read_bytes()
     original_hash = _sha256(original_bytes)
     if original_hash != expected_service_sha256:
@@ -95,6 +122,7 @@ def prepare_rollback_release(
         mode = target_service.stat().st_mode & 0o7777
         target_service.write_text(hardened, encoding="utf-8")
         os.chmod(target_service, mode)
+        _fsync_tree(staged)
         os.replace(staged, output_release)
         directory = os.open(output_release.parent, os.O_RDONLY)
         try:

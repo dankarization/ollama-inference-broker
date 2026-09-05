@@ -57,7 +57,10 @@ def normalize_source_policy(raw: Any) -> dict[str, dict[str, Any]]:
         ):
             if not isinstance(value, bool):
                 raise SourcePolicyError(f"source {name!r} {field} must be a boolean")
-        if producer_storage_mode not in {"broker_temporary", "producer_owned", "hybrid"}:
+        if (
+            not isinstance(producer_storage_mode, str)
+            or producer_storage_mode not in {"broker_temporary", "producer_owned", "hybrid"}
+        ):
             raise SourcePolicyError(
                 f"source {name!r} producer_storage_mode must be broker_temporary, "
                 "producer_owned, or hybrid"

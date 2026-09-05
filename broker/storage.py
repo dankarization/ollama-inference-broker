@@ -256,7 +256,10 @@ def _attempt(value: Any) -> str:
 
 def _storage_ref(value: Any) -> str:
     value = _nonempty(value, "storage_ref", 2048)
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise StorageContractError("storage_ref is not a valid URI") from exc
     if not parsed.scheme or not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]{1,31}", parsed.scheme):
         raise StorageContractError("storage_ref must use an explicit URI scheme")
     if parsed.query or parsed.fragment or parsed.username or parsed.password:
@@ -827,10 +830,11 @@ class StorageManager:
             "AND NOT EXISTS(SELECT 1 FROM job_delivery_ack_conflicts c WHERE c.job_id=j.id) "
             "AND EXISTS(SELECT 1 FROM job_artifacts a WHERE a.job_id=j.id "
             "AND a.role='result' AND a.state='acked' AND a.content_hash=j.result_hash) "
-            "AND (j.input_storage_mode='broker_temporary' OR EXISTS("
+            "AND j.input_storage_mode!='broker_temporary' "
+            "AND EXISTS("
             "SELECT 1 FROM job_artifacts a WHERE a.job_id=j.id AND a.role='input' "
             "AND a.state='acked' AND a.content_hash=j.input_hash "
-            "AND a.storage_ref=j.input_ref)) "
+            "AND a.storage_ref=j.input_ref) "
         )
         sql = (
             "SELECT j.id," + inline_expression + " AS inline_bytes " + eligibility
