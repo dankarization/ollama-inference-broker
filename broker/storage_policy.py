@@ -82,6 +82,14 @@ def write_atomic(path: Path, value: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
+def same_file(left: Path, right: Path) -> bool:
+    """Detect identical destinations, including symlinks and hard links."""
+    try:
+        return left.samefile(right)
+    except OSError:
+        return left.resolve() == right.resolve()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Add safe producer-storage flags while preserving source controls",
@@ -94,6 +102,8 @@ def main() -> None:
         parser.error("use either --apply or --output")
     if not args.policy.is_file():
         parser.error("--policy must name an existing JSON file")
+    if args.output is not None and same_file(args.policy, args.output):
+        parser.error("use --apply instead of writing --output over --policy")
     raw = json.loads(args.policy.read_text(encoding="utf-8"))
     staged, report = stage_storage_policy(raw)
     if args.apply:

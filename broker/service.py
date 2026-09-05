@@ -267,6 +267,7 @@ class Broker:
             checkpoint_interval_seconds=float(checkpoint_interval_seconds),
         )
         self.recover()
+        self.storage.reconcile()
         with self.lock:
             self._refresh_health_cache_locked()
 
@@ -537,8 +538,6 @@ class Broker:
             if expired:
                 self._refresh_health_cache_locked()
             self.completed.notify_all()
-        self.storage.reconcile()
-
     def submit(self, profile: str, kind: str, payload: dict, source: str | None = None,
                source_item_id: str | None = None,
                external_id: str | None = None,
@@ -635,6 +634,7 @@ class Broker:
                     if producer_storage is not None:
                         checks = {
                             "producer_attempt_id": storage_fields["producer_attempt_id"],
+                            "input_ref": storage_fields["input_ref"],
                             "input_hash": storage_fields["input_hash"],
                             "input_bytes": storage_fields["input_bytes"],
                             "input_storage_mode": storage_fields["input_storage_mode"],

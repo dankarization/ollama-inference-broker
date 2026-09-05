@@ -1,9 +1,11 @@
 import json
+import io
 import sqlite3
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -16,7 +18,7 @@ from broker.storage import (
     migrate_storage_schema,
     storage_schema_report,
 )
-from broker.storage_policy import stage_storage_policy
+from broker.storage_policy import main as storage_policy_main, stage_storage_policy
 
 
 class FakeOllama:
@@ -69,7 +71,9 @@ class ProducerStorageTests(unittest.TestCase):
             "sources": {"producer": source},
         }), encoding="utf-8")
 
-    def _admit(self, external_id="external-1", producer_attempt_id="attempt-1"):
+    def _admit(
+        self, external_id="external-1", producer_attempt_id="attempt-1", input_ref=None,
+    ):
         payload = {"prompt": external_id}
         input_hash, input_bytes = content_evidence(payload)
         return self.broker.submit(
@@ -79,7 +83,7 @@ class ProducerStorageTests(unittest.TestCase):
                 "producer_attempt_id": producer_attempt_id,
                 "input": {
                     "mode": "producer_owned",
-                    "storage_ref": f"producer://inputs/{external_id}",
+                    "storage_ref": input_ref or f"producer://inputs/{external_id}",
                     "content_hash": input_hash,
                     "byte_size": input_bytes,
                 },
@@ -224,18 +228,27 @@ class ProducerStorageTests(unittest.TestCase):
                 job["id"], {**body, "input_hash": "sha256:" + "0" * 64},
             )
 
+    def test_exact_input_receipt_retry_survives_policy_rollback(self):
+        job = self._admit()
+        receipt = self._ack_input(job)
+        self._write_policy(producer_storage_enabled=False)
+        self.assertEqual(self._ack_input(job), receipt)
+        self.assertEqual(self.broker.receipt(job["id"])["conflicts"], [])
+
     def test_idempotent_admission_rejects_conflicting_storage_identity(self):
         first = self._admit()
         repeat = self._admit()
         self.assertEqual(repeat["id"], first["id"])
         with self.assertRaisesRegex(ValueError, "idempotency conflict"):
             self._admit(producer_attempt_id="attempt-2")
+        with self.assertRaisesRegex(ValueError, "idempotency conflict"):
+            self._admit(input_ref="producer://inputs/changed")
         self.assertEqual(
             self.broker.compact_status(first["id"])["producer_attempt_id"], "attempt-1",
         )
 
     def test_cleanup_requires_all_source_and_receipt_guards(self):
-        self._write_policy(ack_required=True)
+        self._write_policy(ack_required=True, legacy_result_fallback=False)
         job = self._admit()
         status = self._complete(job)
         self._ack_input(job)
@@ -284,6 +297,39 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertNotEqual(self.broker.status(cancel_requested["id"])["payload"], {})
         self.assertFalse(compacted["vacuum_performed"])
 
+    def test_cleanup_does_not_adopt_jobs_with_legacy_admission_guards(self):
+        jobs = []
+        for external_id, flags in (
+            ("ack-optional", {"ack_required": False, "legacy_result_fallback": False}),
+            ("legacy-fallback", {"ack_required": True, "legacy_result_fallback": True}),
+        ):
+            self._write_policy(**flags)
+            job = self._admit(external_id=external_id)
+            status = self._complete(job)
+            self._ack_input(job)
+            self.broker.acknowledge_result(job["id"], self._ack(job, status))
+            jobs.append(job["id"])
+        self._write_policy(
+            ack_required=True, compaction_enabled=True, legacy_result_fallback=False,
+        )
+        preview = self.broker.storage_maintenance("producer")
+        self.assertEqual(preview["job_ids"], [])
+        for job_id in jobs:
+            self.assertEqual(self.broker.compact_status(job_id)["compaction_state"], "full")
+
+    def test_storage_mutations_require_literal_boolean_confirmation(self):
+        self._write_policy(
+            ack_required=True, compaction_enabled=True, legacy_result_fallback=False,
+        )
+        for operation in ("quarantine", "compact"):
+            for confirm in ("true", "false", 1):
+                with self.subTest(operation=operation, confirm=confirm), self.assertRaisesRegex(
+                    StorageContractError, "confirm=true",
+                ):
+                    self.broker.storage_maintenance(
+                        "producer", operation=operation, confirm=confirm,
+                    )
+
     def test_receipt_repairs_derived_state_after_restart(self):
         job = self._admit()
         status = self._complete(job)
@@ -300,6 +346,15 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertEqual(
             restarted.receipt(job["id"])["receipt"]["receipt_id"], receipt["receipt_id"],
         )
+
+    def test_full_receipt_reconciliation_runs_once_at_startup(self):
+        database = self.root / "startup-reconcile.sqlite3"
+        with patch("broker.service.StorageManager.reconcile", autospec=True, return_value=0) as reconcile:
+            broker = Broker(database, FakeOllama(), FakeWol())
+            self.addCleanup(broker.db.close)
+            broker.recover()
+            broker.recover()
+        self.assertEqual(reconcile.call_count, 1)
 
     def test_wal_policy_is_bounded_and_passive(self):
         self.assertEqual(self.broker.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0], 4096)
@@ -337,6 +392,34 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertTrue(staged["sources"]["olya-vision"]["producer_storage_enabled"])
         self.assertNotIn("producer_storage_enabled", staged["sources"]["uncensored-eval"])
         self.assertFalse(staged["sources"]["olya-vision"]["compaction_enabled"])
+
+    def test_storage_policy_rejects_output_aliasing_live_policy(self):
+        live = self.root / "live-sources.json"
+        original = json.dumps({
+            "version": 1,
+            "sources": {"olya-vision": {"enabled": True, "weight": 8}},
+        })
+        live.write_text(original, encoding="utf-8")
+        with (
+            patch("sys.argv", [
+                "storage-policy", "--policy", str(live), "--output", str(live),
+            ]),
+            patch("sys.stderr", new_callable=io.StringIO),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            storage_policy_main()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(live.read_text(encoding="utf-8"), original)
+
+    def test_storage_health_excludes_non_ack_capable_legacy_results(self):
+        legacy = self.broker.submit(
+            "interactive", "generate", {"prompt": "legacy-health"}, source="producer",
+        )
+        self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
+        self.assertEqual(self.broker.status(legacy["id"])["state"], "completed")
+        producer = self._admit(external_id="producer-health")
+        self._complete(producer)
+        self.assertEqual(self.broker.storage_health()["unacked_terminal"], 1)
 
     def test_http_compact_status_ack_receipt_and_storage_health(self):
         job = self._admit()

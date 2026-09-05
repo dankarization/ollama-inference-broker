@@ -12,7 +12,7 @@ from urllib.request import urlopen
 from broker.http import serve
 from broker.__main__ import (
     dispatch_enabled, dispatch_sources, install_drain_handler, positive_integer,
-    storage_token,
+    positive_number, storage_token,
 )
 from broker.adapters import OllamaHTTP
 from broker.service import Broker
@@ -71,6 +71,12 @@ class BrokerTests(unittest.TestCase):
         for value in ("0", "1.5", "invalid"):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "positive integer"):
                 positive_integer(value, 4096, "WAL")
+
+    def test_wal_checkpoint_interval_requires_a_finite_positive_number(self):
+        self.assertEqual(positive_number("1.5", 60, "WAL interval"), 1.5)
+        for value in ("0", "nan", "inf", "-inf", "invalid"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "positive number"):
+                positive_number(value, 60, "WAL interval")
 
     def test_storage_token_file_must_be_owner_only(self):
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as handle:

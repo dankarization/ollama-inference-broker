@@ -80,9 +80,12 @@ Mutation requires `confirm=true`. All four source guards must be true:
 3. `compaction_enabled=true`;
 4. `legacy_result_fallback=false`.
 
-The job must also be `completed`, have a matching durable receipt and ACKed
-result artifact, and pass the configured grace periods. `quarantine` only
-marks eligibility. `compact` removes inline payload/result after quarantine.
+The job must also have persisted `ack_required=true` and
+`legacy_result_fallback=false` from its own admission, be `completed`, have a
+matching durable receipt and ACKed result artifact, and pass the configured
+grace periods. Enabling destructive source flags later never adopts jobs
+admitted under additive/legacy defaults. `quarantine` only marks eligibility.
+`compact` removes inline payload/result after quarantine.
 Each compact transaction is capped by both `limit` (default 100 rows) and
 `max_bytes` (default 16 MiB, hard maximum 64 MiB); an individually oversized
 row is held for explicit operator handling rather than violating the WAL

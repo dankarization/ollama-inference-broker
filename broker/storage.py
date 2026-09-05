@@ -624,11 +624,11 @@ class StorageManager:
         }
         now = self.clock()
         received_at = now
+        reason: str | None = None
         with self.lock, self.db:
             row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if row is None:
                 return None
-            config = self._source_config(row["source"])
             checks = [
                 (normalized["job_id"] == job_id, "input receipt job_id mismatch"),
                 (normalized["producer"] == row["source"], "input receipt producer mismatch"),
@@ -636,13 +636,32 @@ class StorageManager:
                  "input receipt attempt mismatch"),
                 (row["input_storage_mode"] != "broker_temporary",
                  "job did not declare producer-owned input storage"),
-                (bool(config["producer_storage_enabled"]),
-                 "producer storage is disabled for this source"),
                 (normalized["storage_ref"] == row["input_ref"], "input storage_ref mismatch"),
                 (normalized["input_hash"] == row["input_hash"], "input_hash mismatch"),
                 (normalized["input_bytes"] == row["input_bytes"], "input_bytes mismatch"),
             ]
             reason = next((reason for valid, reason in checks if not valid), None)
+            if reason is None and row["input_received_at"] is not None:
+                artifact = self.db.execute(
+                    "SELECT persisted_at FROM job_artifacts WHERE job_id=? AND role='input'",
+                    (job_id,),
+                ).fetchone()
+                if artifact is not None and artifact["persisted_at"] == normalized["persisted_at"]:
+                    return {
+                        "job_id": job_id,
+                        "producer": normalized["producer"],
+                        "producer_attempt_id": normalized["producer_attempt_id"],
+                        "storage_ref": normalized["storage_ref"],
+                        "input_hash": normalized["input_hash"],
+                        "input_bytes": normalized["input_bytes"],
+                        "persisted_at": normalized["persisted_at"],
+                        "received_at": row["input_received_at"],
+                    }
+                reason = "input receipt conflicts with the durable receipt"
+            if reason is None:
+                config = self._source_config(row["source"])
+                if not config["producer_storage_enabled"]:
+                    reason = "producer storage is disabled for this source"
             if reason is not None:
                 self._conflict(row, {
                     "producer": normalized["producer"],
@@ -650,20 +669,6 @@ class StorageManager:
                     "storage_ref": normalized["storage_ref"],
                     "result_hash": normalized["input_hash"],
                 }, reason, now)
-            elif row["input_received_at"] is not None:
-                artifact = self.db.execute(
-                    "SELECT persisted_at FROM job_artifacts WHERE job_id=? AND role='input'",
-                    (job_id,),
-                ).fetchone()
-                if artifact is None or artifact["persisted_at"] != normalized["persisted_at"]:
-                    reason = "input receipt conflicts with the durable receipt"
-                    self._conflict(row, {
-                        "producer": normalized["producer"],
-                        "producer_attempt_id": normalized["producer_attempt_id"],
-                        "storage_ref": normalized["storage_ref"],
-                        "result_hash": normalized["input_hash"],
-                    }, reason, now)
-                received_at = row["input_received_at"]
             else:
                 self.db.execute(
                     "UPDATE jobs SET input_received_at=? WHERE id=?", (now, job_id)
@@ -812,6 +817,7 @@ class StorageManager:
             "coalesce(length(CAST(j.result_json AS BLOB)),0) AS inline_bytes "
             "FROM jobs j WHERE j.source=? AND j.state='completed' "
             "AND j.delivery_state='acked' AND j.compaction_state=? AND " + time_clause + " "
+            "AND j.ack_required=1 AND j.legacy_result_fallback=0 "
             "AND j.producer_attempt_id IS NOT NULL "
             "AND EXISTS(SELECT 1 FROM job_delivery_acks a WHERE a.job_id=j.id "
             "AND a.producer=j.source AND a.producer_attempt_id=j.producer_attempt_id "
@@ -841,7 +847,7 @@ class StorageManager:
                 inline_bytes += row_bytes
             changed = 0
             if operation != "preview":
-                if not confirm:
+                if confirm is not True:
                     raise StorageContractError("maintenance mutation requires confirm=true")
                 for job_id in ids:
                     if operation == "quarantine":
@@ -932,7 +938,8 @@ class StorageManager:
                 "SELECT "
                 "(SELECT count(*) FROM job_delivery_acks) AS receipts,"
                 "(SELECT count(*) FROM job_delivery_ack_conflicts) AS conflicts,"
-                "(SELECT count(*) FROM jobs WHERE state='completed' AND delivery_state!='acked') "
+                "(SELECT count(*) FROM jobs WHERE state='completed' "
+                "AND result_storage_mode!='broker_temporary' AND delivery_state!='acked') "
                 "AS unacked_terminal,"
                 "(SELECT count(*) FROM jobs WHERE compaction_state='quarantined') AS quarantined"
             ).fetchone())

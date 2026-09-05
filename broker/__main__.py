@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import signal
 from pathlib import Path
@@ -45,7 +46,7 @@ def positive_number(value: str | None, default: float, name: str) -> float:
         parsed = float(value)
     except ValueError as exc:
         raise ValueError(f"{name} must be a positive number") from exc
-    if parsed <= 0:
+    if not math.isfinite(parsed) or parsed <= 0:
         raise ValueError(f"{name} must be a positive number")
     return parsed
 
