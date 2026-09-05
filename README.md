@@ -74,6 +74,9 @@ Ollama, Shutterstock, M101 или MAIN-PC.
 отдельного разрешения на canary dispatch.
 
 ```bash
+install -d -m 0700 ~/.local/state/ollama-inference-broker
+python3 -c 'import pathlib,secrets; pathlib.Path.home().joinpath(".local/state/ollama-inference-broker/storage-api.token").open("x",encoding="utf-8").write(secrets.token_urlsafe(48)+"\n")'
+chmod 0600 ~/.local/state/ollama-inference-broker/storage-api.token
 install -D -m 0644 systemd/ollama-inference-broker.service \
   ~/.config/systemd/user/ollama-inference-broker.service
 systemctl --user daemon-reload
@@ -253,6 +256,29 @@ feature commit.
 `weight` — единственный scheduling-параметр: он задаёт прямую долю source в
 time-batch scheduler. Policy с неизвестным ключом отклоняется, чтобы конфигурация не могла
 молча стать default `1.0`.
+
+### Producer-owned storage: additive safe rollout
+
+Broker поддерживает opt-in capability `producer_storage` при `POST /v1/jobs`,
+payload-free `GET /v1/jobs/{id}/status`, durable result receipt через
+`POST /v1/jobs/{id}/ack` и recovery через `GET /v1/jobs/{id}/receipt`.
+Старый `GET /v1/jobs/{id}` сохраняет полный payload/result, пока для source
+включён `legacy_result_fallback`.
+
+Production policy allowlist уже описывает допустимый storage mode каждого
+известного producer, но безопасные начальные флаги остаются
+`ack_required=false`, `compaction_enabled=false` и
+`legacy_result_fallback=true`. Поэтому deployment схемы и receipt API сам по
+себе не удаляет данные. Quarantine/compaction требует отдельного source-scoped
+переключения всех guard-флагов, matching ACK и двух grace periods. Общего TTL
+cleanup, исторической adoption, `VACUUM` и `TRUNCATE` этот этап не выполняет.
+
+WAL ограничивается `wal_autocheckpoint=4096`,
+`journal_size_limit=67108864`, alert budget 128 MiB и периодическим
+`PASSIVE` checkpoint. Текущая политика и метрики доступны через
+`GET /v1/storage/health`; точный контракт, migration copy tooling и
+lossless rollout/rollback описаны в
+[docs/PRODUCER_STORAGE.md](docs/PRODUCER_STORAGE.md).
 
 ### User-facing Weight (1 lowest … 10 highest)
 

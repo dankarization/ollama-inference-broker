@@ -1,4 +1,5 @@
 from __future__ import annotations
+import hmac
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -10,9 +11,10 @@ from .profiles import PROFILES
 from .dashboard import render as render_dashboard
 from .policy import SourcePolicyError
 from .service import SourceAdmissionBlocked
+from .storage import ReceiptConflict, StorageContractError
 
 
-def serve(broker, host="127.0.0.1", port=8088, policy=None):
+def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
     broker.use_source_policy(policy)
     class Handler(BaseHTTPRequestHandler):
         def _json(self, status, value):
@@ -30,6 +32,18 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                 raise SourcePolicyError("source policy is not configured")
             if source not in policy.snapshot()["sources"]:
                 raise SourcePolicyError(f"source {source!r} is not configured")
+        def _storage_authorized(self):
+            if storage_token is None:
+                self._json(503, {"error": {"code": "storage_api_unavailable"}})
+                return False
+            prefix = "Bearer "
+            authorization = self.headers.get("Authorization", "")
+            if not authorization.startswith(prefix) or not hmac.compare_digest(
+                authorization[len(prefix):], storage_token,
+            ):
+                self._json(401, {"error": {"code": "storage_auth_required"}})
+                return False
+            return True
         def do_POST(self):
             size=int(self.headers.get("Content-Length", 0))
             try:
@@ -39,12 +53,54 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                 return
             path = urlsplit(self.path).path
             if path == "/v1/jobs":
+                if (
+                    isinstance(body, dict) and body.get("producer_storage") is not None
+                    and not self._storage_authorized()
+                ):
+                    return
                 try:
                     self._json(202, broker.submit(body["profile"], body["kind"], body.get("payload", {}),
                                                   body.get("source"), body.get("source_item_id"),
-                                                  body.get("external_id")))
+                                                  body.get("external_id"),
+                                                  body.get("producer_storage")))
                 except SourceAdmissionBlocked as error: self._admission_blocked(error)
-                except (KeyError, ValueError) as e: self._json(400, {"error": str(e)})
+                except (KeyError, TypeError, ValueError, StorageContractError) as e: self._json(400, {"error": str(e)})
+            elif path.startswith("/v1/jobs/") and path.endswith("/input-received"):
+                if not self._storage_authorized():
+                    return
+                try:
+                    result = broker.acknowledge_input(path.split("/")[3], body)
+                    self._json(200 if result else 404, result or {"error": "not found"})
+                except ReceiptConflict as error:
+                    self._json(409, {"error": {"code": error.code, "message": str(error)}})
+                except StorageContractError as error:
+                    self._json(400, {"error": str(error)})
+            elif path.startswith("/v1/jobs/") and path.endswith("/ack"):
+                if not self._storage_authorized():
+                    return
+                try:
+                    result = broker.acknowledge_result(path.split("/")[3], body)
+                    self._json(200 if result else 404, result or {"error": "not found"})
+                except ReceiptConflict as error:
+                    self._json(409, {"error": {"code": error.code, "message": str(error)}})
+                except StorageContractError as error:
+                    self._json(400, {"error": str(error)})
+            elif path == "/v1/maintenance/compact":
+                if not self._storage_authorized():
+                    return
+                try:
+                    if not isinstance(body, dict) or set(body) - {
+                        "source", "operation", "limit", "confirm", "max_bytes",
+                    }:
+                        raise StorageContractError("invalid maintenance request fields")
+                    result = broker.storage_maintenance(
+                        body["source"], operation=body.get("operation", "preview"),
+                        limit=body.get("limit", 100), confirm=body.get("confirm", False),
+                        max_bytes=body.get("max_bytes", 16 * 1024 * 1024),
+                    )
+                    self._json(200, result)
+                except (KeyError, StorageContractError) as error:
+                    self._json(409, {"error": str(error)})
             elif path.startswith("/v1/jobs/") and path.endswith("/cancel"):
                 result=broker.cancel(path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
             elif path.startswith("/v1/jobs/") and path.endswith("/retry"):
@@ -256,6 +312,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                 self._json(503 if dashboard["observation"]["state"] == "unavailable" else 200, dashboard)
             elif path == "/healthz": self._json(200, broker.health())
             elif path == "/v1/metrics": self._json(200, broker.metrics())
+            elif path == "/v1/storage/health": self._json(200, broker.storage_health())
             elif path == "/v1/analytics":
                 try:
                     windows = tuple(
@@ -313,6 +370,14 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None):
                     self._json(200, {"policy": policy.snapshot()})
             elif path.startswith("/v1/jobs/") and path.endswith("/attempts"):
                 result=broker.attempts(path.split("/")[3]); self._json(200 if result is not None else 404, {"attempts":result} if result is not None else {"error":"not found"})
+            elif path.startswith("/v1/jobs/") and path.endswith("/receipt"):
+                if not self._storage_authorized():
+                    return
+                result=broker.receipt(path.split("/")[3]); self._json(200 if result is not None else 404, result if result is not None else {"error":"not found"})
+            elif path.startswith("/v1/jobs/") and path.endswith("/status"):
+                if not self._storage_authorized():
+                    return
+                result=broker.compact_status(path.split("/")[3]); self._json(200 if result is not None else 404, result if result is not None else {"error":"not found"})
             elif path.startswith("/v1/jobs/"):
                 result=broker.status(path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
             else: self._json(404, {"error":"not found"})
