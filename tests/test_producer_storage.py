@@ -460,6 +460,19 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertNotIn(job["id"], json.dumps(response))
         self.assertNotIn(external_id, json.dumps(response))
 
+    def test_legacy_non_idempotent_source_may_reuse_external_id(self):
+        first = self.broker.submit(
+            "interactive", "generate", {"prompt": "first"},
+            source="producer", external_id="reused-legacy-correlation",
+        )
+        second = self.broker.submit(
+            "interactive", "generate", {"prompt": "second"},
+            source="producer", external_id="reused-legacy-correlation",
+        )
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(first["payload"], {"prompt": "first"})
+        self.assertEqual(second["payload"], {"prompt": "second"})
+
     def test_cleanup_requires_all_source_and_receipt_guards(self):
         self._write_policy(ack_required=True, legacy_result_fallback=False)
         job = self._admit()
@@ -859,6 +872,50 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertIn(legacy["id"], {item["id"] for item in public_history})
         self.assertNotIn(job["id"], {item["id"] for item in public_history})
         self.assertIn(job["id"], {item["id"] for item in protected_history})
+
+    def test_http_cancel_and_retry_require_producer_storage_auth(self):
+        completed = self._admit(external_id="protected-completed-mutation")
+        self._complete(completed)
+        mutable = self._admit(external_id="protected-queued-mutation")
+        token = "test-storage-token-with-at-least-32-characters"
+        authorization = {"Authorization": f"Bearer {token}"}
+        server = serve(self.broker, port=0, policy=self.policy, storage_token=token)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def post(job_id, operation, headers=None):
+            request = Request(
+                f"{base}/v1/jobs/{job_id}/{operation}", data=b"{}",
+                headers={"Content-Type": "application/json", **(headers or {})},
+                method="POST",
+            )
+            with urlopen(request) as response:
+                return json.loads(response.read())
+
+        for job_id, operation in (
+            (completed["id"], "cancel"),
+            (mutable["id"], "cancel"),
+            (mutable["id"], "retry"),
+        ):
+            with self.subTest(job_id=job_id, operation=operation), self.assertRaises(HTTPError) as caught:
+                post(job_id, operation)
+            self.assertEqual(caught.exception.code, 401)
+            self.assertEqual(
+                json.loads(caught.exception.read()),
+                {"error": {"code": "storage_auth_required"}},
+            )
+
+        self.assertEqual(self.broker.status(completed["id"])["state"], "completed")
+        self.assertEqual(self.broker.status(mutable["id"])["state"], "queued")
+        self.assertEqual(post(mutable["id"], "cancel", authorization)["state"], "cancelled")
+        with self.assertRaises(HTTPError) as caught:
+            post(mutable["id"], "retry")
+        self.assertEqual(caught.exception.code, 401)
+        self.assertEqual(self.broker.status(mutable["id"])["state"], "cancelled")
+        self.assertEqual(post(mutable["id"], "retry", authorization)["state"], "queued")
 
     def test_http_compact_status_ack_receipt_and_storage_health(self):
         job = self._admit()

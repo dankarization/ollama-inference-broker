@@ -60,9 +60,10 @@ history/audit/correlation ответы их исключают, а legacy analyt
 ```
 
 Повтор failed/cancelled job доступен явно через
-`POST /v1/jobs/{id}/retry`. Lease renewal подготовлен как broker method для
-будущего внешнего executor contract; текущий синхронный dispatcher его не
-вызывает и работает как прежде.
+`POST /v1/jobs/{id}/retry`; для producer-storage job endpoint требует тот же
+owner-only bearer token, что и status/receipt. Lease renewal подготовлен как
+broker method для будущего внешнего executor contract; текущий синхронный
+dispatcher его не вызывает и работает как прежде.
 
 ## Метрики
 

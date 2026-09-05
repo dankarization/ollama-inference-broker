@@ -7,12 +7,13 @@ allowlisted with `producer_storage_enabled=true` **and** admission includes a
 `ack_required=false`, `legacy_result_fallback=true`, and
 `compaction_enabled=false`.
 
-All producer capability requests, compact status/receipt reads, ACKs, and
-maintenance calls require `Authorization: Bearer …` matching the owner-only
-file configured by `BROKER_STORAGE_TOKEN_FILE`. The broker never logs the
-header or token. If the file is not configured, the new storage API fails
-closed while legacy APIs continue to work. Production creates the token
-locally with mode `0600`; it is not stored in Git or operational evidence.
+All producer capability requests, full/compact status and receipt reads,
+cancel/retry mutations, ACKs, and maintenance calls require
+`Authorization: Bearer …` matching the owner-only file configured by
+`BROKER_STORAGE_TOKEN_FILE`. The broker never logs the header or token. If the
+file is not configured, the new storage API fails closed while legacy APIs
+continue to work. Production creates the token locally with mode `0600`; it is
+not stored in Git or operational evidence.
 
 ## Admission and canonical evidence
 
@@ -44,7 +45,10 @@ with `producer_storage`, a retry that omits the capability is also a conflict;
 it cannot recover the producer-owned job through the unauthenticated legacy
 admission path. An exact retry is resolved against the durable capability
 identity before current source storage/admission policy, so a lost admission
-response remains recoverable after a safe policy rollback.
+response remains recoverable after a safe policy rollback. Legacy sources
+outside the dedicated Olya/Syncopia idempotency contracts may still admit
+multiple jobs with the same `external_id` when no producer-storage capability
+is present.
 
 `POST /v1/jobs/{id}/input-received` confirms the declared input reference,
 hash, size, source, and producer attempt. `GET /v1/jobs/{id}/status` returns a

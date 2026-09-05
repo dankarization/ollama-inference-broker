@@ -89,7 +89,7 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
 после отдельной проверки queued jobs.
 
 - `POST /v1/jobs` принимает `{ "profile":"interactive", "kind":"chat|generate", "payload":{...} }` и возвращает сохранённое задание (`202`).
-- `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel` и `GET /v1/metrics` дают доступ к жизненному циклу и данным MAIN-PC `/api/ps`.
+- `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel` и `GET /v1/metrics` дают доступ к жизненному циклу и данным MAIN-PC `/api/ps`. Для producer-storage jobs чтение, cancel и retry требуют owner-only storage bearer token; legacy jobs сохраняют прежний контракт.
 - `GET /v1/analytics`, `/v1/audit-events`, `/v1/jobs/{id}/attempts` и
   `/v1/correlations` дают payload-free историю очереди, попыток, correlation и
   scheduler fairness. Определения метрик и пример 8:3 — в
@@ -134,7 +134,10 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
 Каждое принятое задание и scheduler decision сохраняются в durable
 audit/attempt history. `POST /v1/jobs` опционально принимает
 `source_item_id`/`external_id`; private payload и значения correlation не
-копируются в structured logs. Существующие request/response поля не удалены.
+копируются в structured logs. `external_id` остаётся idempotency key только для
+специализированных Olya/Syncopia contracts и producer-storage jobs; остальные
+legacy sources могут независимо принять несколько jobs с одним значением.
+Существующие request/response поля не удалены.
 
 Рабочий source `shutterstock` намеренно не имеет broker profile и не может
 получить lease. Новый `shutterstock-canary` — отдельное имя source, а не

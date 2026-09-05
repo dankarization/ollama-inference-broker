@@ -657,8 +657,6 @@ class Broker:
                 # Rejection itself is durable observability, despite aborting admission.
                 self.db.commit()
                 raise SourceAdmissionBlocked(source)
-            if existing is not None:
-                return self.status(existing["id"])
             self.db.execute(
                 "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
                 "queued_at,source_item_id,external_id,input_storage_mode,input_ref,input_hash,"

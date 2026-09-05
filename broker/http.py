@@ -106,10 +106,16 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 except (KeyError, StorageContractError) as error:
                     self._json(409, {"error": str(error)})
             elif path.startswith("/v1/jobs/") and path.endswith("/cancel"):
-                result=broker.cancel(path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
+                job_id = path.split("/")[3]
+                if broker.producer_storage_job(job_id) and not self._storage_authorized():
+                    return
+                result=broker.cancel(job_id); self._json(200 if result else 404, result or {"error":"not found"})
             elif path.startswith("/v1/jobs/") and path.endswith("/retry"):
+                job_id = path.split("/")[3]
+                if broker.producer_storage_job(job_id) and not self._storage_authorized():
+                    return
                 try:
-                    result=broker.retry(path.split("/")[3]); self._json(200 if result else 404, result or {"error":"not found"})
+                    result=broker.retry(job_id); self._json(200 if result else 404, result or {"error":"not found"})
                 except ValueError as e: self._json(409, {"error":str(e)})
             elif path.startswith("/v1/sources/") and path.endswith("/weight"):
                 source = unquote(path[len("/v1/sources/"):-len("/weight")]).strip("/")
