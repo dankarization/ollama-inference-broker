@@ -1,5 +1,7 @@
 import json
 import io
+import hashlib
+import os
 import sqlite3
 import tempfile
 import threading
@@ -10,6 +12,12 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from broker.http import serve
+from broker.migration import main as migration_main
+from broker.policy import SourcePolicyError, normalize_source_policy
+from broker.rollback_guard import (
+    LEGACY_HIDDEN_STORAGE_FIELDS,
+    prepare_rollback_release,
+)
 from broker.service import Broker, SourcePolicy
 from broker.storage import (
     ReceiptConflict,
@@ -154,6 +162,80 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertEqual(report["quick_check"], "ok")
         db.close()
 
+    def test_migration_rejects_report_aliasing_database(self):
+        database = self.root / "migration.sqlite3"
+        original = b"not-opened-because-alias-is-rejected"
+        database.write_bytes(original)
+        aliases = [database, self.root / "migration-report-hardlink.json"]
+        os.link(database, aliases[1])
+        for report in aliases:
+            with (
+                self.subTest(report=report),
+                patch("sys.argv", [
+                    "migration", "--database", str(database), "--report", str(report),
+                ]),
+                patch("sys.stderr", new_callable=io.StringIO),
+                self.assertRaises(SystemExit) as caught,
+            ):
+                migration_main()
+            self.assertEqual(caught.exception.code, 2)
+            self.assertEqual(database.read_bytes(), original)
+
+    def test_rollback_release_hides_additive_metadata(self):
+        source = self.root / "parent-release"
+        service = source / "broker" / "service.py"
+        service.parent.mkdir(parents=True)
+        service.write_text(
+            'import json\nimport logging\n\n'
+            'LOGGER = logging.getLogger("ollama_inference_broker.audit")\n\n'
+            'class Broker:\n'
+            '    def _job(self, row):\n'
+            '        data = dict(row)\n'
+            '        data.pop("priority", None)  # inert historic column is never public\n'
+            '        data["payload"] = json.loads(data["payload"])\n'
+            '        if data.get("result_json") is not None:\n'
+            '            data["result"] = json.loads(data.pop("result_json"))\n'
+            '        else:\n'
+            '            data.pop("result_json", None)\n'
+            '        if data["state"] == "queued":\n'
+            '            data["queue_position"] = self._position(row)\n'
+            '        return data\n',
+            encoding="utf-8",
+        )
+        source_hash = hashlib.sha256(service.read_bytes()).hexdigest()
+        output = self.root / "rollback-protected"
+        report = prepare_rollback_release(
+            source, output, expected_service_sha256=source_hash,
+        )
+        namespace = {}
+        exec((output / "broker" / "service.py").read_text(encoding="utf-8"), namespace)
+        row = {
+            "id": "legacy", "state": "completed", "priority": 9,
+            "payload": '{}', "result_json": '{"done":true}',
+            **{
+                field: f"private-{field}"
+                for field in LEGACY_HIDDEN_STORAGE_FIELDS
+            },
+        }
+        response = namespace["Broker"]()._job(row)
+        self.assertEqual(response["result"], {"done": True})
+        self.assertTrue(LEGACY_HIDDEN_STORAGE_FIELDS.isdisjoint(response))
+        self.assertEqual(
+            report["hidden_storage_fields"], len(LEGACY_HIDDEN_STORAGE_FIELDS),
+        )
+        self.assertFalse(report["payloads_in_report"])
+
+    def test_policy_rejects_non_finite_storage_grace_periods(self):
+        for field in ("compaction_grace_seconds", "quarantine_grace_seconds"):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                raw = {
+                    "sources": {"producer": {field: value}},
+                }
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                    SourcePolicyError, "finite non-negative",
+                ):
+                    normalize_source_policy(raw)
+
     def test_legacy_callers_still_admit_dispatch_and_fetch_full_result(self):
         job = self.broker.submit(
             "interactive", "generate", {"prompt": "legacy"}, source="producer",
@@ -297,6 +379,29 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertNotEqual(self.broker.status(cancel_requested["id"])["payload"], {})
         self.assertFalse(compacted["vacuum_performed"])
 
+    def test_oversized_compaction_candidate_does_not_starve_later_jobs(self):
+        self._write_policy(
+            ack_required=True, compaction_enabled=True, legacy_result_fallback=False,
+        )
+        jobs = []
+        for external_id in ("older-oversized", "later-small"):
+            job = self._admit(external_id=external_id)
+            status = self._complete(job)
+            self._ack_input(job)
+            self.broker.acknowledge_result(job["id"], self._ack(job, status))
+            jobs.append(job)
+        with self.broker.db:
+            self.broker.db.execute(
+                "UPDATE jobs SET payload=?,compaction_after=1 WHERE id=?",
+                (json.dumps({"prompt": "x" * 2048}), jobs[0]["id"]),
+            )
+            self.broker.db.execute(
+                "UPDATE jobs SET compaction_after=2 WHERE id=?", (jobs[1]["id"],),
+            )
+        preview = self.broker.storage_maintenance("producer", max_bytes=1024)
+        self.assertEqual(preview["job_ids"], [jobs[1]["id"]])
+        self.assertEqual(preview["skipped_oversize"], 1)
+
     def test_cleanup_does_not_adopt_jobs_with_legacy_admission_guards(self):
         jobs = []
         for external_id, flags in (
@@ -410,6 +515,38 @@ class ProducerStorageTests(unittest.TestCase):
             storage_policy_main()
         self.assertEqual(caught.exception.code, 2)
         self.assertEqual(live.read_text(encoding="utf-8"), original)
+
+    def test_storage_policy_apply_preserves_concurrent_source_update(self):
+        live = self.root / "live-concurrent-sources.json"
+        original = {
+            "version": 1,
+            "sources": {"olya-vision": {"enabled": True, "weight": 8}},
+        }
+        concurrent = {
+            "version": 1,
+            "sources": {
+                "olya-vision": {
+                    "enabled": True, "weight": 8, "admission_allowed": False,
+                },
+            },
+        }
+        live.write_text(json.dumps(original), encoding="utf-8")
+        real_stage = stage_storage_policy
+
+        def stage_then_update(raw):
+            staged = real_stage(raw)
+            live.write_text(json.dumps(concurrent), encoding="utf-8")
+            return staged
+
+        with (
+            patch("sys.argv", ["storage-policy", "--policy", str(live), "--apply"]),
+            patch("broker.storage_policy.stage_storage_policy", side_effect=stage_then_update),
+            patch("sys.stderr", new_callable=io.StringIO),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            storage_policy_main()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(json.loads(live.read_text(encoding="utf-8")), concurrent)
 
     def test_storage_health_excludes_non_ack_capable_legacy_results(self):
         legacy = self.broker.submit(

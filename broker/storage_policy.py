@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import tempfile
@@ -19,6 +20,37 @@ SOURCE_STORAGE_MODES = {
     "syncopia-telegram-memory": "hybrid",
 }
 SCHEDULER_FIELDS = ("enabled", "weight", "admission_allowed")
+
+
+class ConcurrentPolicyUpdateError(RuntimeError):
+    pass
+
+
+def read_snapshot(path: Path) -> tuple[bytes, tuple[int, int, int, int, int, str]]:
+    """Read a file and bind its bytes to one stable filesystem identity."""
+    with path.open("rb") as handle:
+        before = os.fstat(handle.fileno())
+        content = handle.read()
+        after = os.fstat(handle.fileno())
+    fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in fields):
+        raise ConcurrentPolicyUpdateError("policy changed while it was being read")
+    try:
+        current = path.stat()
+    except OSError as exc:
+        raise ConcurrentPolicyUpdateError(
+            "policy disappeared while it was being read"
+        ) from exc
+    if any(getattr(after, field) != getattr(current, field) for field in fields):
+        raise ConcurrentPolicyUpdateError("policy was replaced while it was being read")
+    return content, (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        hashlib.sha256(content).hexdigest(),
+    )
 
 
 def scheduler_fingerprint(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -61,8 +93,18 @@ def stage_storage_policy(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
     }
 
 
-def write_atomic(path: Path, value: dict[str, Any]) -> None:
-    mode = path.stat().st_mode & 0o7777
+def write_atomic(
+    path: Path,
+    value: dict[str, Any],
+    *,
+    expected_fingerprint: tuple[int, int, int, int, int, str] | None = None,
+) -> None:
+    try:
+        mode = path.stat().st_mode & 0o7777
+    except OSError as exc:
+        raise ConcurrentPolicyUpdateError(
+            "policy disappeared after staging; refusing to replace it"
+        ) from exc
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -71,6 +113,12 @@ def write_atomic(path: Path, value: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary, mode)
+        if expected_fingerprint is not None:
+            _, current_fingerprint = read_snapshot(path)
+            if current_fingerprint != expected_fingerprint:
+                raise ConcurrentPolicyUpdateError(
+                    "policy changed after staging; refusing to replace it"
+                )
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
@@ -104,10 +152,17 @@ def main() -> None:
         parser.error("--policy must name an existing JSON file")
     if args.output is not None and same_file(args.policy, args.output):
         parser.error("use --apply instead of writing --output over --policy")
-    raw = json.loads(args.policy.read_text(encoding="utf-8"))
+    try:
+        encoded, fingerprint = read_snapshot(args.policy)
+    except ConcurrentPolicyUpdateError as exc:
+        parser.error(str(exc))
+    raw = json.loads(encoded)
     staged, report = stage_storage_policy(raw)
     if args.apply:
-        write_atomic(args.policy, staged)
+        try:
+            write_atomic(args.policy, staged, expected_fingerprint=fingerprint)
+        except ConcurrentPolicyUpdateError as exc:
+            parser.error(str(exc))
     elif args.output is not None:
         args.output.write_text(json.dumps(staged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(report, sort_keys=True))

@@ -112,7 +112,9 @@ python3 -m broker.migration \
 ```
 
 The command refuses a missing path. Its report contains only schema names,
-counts, integrity results, and file/WAL policy metrics.
+counts, integrity results, and file/WAL policy metrics. It also refuses a
+`--report` path that resolves to the database itself through a direct path,
+symlink, or hard link.
 
 Stage safe flags in the **live** policy without copying the repository's sample
 weights over operator changes:
@@ -128,18 +130,35 @@ The tool fails unless normalized `enabled`, `weight`, and
 allowlists only currently present approved producer sources, leaves unknown
 and `uncensored-eval` sources untouched, and always stages ACK optional,
 legacy fallback on, and compaction off. `--apply` performs an fsync + atomic
-replace after the operator preserves the original policy for rollback.
+replace after the operator preserves the original policy for rollback. The
+apply aborts if any process replaces or modifies the live policy after it was
+read, preserving concurrent source-control changes.
 
 ## Rollout and rollback
 
-Before restart, drain new claims, wait for zero active leases, create a
-consistent SQLite backup, restore-read it, preserve the previous release and
-policy, and record state counts. Deploy a new immutable release and atomically
-switch the service working directory. After restart verify HTTP health,
+Before restart, drain new claims while allowing the current lease to finish,
+then create a consistent SQLite backup, restore-read it, preserve the previous
+release and policy, and record state counts. Because the additive job columns
+would be visible through the unpatched parent's legacy `SELECT *` serializer,
+prepare an immutable metadata-safe rollback release before migration:
+
+```bash
+python3 -m broker.rollback_guard \
+  --source-release /path/to/reviewed-parent-release \
+  --output-release /path/to/rollback-protected-release
+```
+
+The tool accepts only the reviewed parent `broker/service.py` hash, copies the
+release without Git/cache state, injects the same 22-field legacy response
+filter, compiles the patched source, and reports only paths and hashes. Verify
+the rollback copy with `compileall` and the legacy API test before continuing.
+Deploy a new immutable release and atomically switch the service working
+directory. After restart verify HTTP health,
 payload-free storage health, unchanged source weights, state counts, receipt
 tables, `quick_check`, `foreign_key_check`, and journal logs.
 
-Rollback atomically restores the prior release and policy and restarts the
-service. The additive tables/columns are intentionally left in place; old code
-ignores them. Never delete or reverse-migrate the production DB during
-rollback.
+Rollback atomically activates the prepared metadata-safe parent release and
+original policy, then restarts the service. The additive tables/columns are
+intentionally left in place; the guarded legacy serializer hides them. Never
+activate the unpatched parent after schema migration, and never delete or
+reverse-migrate the production DB during rollback.

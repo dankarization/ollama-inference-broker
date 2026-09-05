@@ -812,9 +812,11 @@ class StorageManager:
         if operation == "compact":
             time_clause = "j.quarantined_at IS NOT NULL AND j.quarantined_at<=?"
             threshold = now - float(config["quarantine_grace_seconds"])
-        sql = (
-            "SELECT j.id,length(CAST(j.payload AS BLOB))+"
-            "coalesce(length(CAST(j.result_json AS BLOB)),0) AS inline_bytes "
+        inline_expression = (
+            "length(CAST(j.payload AS BLOB))+"
+            "coalesce(length(CAST(j.result_json AS BLOB)),0)"
+        )
+        eligibility = (
             "FROM jobs j WHERE j.source=? AND j.state='completed' "
             "AND j.delivery_state='acked' AND j.compaction_state=? AND " + time_clause + " "
             "AND j.ack_required=1 AND j.legacy_result_fallback=0 "
@@ -829,18 +831,25 @@ class StorageManager:
             "SELECT 1 FROM job_artifacts a WHERE a.job_id=j.id AND a.role='input' "
             "AND a.state='acked' AND a.content_hash=j.input_hash "
             "AND a.storage_ref=j.input_ref)) "
+        )
+        sql = (
+            "SELECT j.id," + inline_expression + " AS inline_bytes " + eligibility
+            + "AND " + inline_expression + "<=? "
             "ORDER BY j.compaction_after,j.id LIMIT 1000"
         )
+        oversize_sql = (
+            "SELECT count(*) FROM (SELECT 1 " + eligibility
+            + "AND " + inline_expression + ">? "
+            "ORDER BY j.compaction_after,j.id LIMIT 1000)"
+        )
         with self.lock, self.db:
-            rows = list(self.db.execute(sql, (source, state, threshold)))
+            params = (source, state, threshold, max_bytes)
+            rows = list(self.db.execute(sql, params))
+            skipped_oversize = int(self.db.execute(oversize_sql, params).fetchone()[0])
             ids: list[str] = []
             inline_bytes = 0
-            skipped_oversize = 0
             for row in rows:
                 row_bytes = int(row["inline_bytes"] or 0)
-                if row_bytes > max_bytes:
-                    skipped_oversize += 1
-                    continue
                 if inline_bytes + row_bytes > max_bytes or len(ids) >= limit:
                     break
                 ids.append(row["id"])

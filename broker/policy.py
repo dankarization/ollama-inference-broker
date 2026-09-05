@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -65,9 +66,14 @@ def normalize_source_policy(raw: Any) -> dict[str, dict[str, Any]]:
             ("compaction_grace_seconds", compaction_grace_seconds),
             ("quarantine_grace_seconds", quarantine_grace_seconds),
         ):
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
                 raise SourcePolicyError(
-                    f"source {name!r} {field} must be a non-negative number"
+                    f"source {name!r} {field} must be a finite non-negative number"
                 )
         if compaction_enabled and not producer_storage_enabled:
             raise SourcePolicyError(

@@ -13,6 +13,7 @@ from .storage import (
     migrate_storage_schema,
     storage_schema_report,
 )
+from .storage_policy import same_file
 
 
 def main() -> None:
@@ -32,6 +33,8 @@ def main() -> None:
     args = parser.parse_args()
     if not args.database.is_file():
         parser.error("--database must name an existing SQLite file")
+    if args.report is not None and same_file(args.database, args.report):
+        parser.error("--report must not alias --database")
 
     db = sqlite3.connect(str(args.database))
     try:

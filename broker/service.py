@@ -23,6 +23,7 @@ from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES,
                      validate_uncensored_eval_payload)
 from .profiles import PROFILES
 from .policy import SourcePolicyError, normalize_source_policy
+from .rollback_guard import LEGACY_HIDDEN_STORAGE_FIELDS
 from .storage import (
     DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
     DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
@@ -34,14 +35,6 @@ from .storage import (
 
 
 LOGGER = logging.getLogger("ollama_inference_broker.audit")
-LEGACY_HIDDEN_STORAGE_FIELDS = frozenset({
-    "input_storage_mode", "input_ref", "input_hash", "input_bytes",
-    "input_received_at", "result_storage_mode", "result_ref", "result_hash",
-    "result_bytes", "delivery_state", "delivery_attempt_count",
-    "last_delivery_at", "acked_at", "retention_until", "compaction_after",
-    "artifact_schema_version", "compaction_state", "producer_attempt_id",
-    "ack_required", "legacy_result_fallback", "quarantined_at", "compacted_at",
-})
 OBSERVER_READ_DEADLINE_SECONDS = 0.75
 SCHEDULING_HORIZON_SECONDS = 60 * 60
 FORECAST_DEFAULT_EXECUTION_SECONDS = 300.0
