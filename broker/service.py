@@ -51,6 +51,10 @@ class SourceAdmissionBlocked(Exception):
         super().__init__(f"new admissions are blocked for source {source!r}")
 
 
+class StorageAuthorizationRequired(PermissionError):
+    """A bulk mutation selected at least one producer-storage job."""
+
+
 class SourcePolicy:
     """Runtime-reloadable per-source weights and enablement.
 
@@ -353,7 +357,20 @@ class Broker:
                 from_state TEXT,
                 to_state TEXT,
                 reason TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}')""")
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                producer_storage INTEGER NOT NULL DEFAULT 0)""")
+            audit_columns = {
+                row[1] for row in self.db.execute("PRAGMA table_info(audit_events)")
+            }
+            if "producer_storage" not in audit_columns:
+                self.db.execute(
+                    "ALTER TABLE audit_events ADD COLUMN producer_storage "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                self.db.execute(
+                    "UPDATE audit_events SET producer_storage=1 WHERE job_id IN "
+                    f"(SELECT id FROM jobs WHERE {PRODUCER_STORAGE_JOB_PREDICATE})"
+                )
             self.db.execute("""CREATE TABLE IF NOT EXISTS job_attempts (
                 job_id TEXT NOT NULL,
                 attempt_no INTEGER NOT NULL,
@@ -375,6 +392,18 @@ class Broker:
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS audit_events_source_time "
                 "ON audit_events(source,occurred,event_type)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS audit_events_public_sequence "
+                "ON audit_events(sequence DESC) WHERE producer_storage=0"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS audit_events_public_source_sequence "
+                "ON audit_events(source,sequence DESC) WHERE producer_storage=0"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS audit_events_public_job_sequence "
+                "ON audit_events(job_id,sequence DESC) WHERE producer_storage=0"
             )
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_source_state ON jobs(source,state,created)"
@@ -478,11 +507,20 @@ class Broker:
     ) -> None:
         timestamp = self.clock() if occurred is None else occurred
         safe_metadata = metadata or {}
+        producer_storage = int(
+            job_id is not None
+            and self.db.execute(
+                f"SELECT 1 FROM jobs WHERE id=? AND {PRODUCER_STORAGE_JOB_PREDICATE}",
+                (job_id,),
+            ).fetchone() is not None
+        )
         self.db.execute(
             "INSERT INTO audit_events(occurred,event_type,job_id,source,attempt_no,"
-            "from_state,to_state,reason,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)",
+            "from_state,to_state,reason,metadata_json,producer_storage) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
             (timestamp, event_type, job_id, source, attempt_no, from_state,
-             to_state, reason, json.dumps(safe_metadata, sort_keys=True)),
+             to_state, reason, json.dumps(safe_metadata, sort_keys=True),
+             producer_storage),
         )
         # Deliberately omit payload, result, correlation values and error text.
         LOGGER.info(json.dumps({
@@ -692,15 +730,22 @@ class Broker:
             raise ValueError("source must be a non-empty string up to 256 characters")
         return source.strip()
 
-    def bulk_cancel_queued(self, source: str) -> dict[str, Any]:
+    def bulk_cancel_queued(
+        self, source: str, *, allow_producer_storage: bool = False,
+    ) -> dict[str, Any]:
         """Cancel only queued jobs for one exact source in one transaction."""
         source = self._bulk_source(source)
         now = self.clock()
         with self.lock, self.db:
             rows = list(self.db.execute(
-                "SELECT id,attempt_count FROM jobs WHERE source=? AND state='queued' "
+                "SELECT id,attempt_count," + PRODUCER_STORAGE_JOB_PREDICATE +
+                " AS producer_storage FROM jobs WHERE source=? AND state='queued' "
                 "ORDER BY queued_at,id", (source,),
             ))
+            if not allow_producer_storage and any(
+                row["producer_storage"] for row in rows
+            ):
+                raise StorageAuthorizationRequired
             for row in rows:
                 self.db.execute(
                     "UPDATE jobs SET state='cancelled',finished=? "
@@ -722,15 +767,22 @@ class Broker:
             self.completed.notify_all()
         return {"source": source, "cancelled": count}
 
-    def bulk_retry_failed(self, source: str) -> dict[str, Any]:
+    def bulk_retry_failed(
+        self, source: str, *, allow_producer_storage: bool = False,
+    ) -> dict[str, Any]:
         """Requeue only failed jobs while retaining attempts and audit history."""
         source = self._bulk_source(source)
         now = self.clock()
         with self.lock, self.db:
             rows = list(self.db.execute(
-                "SELECT id,attempt_count FROM jobs WHERE source=? AND state='failed' "
+                "SELECT id,attempt_count," + PRODUCER_STORAGE_JOB_PREDICATE +
+                " AS producer_storage FROM jobs WHERE source=? AND state='failed' "
                 "ORDER BY finished,id", (source,),
             ))
+            if not allow_producer_storage and any(
+                row["producer_storage"] for row in rows
+            ):
+                raise StorageAuthorizationRequired
             for row in rows:
                 attempt_no = row["attempt_count"] or None
                 self._audit(

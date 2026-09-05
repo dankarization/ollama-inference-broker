@@ -38,12 +38,15 @@ def main() -> None:
 
     db = sqlite3.connect(str(args.database))
     try:
-        with db:
-            migration = migrate_storage_schema(
-                db,
-                wal_autocheckpoint_pages=args.wal_autocheckpoint_pages,
-                journal_size_limit_bytes=args.journal_size_limit_bytes,
-            )
+        try:
+            with db:
+                migration = migrate_storage_schema(
+                    db,
+                    wal_autocheckpoint_pages=args.wal_autocheckpoint_pages,
+                    journal_size_limit_bytes=args.journal_size_limit_bytes,
+                )
+        except ValueError as error:
+            parser.error(str(error))
         report = {
             "migration": migration,
             "database": str(args.database),

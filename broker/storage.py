@@ -18,6 +18,8 @@ LOGGER = logging.getLogger("ollama_inference_broker.storage")
 STORAGE_SCHEMA_VERSION = 1
 DEFAULT_WAL_AUTOCHECKPOINT_PAGES = 4096
 DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
+MAX_WAL_AUTOCHECKPOINT_PAGES = (1 << 31) - 1
+MAX_JOURNAL_SIZE_LIMIT_BYTES = (1 << 63) - 1
 DEFAULT_WAL_BUDGET_BYTES = 128 * 1024 * 1024
 DEFAULT_CHECKPOINT_INTERVAL_SECONDS = 60.0
 HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -67,13 +69,23 @@ def migrate_storage_schema(
     journal_size_limit_bytes: int = DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
 ) -> dict[str, Any]:
     """Apply the metadata-only, additive storage migration idempotently."""
-    if wal_autocheckpoint_pages <= 0:
-        raise ValueError("wal_autocheckpoint_pages must be positive")
-    if journal_size_limit_bytes <= 0:
-        raise ValueError("journal_size_limit_bytes must be positive")
+    if not 1 <= wal_autocheckpoint_pages <= MAX_WAL_AUTOCHECKPOINT_PAGES:
+        raise ValueError("wal_autocheckpoint_pages is outside SQLite's supported range")
+    if not 1 <= journal_size_limit_bytes <= MAX_JOURNAL_SIZE_LIMIT_BYTES:
+        raise ValueError("journal_size_limit_bytes is outside SQLite's supported range")
 
     db.execute(f"PRAGMA wal_autocheckpoint={int(wal_autocheckpoint_pages)}")
     db.execute(f"PRAGMA journal_size_limit={int(journal_size_limit_bytes)}")
+    effective_wal_autocheckpoint_pages = int(
+        db.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+    )
+    effective_journal_size_limit_bytes = int(
+        db.execute("PRAGMA journal_size_limit").fetchone()[0]
+    )
+    if effective_wal_autocheckpoint_pages != wal_autocheckpoint_pages:
+        raise ValueError("SQLite did not apply wal_autocheckpoint_pages exactly")
+    if effective_journal_size_limit_bytes != journal_size_limit_bytes:
+        raise ValueError("SQLite did not apply journal_size_limit_bytes exactly")
     db.execute("""CREATE TABLE IF NOT EXISTS broker_schema_migrations (
         version INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
@@ -182,12 +194,8 @@ def migrate_storage_schema(
     return {
         "schema_version": STORAGE_SCHEMA_VERSION,
         "added_columns": added,
-        "wal_autocheckpoint_pages": int(db.execute(
-            "PRAGMA wal_autocheckpoint"
-        ).fetchone()[0]),
-        "journal_size_limit_bytes": int(db.execute(
-            "PRAGMA journal_size_limit"
-        ).fetchone()[0]),
+        "wal_autocheckpoint_pages": effective_wal_autocheckpoint_pages,
+        "journal_size_limit_bytes": effective_journal_size_limit_bytes,
     }
 
 

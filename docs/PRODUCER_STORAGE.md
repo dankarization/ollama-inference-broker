@@ -121,6 +121,8 @@ The broker configures `wal_autocheckpoint=4096` pages, a 64 MiB
 limits, and the last checkpoint result. The unacked and quarantined health
 counts use dedicated partial indexes, so polling does not scan payload-heavy
 legacy history while holding the broker lock.
+Startup and the migration CLI reject pragma values outside SQLite's signed
+integer ranges and verify that SQLite applied both values exactly.
 
 Apply the schema to an explicit safe copy and write a payload-free report:
 

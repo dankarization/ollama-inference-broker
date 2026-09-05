@@ -6,9 +6,6 @@ import sqlite3
 from collections import defaultdict
 from typing import Any, Iterable
 
-from .storage import PRODUCER_STORAGE_JOB_PREDICATE
-
-
 DEFAULT_WINDOWS = (300, 1_800, 10_800, 86_400)
 
 
@@ -54,17 +51,20 @@ def audit_history(
     if since is not None:
         clauses.append("occurred>=?")
         values.append(since)
+    table = "audit_events"
     if not include_producer_storage:
-        clauses.append(
-            "(job_id IS NULL OR NOT EXISTS (SELECT 1 FROM jobs "
-            "WHERE jobs.id=audit_events.job_id AND "
-            f"{PRODUCER_STORAGE_JOB_PREDICATE}))"
-        )
+        clauses.append("producer_storage=0")
+        if job_id is not None:
+            table += " INDEXED BY audit_events_public_job_sequence"
+        elif source is not None:
+            table += " INDEXED BY audit_events_public_source_sequence"
+        else:
+            table += " INDEXED BY audit_events_public_sequence"
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     bounded_limit = max(1, min(int(limit), 1_000))
     rows = db.execute(
         "SELECT sequence,occurred,event_type,job_id,source,attempt_no,"
-        "from_state,to_state,reason,metadata_json FROM audit_events"
+        f"from_state,to_state,reason,metadata_json FROM {table}"
         f"{where} ORDER BY sequence DESC LIMIT ?",
         (*values, bounded_limit),
     )

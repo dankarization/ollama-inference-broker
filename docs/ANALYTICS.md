@@ -44,8 +44,8 @@ Correlation lookup возвращает только job/source/profile/state/ti
 идентификаторы, без payload/result. `GET /v1/jobs/{id}` оставлен без изменений
 для legacy jobs. Producer-storage jobs и их audit metadata видны через эти
 read endpoints только с owner-only storage bearer token; unauthenticated
-history/audit/correlation ответы их исключают, а legacy analytics остаётся
-доступной как прежде.
+history/audit/correlation ответы их исключают через persisted visibility marker
+и partial indexes, а legacy analytics остаётся доступной как прежде.
 
 Новые callers могут передавать в `POST /v1/jobs`:
 
@@ -64,6 +64,10 @@ history/audit/correlation ответы их исключают, а legacy analyt
 owner-only bearer token, что и status/receipt. Lease renewal подготовлен как
 broker method для будущего внешнего executor contract; текущий синхронный
 dispatcher его не вызывает и работает как прежде.
+
+Bulk cancel/retry сохраняет legacy behavior, но если выбранный набор содержит
+producer-storage job, весь mutation требует storage bearer token и до проверки
+не изменяет ни одной строки.
 
 ## Метрики
 

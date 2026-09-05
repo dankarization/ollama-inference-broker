@@ -10,7 +10,7 @@ from .compat import (CompatibilityError, stream_frames, submit as submit_compati
 from .profiles import PROFILES
 from .dashboard import render as render_dashboard
 from .policy import SourcePolicyError
-from .service import SourceAdmissionBlocked
+from .service import SourceAdmissionBlocked, StorageAuthorizationRequired
 from .storage import ReceiptConflict, StorageContractError
 
 
@@ -181,7 +181,12 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     if not isinstance(body, dict) or body != {"confirm": True}:
                         raise SourcePolicyError("bulk cancellation requires {\"confirm\": true}")
                     self._configured_source(source)
-                    self._json(200, broker.bulk_cancel_queued(source))
+                    self._json(200, broker.bulk_cancel_queued(
+                        source,
+                        allow_producer_storage=self._storage_authenticated(),
+                    ))
+                except StorageAuthorizationRequired:
+                    self._storage_authorized()
                 except (SourcePolicyError, ValueError) as error:
                     self._json(400, {"error": str(error)})
             elif path.startswith("/v1/sources/") and path.endswith("/failed/retry"):
@@ -190,7 +195,12 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     if not isinstance(body, dict) or body != {"confirm": True}:
                         raise SourcePolicyError("bulk retry requires {\"confirm\": true}")
                     self._configured_source(source)
-                    self._json(200, broker.bulk_retry_failed(source))
+                    self._json(200, broker.bulk_retry_failed(
+                        source,
+                        allow_producer_storage=self._storage_authenticated(),
+                    ))
+                except StorageAuthorizationRequired:
+                    self._storage_authorized()
                 except (SourcePolicyError, ValueError) as error:
                     self._json(400, {"error": str(error)})
             elif path in {"/api/chat", "/api/generate"}:

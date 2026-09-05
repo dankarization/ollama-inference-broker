@@ -21,6 +21,8 @@ from broker.rollback_guard import (
 )
 from broker.service import Broker, SourcePolicy
 from broker.storage import (
+    MAX_JOURNAL_SIZE_LIMIT_BYTES,
+    MAX_WAL_AUTOCHECKPOINT_PAGES,
     ReceiptConflict,
     StorageContractError,
     content_evidence,
@@ -198,6 +200,25 @@ class ProducerStorageTests(unittest.TestCase):
                 migration_main()
             self.assertEqual(caught.exception.code, 2)
             self.assertEqual(database.read_bytes(), original)
+
+    def test_migration_cli_rejects_unsupported_sqlite_pragma_limits(self):
+        database = self.root / "migration-limits.sqlite3"
+        sqlite3.connect(database).close()
+        for option, value in (
+            ("--wal-autocheckpoint-pages", MAX_WAL_AUTOCHECKPOINT_PAGES + 1),
+            ("--journal-size-limit-bytes", MAX_JOURNAL_SIZE_LIMIT_BYTES + 1),
+        ):
+            with (
+                self.subTest(option=option),
+                patch("sys.argv", [
+                    "migration", "--database", str(database), option, str(value),
+                ]),
+                patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                self.assertRaises(SystemExit) as caught,
+            ):
+                migration_main()
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("outside SQLite's supported range", stderr.getvalue())
 
     def test_rollback_release_hides_additive_metadata(self):
         source = self.root / "parent-release"
@@ -653,6 +674,14 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertEqual(wal["last_checkpoint"], checkpoint)
         self.assertEqual(wal["effective_wal_autocheckpoint_pages"], 4096)
         self.assertEqual(wal["effective_journal_size_limit_bytes"], 64 * 1024 * 1024)
+        for overrides in (
+            {"wal_autocheckpoint_pages": MAX_WAL_AUTOCHECKPOINT_PAGES + 1},
+            {"journal_size_limit_bytes": MAX_JOURNAL_SIZE_LIMIT_BYTES + 1},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                ValueError, "outside SQLite's supported range",
+            ):
+                migrate_storage_schema(self.broker.db, **overrides)
 
     def test_storage_policy_staging_preserves_live_source_controls(self):
         live = {
@@ -916,6 +945,92 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 401)
         self.assertEqual(self.broker.status(mutable["id"])["state"], "cancelled")
         self.assertEqual(post(mutable["id"], "retry", authorization)["state"], "queued")
+
+    def test_http_bulk_mutations_require_auth_for_producer_storage_jobs(self):
+        queued = self._admit(external_id="protected-bulk-queued")
+        failed = self._admit(external_id="protected-bulk-failed")
+        legacy_queued = self.broker.submit(
+            "interactive", "generate", {"prompt": "legacy-bulk-queued"},
+            source="producer",
+        )
+        legacy_failed = self.broker.submit(
+            "interactive", "generate", {"prompt": "legacy-bulk-failed"},
+            source="producer",
+        )
+        with self.broker.db:
+            self.broker.db.execute(
+                "UPDATE jobs SET state='failed',finished=1,error='synthetic' "
+                "WHERE id IN (?,?)",
+                (failed["id"], legacy_failed["id"]),
+            )
+        token = "test-storage-token-with-at-least-32-characters"
+        authorization = {"Authorization": f"Bearer {token}"}
+        server = serve(self.broker, port=0, policy=self.policy, storage_token=token)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def post(path, headers=None):
+            request = Request(
+                f"{base}{path}", data=b'{"confirm":true}',
+                headers={"Content-Type": "application/json", **(headers or {})},
+                method="POST",
+            )
+            with urlopen(request) as response:
+                return json.loads(response.read())
+
+        operations = (
+            (
+                "/v1/sources/producer/queued/cancel",
+                (queued["id"], legacy_queued["id"]),
+                "queued",
+            ),
+            (
+                "/v1/sources/producer/failed/retry",
+                (failed["id"], legacy_failed["id"]),
+                "failed",
+            ),
+        )
+        for path, job_ids, expected_state in operations:
+            with self.subTest(path=path), self.assertRaises(HTTPError) as caught:
+                post(path)
+            self.assertEqual(caught.exception.code, 401)
+            self.assertEqual(
+                {self.broker.status(job_id)["state"] for job_id in job_ids},
+                {expected_state},
+            )
+            post(path, authorization)
+        self.assertEqual(self.broker.status(queued["id"])["state"], "cancelled")
+        self.assertEqual(self.broker.status(legacy_queued["id"])["state"], "cancelled")
+        self.assertEqual(self.broker.status(failed["id"])["state"], "queued")
+        self.assertEqual(self.broker.status(legacy_failed["id"])["state"], "queued")
+
+    def test_public_audit_reads_use_persisted_visibility_indexes(self):
+        protected = self._admit(external_id="protected-audit-index")
+        legacy = self.broker.submit(
+            "interactive", "generate", {"prompt": "legacy-audit-index"},
+            source="producer",
+        )
+        visibility = dict(self.broker.db.execute(
+            "SELECT job_id,producer_storage FROM audit_events "
+            "WHERE event_type='admission.accepted'"
+        ))
+        self.assertEqual(visibility[protected["id"]], 1)
+        self.assertEqual(visibility[legacy["id"]], 0)
+        public = self.broker.audit_events(limit=100, include_producer_storage=False)
+        self.assertIn(legacy["id"], {event["job_id"] for event in public})
+        self.assertNotIn(protected["id"], {event["job_id"] for event in public})
+        plan = " ".join(
+            str(row[3]) for row in self.broker.db.execute(
+                "EXPLAIN QUERY PLAN SELECT sequence FROM audit_events "
+                "INDEXED BY audit_events_public_sequence "
+                "WHERE producer_storage=0 ORDER BY sequence DESC LIMIT 100"
+            )
+        )
+        self.assertIn("audit_events_public_sequence", plan)
+        self.assertNotIn("CORRELATED", plan)
 
     def test_http_compact_status_ack_receipt_and_storage_health(self):
         job = self._admit()
