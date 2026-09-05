@@ -21,6 +21,7 @@ from broker.policy import (
 from broker.rollback_guard import (
     LEGACY_HIDDEN_STORAGE_FIELDS,
     _fsync_tree,
+    _release_manifest_sha256,
     prepare_rollback_release,
 )
 from broker.service import Broker, SourcePolicy
@@ -269,6 +270,16 @@ class ProducerStorageTests(unittest.TestCase):
             'import json\nimport logging\n\n'
             'LOGGER = logging.getLogger("ollama_inference_broker.audit")\n\n'
             'class Broker:\n'
+            '    def _audit(self, event_type, job_id=None, source=None, attempt_no=None, '
+            'from_state=None, to_state=None, reason=None, metadata=None, occurred=None):\n'
+            '        timestamp = self.clock() if occurred is None else occurred\n'
+            '        safe_metadata = metadata or {}\n'
+            '        self.db.execute(\n'
+            '            "INSERT INTO audit_events(occurred,event_type,job_id,source,attempt_no,"\n'
+            '            "from_state,to_state,reason,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)",\n'
+            '            (timestamp, event_type, job_id, source, attempt_no, from_state,\n'
+            '             to_state, reason, json.dumps(safe_metadata, sort_keys=True)),\n'
+            '        )\n\n'
             '    def _job(self, row):\n'
             '        data = dict(row)\n'
             '        data.pop("priority", None)  # inert historic column is never public\n'
@@ -288,39 +299,104 @@ class ProducerStorageTests(unittest.TestCase):
             '        return query\n',
             encoding="utf-8",
         )
+        sibling = source / "broker" / "http.py"
+        sibling.write_text("reviewed parent\n", encoding="utf-8")
         source_hash = hashlib.sha256(service.read_bytes()).hexdigest()
+        source_release_hash = _release_manifest_sha256(source)
         descendant = source / "rollback-protected"
         with self.assertRaisesRegex(ValueError, "outside source release"):
             prepare_rollback_release(
                 source, descendant, expected_service_sha256=source_hash,
+                expected_release_sha256=source_release_hash,
             )
         self.assertFalse(descendant.exists())
+        sibling.write_text("hybrid parent\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "complete reviewed rollback parent"):
+            prepare_rollback_release(
+                source, self.root / "hybrid-rejected",
+                expected_service_sha256=source_hash,
+                expected_release_sha256=source_release_hash,
+            )
+        self.assertFalse((self.root / "hybrid-rejected").exists())
+        sibling.write_text("reviewed parent\n", encoding="utf-8")
         output = self.root / "rollback-protected"
         with patch(
             "broker.rollback_guard._fsync_tree", wraps=_fsync_tree,
         ) as fsync_tree:
             report = prepare_rollback_release(
                 source, output, expected_service_sha256=source_hash,
+                expected_release_sha256=source_release_hash,
             )
         self.assertEqual(fsync_tree.call_count, 1)
         self.assertEqual(fsync_tree.call_args.args[0].name, "release")
         namespace = {}
         exec((output / "broker" / "service.py").read_text(encoding="utf-8"), namespace)
-        row = {
+        legacy_row = {
             "id": "legacy", "state": "completed", "priority": 9,
             "payload": '{}', "result_json": '{"done":true}',
+            "producer_attempt_id": None,
+            "input_storage_mode": "broker_temporary",
+            "result_storage_mode": "broker_temporary",
             **{
                 field: f"private-{field}"
                 for field in LEGACY_HIDDEN_STORAGE_FIELDS
+                if field not in {
+                    "producer_attempt_id", "input_storage_mode", "result_storage_mode",
+                }
             },
         }
-        response = namespace["Broker"]()._job(row)
+        broker = namespace["Broker"]()
+        response = broker._job(legacy_row)
         self.assertEqual(response["result"], {"done": True})
         self.assertTrue(LEGACY_HIDDEN_STORAGE_FIELDS.isdisjoint(response))
+        protected_row = {
+            **legacy_row,
+            "id": "protected",
+            "payload": '{"private":"input"}',
+            "result_json": '{"private":"result"}',
+            "producer_attempt_id": "attempt-1",
+            "input_storage_mode": "producer_owned",
+            "result_storage_mode": "producer_owned",
+        }
+        protected = broker._job(protected_row)
+        self.assertNotIn("payload", protected)
+        self.assertNotIn("result", protected)
+        self.assertNotIn("result_json", protected)
+        self.assertTrue(LEGACY_HIDDEN_STORAGE_FIELDS.isdisjoint(protected))
+        broker.db = sqlite3.connect(":memory:")
+        broker.clock = lambda: 1.0
+        broker.db.execute(
+            "CREATE TABLE jobs(id TEXT PRIMARY KEY, producer_attempt_id TEXT, "
+            "input_storage_mode TEXT, result_storage_mode TEXT)"
+        )
+        broker.db.execute(
+            "CREATE TABLE audit_events(occurred REAL,event_type TEXT,job_id TEXT,"
+            "source TEXT,attempt_no INTEGER,from_state TEXT,to_state TEXT,reason TEXT,"
+            "metadata_json TEXT,producer_storage INTEGER NOT NULL DEFAULT 0)"
+        )
+        broker.db.executemany(
+            "INSERT INTO jobs VALUES(?,?,?,?)",
+            [
+                ("legacy", None, "broker_temporary", "broker_temporary"),
+                ("protected", "attempt-1", "producer_owned", "producer_owned"),
+            ],
+        )
+        broker._audit("job.failed", job_id="legacy", source="legacy")
+        broker._audit("job.failed", job_id="protected", source="producer")
+        self.assertEqual(
+            broker.db.execute(
+                "SELECT job_id,producer_storage FROM audit_events ORDER BY rowid"
+            ).fetchall(),
+            [("legacy", 0), ("protected", 1)],
+        )
+        broker.db.close()
         self.assertEqual(
             report["hidden_storage_fields"], len(LEGACY_HIDDEN_STORAGE_FIELDS),
         )
         self.assertTrue(report["producer_storage_dispatch_blocked"])
+        self.assertTrue(report["producer_storage_bodies_suppressed"])
+        self.assertTrue(report["producer_storage_audit_classified"])
+        self.assertEqual(report["source_release_sha256"], source_release_hash)
         hardened = (output / "broker" / "service.py").read_text(encoding="utf-8")
         self.assertIn("AND producer_attempt_id IS NULL", hardened)
         self.assertIn("AND input_storage_mode='broker_temporary'", hardened)
