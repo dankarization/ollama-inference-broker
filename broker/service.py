@@ -1606,20 +1606,34 @@ class Broker:
         self._loaded_models_cache = [dict(model) for model in models if isinstance(model, dict)]
         loaded = [m.get("name") for m in models]
         others = [m for m in loaded if m != profile.model]
-        if others:
-            for model in others: self.ollama.unload(model)
-            reason = "unloaded incompatible model before switch"
-        else:
-            reason = "target already resident" if profile.model in loaded else "target model requested"
-        # A no-op generation is Ollama's explicit model-load/readiness contract.
-        if not self.ollama.is_ready(profile.model):
-            self.ollama.run("generate", {"model": profile.model, "prompt": "", "keep_alive": f"{profile.keep_alive_seconds}s"})
-        wait_ready = getattr(self.ollama, "wait_ready", None)
-        ready = (
-            wait_ready(profile.model, timeout_seconds=30)
-            if wait_ready is not None
-            else self.ollama.is_ready(profile.model)
+        reason = (
+            "unloaded incompatible model before switch" if others
+            else "target already resident" if profile.model in loaded
+            else "target model requested"
         )
+        ensure_ready = getattr(self.ollama, "ensure_model_ready", None)
+        if ensure_ready is not None:
+            ready = ensure_ready(
+                profile.model,
+                keep_alive=f"{profile.keep_alive_seconds}s",
+                timeout_seconds=min(300, profile.request_timeout_seconds),
+            )
+        else:
+            # Compatibility seam for injected test/executor adapters. Production
+            # OllamaHTTP uses the bounded exclusive switch above.
+            for model in others:
+                self.ollama.unload(model)
+            if not self.ollama.is_ready(profile.model):
+                self.ollama.run(
+                    "generate",
+                    {"model": profile.model, "prompt": "", "keep_alive": f"{profile.keep_alive_seconds}s"},
+                )
+            wait_ready = getattr(self.ollama, "wait_ready", None)
+            ready = (
+                wait_ready(profile.model, timeout_seconds=30)
+                if wait_ready is not None
+                else self.ollama.is_ready(profile.model)
+            )
         if not ready:
             raise RuntimeError("target model did not become ready")
         payload = json.loads(row["payload"])
