@@ -312,10 +312,23 @@ Runtime-параметры моделей задаёт broker, caller не мо�
 
 `POST /v1/syncopia-memory/extract` — отдельный синхронный text-only contract
 для локального Phase-2 extractor. Он требует `tools=[]`, `stream=false`, ровно
-system+user messages и JSON Schema, запускает только
-`qwen3.8:ad-iq2-xs` с `num_ctx=65536`, `num_predict=8192`, `think=false` и source
+system+user messages, запускает только
+`qwen3.8:ad-iq2-xs` с `num_ctx=65536`, `num_predict=8192` и source
 `syncopia-telegram-memory`. Request hash используется caller как idempotency
 key; Olya/Shutterstock endpoints и profiles не переиспользуются.
+
+Для свободной текстовой сводки на том же `syncopia-memory-qwen38` необходимо
+**не передавать** оба поля `format`/`response_format` и задать `think="low"`.
+Этот явный freeform mode не добавляет JSON forcing, не усекает messages и
+передаёт `think="low"` в Ollama. Лимиты и options остаются теми же:
+`temperature=0`, `num_ctx=65536`, `num_predict=8192`; сообщения свыше 196608
+UTF-8 JSON bytes отклоняются, а не обрезаются. Schema mode по-прежнему требует
+`format` как JSON Schema object, допускает отсутствующий/`null` response_format
+или `{"type":"json_object"}` и принудительно использует `think=false`.
+Null/частичные format-поля не выбирают freeform mode. Оба режима поддерживаются
+также через `POST /v1/jobs` на выделенных profile/source; producer-storage
+требует прежний bearer, canonical normalized input hash и ACK, без изменения
+storage identity или правил защиты.
 
 ## Проверка и разработка
 

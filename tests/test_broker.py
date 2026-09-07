@@ -834,6 +834,66 @@ class SyncopiaMemoryEndpointTests(unittest.TestCase):
             with self.subTest(message=message), self.assertRaisesRegex(CompatibilityError, message):
                 validate_syncopia_memory_payload(invalid)
 
+    def test_freeform_dispatch_preserves_text_think_and_idempotency(self):
+        from broker.compat import submit_syncopia_memory
+        broker = self.make(["qwen3.8:ad-iq2-xs"])
+        request = self.request(think="low", options={"num_ctx": 999999})
+        del request["format"], request["response_format"]
+        request["messages"][1]["content"] = "  Русский текст\n" * 2000 + "КОНЕЦ  "
+        original = json.loads(json.dumps(request))
+        job = submit_syncopia_memory(broker, request)
+        self.assertEqual(submit_syncopia_memory(broker, request)["id"], job["id"])
+        self.assertTrue(broker.dispatch_once(frozenset({"syncopia-telegram-memory"})))
+        self.assertEqual(submit_syncopia_memory(broker, request)["id"], job["id"])
+        self.assertFalse(broker.dispatch_once(frozenset({"syncopia-telegram-memory"})))
+        dispatched = [c[2] for c in self.calls if isinstance(c, tuple) and c[:2] == ("run", "chat")]
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["think"], "low")
+        self.assertEqual(dispatched[0]["messages"], original["messages"])
+        self.assertEqual(dispatched[0]["model"], "qwen3.8:ad-iq2-xs")
+        self.assertNotIn("format", dispatched[0])
+        self.assertNotIn("response_format", dispatched[0])
+        self.assertEqual(dispatched[0]["options"], {
+            "temperature": 0, "num_ctx": 65536, "num_predict": 8192,
+        })
+        self.assertEqual(request, original)
+
+    def test_schema_mode_keeps_legacy_normalization(self):
+        from broker.compat import validate_syncopia_memory_payload
+        for think in (None, False, True, "low", "high"):
+            for response_format in (None, {"type": "json_object"}):
+                with self.subTest(think=think, response_format=response_format):
+                    request = self.request(think=think, response_format=response_format)
+                    payload = validate_syncopia_memory_payload(request)
+                    self.assertIs(payload["think"], False)
+                    self.assertEqual(payload["format"], request["format"])
+        request = self.request()
+        del request["response_format"]
+        self.assertIs(validate_syncopia_memory_payload(request)["think"], False)
+
+    def test_freeform_invalid_modes_and_shared_limits_fail_closed(self):
+        from broker.compat import CompatibilityError, validate_syncopia_memory_payload
+        freeform = self.request(think="low")
+        del freeform["format"], freeform["response_format"]
+        invalid_overrides = [
+            {"think": value} for value in (None, False, True, "", "medium", "high", [], {})
+        ] + [
+            {"format": None}, {"format": "json"}, {"format": []},
+            {"response_format": None}, {"response_format": {"type": "json_object"}},
+            {"response_format": {"type": "text"}}, {"stream": True},
+            {"tools": [{"type": "function"}]}, {"images": ["synthetic"]},
+            {"model": "other"},
+            {"messages": [{"role": "user", "content": "missing system"}]},
+            {"messages": [{"role": "system", "content": "s"},
+                          {"role": "user", "content": "x" * 196608}]},
+        ]
+        for overrides in invalid_overrides:
+            with self.subTest(fields=list(overrides)), self.assertRaises(CompatibilityError):
+                validate_syncopia_memory_payload({**freeform, **overrides})
+        del freeform["think"]
+        with self.assertRaises(CompatibilityError):
+            validate_syncopia_memory_payload(freeform)
+
     def test_synchronous_endpoint_returns_broker_identity(self):
         broker = self.make(["qwen3.8:ad-iq2-xs"])
         server = serve(broker, port=0)

@@ -57,8 +57,8 @@ PROFILES = {
         max_schema_bytes=16_384,
     ),
     # Phase-2 Telegram-memory extraction is a separate text-only source.  The
-    # 64k context and thinking-disabled mode are enforced again by its compatibility
-    # contract; callers cannot borrow the Olya lane or widen either limit.
+    # 64k context and schema/freeform thinking modes are enforced again by its
+    # compatibility contract; callers cannot borrow the Olya lane or widen limits.
     "syncopia-memory-qwen38": Profile(
         "syncopia-memory-qwen38", "qwen3.8:ad-iq2-xs", 65_536, 8_192, 1_800,
         max_concurrency=1, request_timeout_seconds=900,
