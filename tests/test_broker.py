@@ -107,6 +107,60 @@ class BrokerTests(unittest.TestCase):
         ):
             self.assertTrue(client.wait_ready("gemma4:12b", timeout_seconds=3))
         self.assertEqual(sleep.call_count, 2)
+
+    def test_model_switch_waits_for_delayed_unload_before_loading_target(self):
+        client = OllamaHTTP()
+        old = "nemotron3:33b"
+        target = "qwen3.8:ad-iq2-xs"
+        states = iter((
+            {"models": [{"name": old}]},
+            {"models": [{"name": old}]},
+            {"models": []},
+            {"models": [{"name": target}]},
+        ))
+        calls = []
+        client.ps = lambda: (calls.append("ps"), next(states))[1]
+        client.unload = lambda model, timeout_seconds=None: calls.append(
+            ("unload", model, timeout_seconds)
+        )
+        client._request = lambda path, body, timeout_seconds=None: calls.append(
+            ("load", path, body.copy(), timeout_seconds)
+        ) or {"done": True}
+        with patch("broker.adapters.time.sleep"):
+            self.assertTrue(client.ensure_model_ready(
+                target, keep_alive="1800s", timeout_seconds=300, poll_seconds=0,
+            ))
+        unload_index = next(i for i, call in enumerate(calls) if isinstance(call, tuple) and call[0] == "unload")
+        load_index = next(i for i, call in enumerate(calls) if isinstance(call, tuple) and call[0] == "load")
+        self.assertGreater(load_index, unload_index)
+        self.assertGreaterEqual(calls[:load_index].count("ps"), 3)
+        self.assertEqual(calls[load_index][2], {"model": target, "keep_alive": "1800s"})
+
+    def test_dispatch_uses_profile_bounded_exclusive_model_switch(self):
+        class ExclusiveSwitchOllama(FakeOllama):
+            def ensure_model_ready(self, model, *, keep_alive, timeout_seconds):
+                self.calls.append(("ensure_model_ready", model, keep_alive, timeout_seconds))
+                self.loaded[:] = [model]
+                return True
+
+        self.calls = []
+        self.tmp = tempfile.NamedTemporaryFile()
+        self.addCleanup(self.tmp.close)
+        self.ol = ExclusiveSwitchOllama(self.calls, ["nemotron3:33b"])
+        broker = Broker(self.tmp.name, self.ol, FakeWol(self.calls))
+        job = broker.submit(
+            "syncopia-memory-qwen38", "chat",
+            {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+             "tools": [], "stream": False, "think": "low"},
+            source="syncopia-telegram-memory",
+        )
+        broker.dispatch_once()
+        self.assertEqual(broker.status(job["id"])["state"], "completed")
+        self.assertIn(
+            ("ensure_model_ready", "qwen3.8:ad-iq2-xs", "1800s", 300),
+            self.calls,
+        )
+        self.assertNotIn(("unload", "nemotron3:33b"), self.calls)
     def test_global_fifo_without_policy(self):
         b=self.make(["nemotron3:33b"], clock=iter(range(1_000)).__next__)
         cron=b.submit("cron", "generate", {"prompt":"cron"})["id"]

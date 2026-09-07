@@ -92,8 +92,63 @@ class OllamaHTTP:
                 return False
             time.sleep(min(poll_seconds, remaining))
 
-    def unload(self, model: str) -> None:
-        self._request("/api/generate", {"model": model, "keep_alive": 0})
+    def unload(self, model: str, timeout_seconds: float | None = None) -> None:
+        self._request(
+            "/api/generate", {"model": model, "keep_alive": 0}, timeout_seconds
+        )
+
+    def ensure_model_ready(
+        self,
+        model: str,
+        *,
+        keep_alive: str,
+        timeout_seconds: float = 300,
+        poll_seconds: float = 1,
+    ) -> bool:
+        """Make ``model`` the only resident model within one bounded deadline.
+
+        Ollama may acknowledge an unload before ``/api/ps`` stops reporting the
+        old model.  Loading the target during that interval can leave the old
+        model resident and never make the target visible.  Wait for all
+        incompatible models to disappear before issuing the one explicit load,
+        then require an exclusive target-model observation.
+        """
+        if timeout_seconds <= 0 or poll_seconds < 0:
+            raise ValueError("model readiness timeouts must be positive")
+        deadline = time.monotonic() + timeout_seconds
+        unload_requested: set[str] = set()
+        load_requested = False
+        while True:
+            models = self.ps().get("models", [])
+            loaded = {
+                item.get("name")
+                for item in models
+                if isinstance(item, dict) and isinstance(item.get("name"), str)
+            }
+            incompatible = loaded - {model}
+            if incompatible:
+                for resident in sorted(incompatible - unload_requested):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self.unload(resident, timeout_seconds=remaining)
+                    unload_requested.add(resident)
+            elif model in loaded:
+                return True
+            elif not load_requested:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._request(
+                    "/api/generate",
+                    {"model": model, "keep_alive": keep_alive},
+                    timeout_seconds=remaining,
+                )
+                load_requested = True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(poll_seconds, remaining))
 
     def run(self, kind: str, request: dict) -> dict:
         # This private field is set by the broker from a server-owned profile;
