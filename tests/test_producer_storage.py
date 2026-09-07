@@ -1080,6 +1080,71 @@ class ProducerStorageTests(unittest.TestCase):
             " ".join(str(row[3]) for row in query_plans["quarantined"]),
         )
 
+    def test_syncopia_freeform_http_preserves_storage_auth_and_ack(self):
+        source = "syncopia-telegram-memory"
+        raw = json.loads(self.policy_path.read_text())
+        raw["sources"][source] = raw["sources"].pop("producer")
+        raw["sources"][source]["producer_storage_mode"] = "hybrid"
+        self.policy_path.write_text(json.dumps(raw))
+        self.broker.ollama.ps = lambda: {"models": [{"name": "qwen3.8:ad-iq2-xs"}]}
+        requests = []
+        def run(kind, payload):
+            requests.append((kind, payload))
+            return {"done": True, "message": {"role": "assistant", "content": "Свободная сводка."}}
+        self.broker.ollama.run = run
+        body = {
+            "profile": "syncopia-memory-qwen38", "kind": "chat", "source": source,
+            "external_id": "freeform-protected", "source_item_id": "synthetic",
+            "payload": {"messages": [{"role": "system", "content": "Краткая сводка."},
+                                     {"role": "user", "content": "Только синтетические данные."}],
+                        "think": "low"},
+            "producer_storage": {"producer_attempt_id": "freeform-attempt-1",
+                                 "input": {"mode": "broker_temporary"},
+                                 "result": {"mode": "hybrid", "schema_version": "freeform-v1"}},
+        }
+        token = "test-storage-token-with-at-least-32-characters"
+        server = serve(self.broker, port=0, policy=self.policy, storage_token=token)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_port}"
+        def call(path, data=None, authorized=False):
+            headers = {"Content-Type": "application/json"}
+            if authorized:
+                headers["Authorization"] = f"Bearer {token}"
+            with urlopen(Request(base + path, data=None if data is None else json.dumps(data).encode(),
+                                 headers=headers)) as response:
+                return json.load(response)
+        with self.assertRaises(HTTPError) as denied:
+            call("/v1/jobs", body)
+        self.assertEqual(denied.exception.code, 401)
+        self.assertEqual(self.broker.health()["queue_depth"], 0)
+        job = call("/v1/jobs", body, True)
+        job_path = f"/v1/jobs/{job['id']}"
+        self.assertEqual(call("/v1/jobs", body, True)["id"], job["id"])
+        self.assertTrue(self.broker.dispatch_once(frozenset({source})))
+        with self.assertRaises(HTTPError) as denied:
+            call(job_path)
+        self.assertEqual(denied.exception.code, 401)
+        result = call(job_path, authorized=True)
+        self.assertEqual(result["result"]["message"]["content"], "Свободная сводка.")
+        status = self.broker.compact_status(job["id"])
+        ack = self._ack(job, status, producer=source, producer_attempt_id="freeform-attempt-1",
+                        schema_version="freeform-v1")
+        with self.assertRaises(HTTPError) as denied:
+            call(job_path + "/ack", ack)
+        self.assertEqual(denied.exception.code, 401)
+        receipt = call(job_path + "/ack", ack, True)
+        self.assertEqual(call(job_path + "/ack", ack, True), receipt)
+        self.assertEqual(call("/v1/jobs", body, True)["id"], job["id"])
+        self.assertFalse(self.broker.dispatch_once(frozenset({source})))
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0][1]["think"], "low")
+        self.assertEqual(requests[0][1]["messages"], body["payload"]["messages"])
+        self.assertNotIn("format", requests[0][1])
+        self.assertNotIn("response_format", requests[0][1])
+        self.assertEqual(self.broker.compact_status(job["id"])["delivery_state"], "acked")
+
     def test_public_reads_protect_producer_jobs_and_storage_evidence(self):
         job = self._admit(external_id="protected-public-read")
         status = self._complete(job)

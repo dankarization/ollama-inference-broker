@@ -316,7 +316,7 @@ def submit_olya_decision(broker: Any, request: Any) -> dict[str, Any]:
 
 
 def validate_syncopia_memory_payload(request: Any) -> dict[str, Any]:
-    """Validate the tools-disabled Phase-2 Telegram-memory extraction shape."""
+    """Validate schema extraction or explicit low-thinking freeform summaries."""
     if not isinstance(request, dict):
         raise CompatibilityError("request must be a JSON object")
     profile = PROFILES["syncopia-memory-qwen38"]
@@ -336,6 +336,20 @@ def validate_syncopia_memory_payload(request: Any) -> dict[str, Any]:
         raise CompatibilityError("Syncopia memory requires stream=false")
     if request.get("images") not in (None, []):
         raise CompatibilityError("Syncopia memory is text-only")
+    payload = {
+        "messages": messages,
+        "think": False,
+        "options": {
+            "temperature": 0,
+            "num_ctx": profile.max_context,
+            "num_predict": profile.max_output,
+        },
+    }
+    if "format" not in request and "response_format" not in request:
+        if request.get("think") != "low":
+            raise CompatibilityError("Syncopia freeform requires think=low")
+        payload["think"] = "low"
+        return payload
     response_format = request.get("response_format")
     if response_format not in (None, {"type": "json_object"}):
         raise CompatibilityError("response_format must request one JSON object")
@@ -348,16 +362,8 @@ def validate_syncopia_memory_payload(request: Any) -> dict[str, Any]:
         raise CompatibilityError("format must be JSON serializable") from None
     if schema_bytes > profile.max_schema_bytes:
         raise CompatibilityError("format exceeds the Syncopia memory schema limit")
-    return {
-        "messages": messages,
-        "format": schema,
-        "think": False,
-        "options": {
-            "temperature": 0,
-            "num_ctx": profile.max_context,
-            "num_predict": profile.max_output,
-        },
-    }
+    payload["format"] = schema
+    return payload
 
 
 def submit_syncopia_memory(broker: Any, request: Any) -> dict[str, Any]:
