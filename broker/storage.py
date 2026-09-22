@@ -18,7 +18,7 @@ from .policy import RETENTION_DEFAULTS, normalize_source_policy, source_policy_w
 
 
 LOGGER = logging.getLogger("ollama_inference_broker.storage")
-STORAGE_SCHEMA_VERSION = 2
+STORAGE_SCHEMA_VERSION = 3
 DEFAULT_WAL_AUTOCHECKPOINT_PAGES = 4096
 DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
 MAX_WAL_AUTOCHECKPOINT_PAGES = (1 << 31) - 1
@@ -225,7 +225,13 @@ def migrate_storage_schema(
     db.execute("""CREATE TABLE IF NOT EXISTS storage_source_usage (
         source TEXT PRIMARY KEY,
         job_count INTEGER NOT NULL,
-        inline_bytes INTEGER NOT NULL)""")
+        inline_bytes INTEGER NOT NULL,
+        terminal_inline_bytes INTEGER NOT NULL DEFAULT 0)""")
+    if "terminal_inline_bytes" not in _column_names(db, "storage_source_usage"):
+        db.execute(
+            "ALTER TABLE storage_source_usage ADD COLUMN terminal_inline_bytes "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
     db.execute(
         "CREATE INDEX IF NOT EXISTS job_artifacts_job_state "
         "ON job_artifacts(job_id,role,state)"
@@ -323,40 +329,83 @@ def migrate_storage_schema(
             "SELECT source,count(*),sum(length(CAST(payload AS BLOB))+"
             "coalesce(length(CAST(result_json AS BLOB)),0)) FROM jobs GROUP BY source"
         )
+    terminal_usage_migrated = db.execute(
+        "SELECT 1 FROM broker_schema_migrations WHERE version=3"
+    ).fetchone() is not None
+    if not terminal_usage_migrated:
+        db.execute("UPDATE storage_source_usage SET terminal_inline_bytes=0")
+        db.execute(
+            "INSERT INTO storage_source_usage("
+            "source,job_count,inline_bytes,terminal_inline_bytes) "
+            "SELECT source,0,0,sum(length(CAST(payload AS BLOB))+"
+            "coalesce(length(CAST(result_json AS BLOB)),0)) FROM jobs "
+            "WHERE state IN ('completed','failed','cancelled') "
+            "AND compaction_state='full' GROUP BY source "
+            "ON CONFLICT(source) DO UPDATE SET "
+            "terminal_inline_bytes=excluded.terminal_inline_bytes"
+        )
+    for trigger in (
+        "jobs_storage_usage_insert",
+        "jobs_storage_usage_delete",
+        "jobs_storage_usage_update",
+    ):
+        db.execute(f"DROP TRIGGER IF EXISTS {trigger}")
     db.execute("""CREATE TRIGGER IF NOT EXISTS jobs_storage_usage_insert
         AFTER INSERT ON jobs BEGIN
-        INSERT INTO storage_source_usage(source,job_count,inline_bytes)
+        INSERT INTO storage_source_usage(
+        source,job_count,inline_bytes,terminal_inline_bytes)
         VALUES(NEW.source,1,length(CAST(NEW.payload AS BLOB))+
-        coalesce(length(CAST(NEW.result_json AS BLOB)),0))
+        coalesce(length(CAST(NEW.result_json AS BLOB)),0),
+        CASE WHEN NEW.state IN ('completed','failed','cancelled')
+        AND NEW.compaction_state='full' THEN length(CAST(NEW.payload AS BLOB))+
+        coalesce(length(CAST(NEW.result_json AS BLOB)),0) ELSE 0 END)
         ON CONFLICT(source) DO UPDATE SET
         job_count=job_count+1,
-        inline_bytes=inline_bytes+excluded.inline_bytes;
+        inline_bytes=inline_bytes+excluded.inline_bytes,
+        terminal_inline_bytes=terminal_inline_bytes+excluded.terminal_inline_bytes;
         END""")
     db.execute("""CREATE TRIGGER IF NOT EXISTS jobs_storage_usage_delete
         AFTER DELETE ON jobs BEGIN
         UPDATE storage_source_usage SET
         job_count=job_count-1,
         inline_bytes=inline_bytes-length(CAST(OLD.payload AS BLOB))-
-        coalesce(length(CAST(OLD.result_json AS BLOB)),0)
+        coalesce(length(CAST(OLD.result_json AS BLOB)),0),
+        terminal_inline_bytes=terminal_inline_bytes-
+        CASE WHEN OLD.state IN ('completed','failed','cancelled')
+        AND OLD.compaction_state='full' THEN length(CAST(OLD.payload AS BLOB))+
+        coalesce(length(CAST(OLD.result_json AS BLOB)),0) ELSE 0 END
         WHERE source=OLD.source;
         END""")
     db.execute("""CREATE TRIGGER IF NOT EXISTS jobs_storage_usage_update
-        AFTER UPDATE OF source,payload,result_json ON jobs BEGIN
+        AFTER UPDATE OF source,state,payload,result_json,compaction_state ON jobs BEGIN
         UPDATE storage_source_usage SET
         job_count=job_count-1,
         inline_bytes=inline_bytes-length(CAST(OLD.payload AS BLOB))-
-        coalesce(length(CAST(OLD.result_json AS BLOB)),0)
+        coalesce(length(CAST(OLD.result_json AS BLOB)),0),
+        terminal_inline_bytes=terminal_inline_bytes-
+        CASE WHEN OLD.state IN ('completed','failed','cancelled')
+        AND OLD.compaction_state='full' THEN length(CAST(OLD.payload AS BLOB))+
+        coalesce(length(CAST(OLD.result_json AS BLOB)),0) ELSE 0 END
         WHERE source=OLD.source;
-        INSERT INTO storage_source_usage(source,job_count,inline_bytes)
+        INSERT INTO storage_source_usage(
+        source,job_count,inline_bytes,terminal_inline_bytes)
         VALUES(NEW.source,1,length(CAST(NEW.payload AS BLOB))+
-        coalesce(length(CAST(NEW.result_json AS BLOB)),0))
+        coalesce(length(CAST(NEW.result_json AS BLOB)),0),
+        CASE WHEN NEW.state IN ('completed','failed','cancelled')
+        AND NEW.compaction_state='full' THEN length(CAST(NEW.payload AS BLOB))+
+        coalesce(length(CAST(NEW.result_json AS BLOB)),0) ELSE 0 END)
         ON CONFLICT(source) DO UPDATE SET
         job_count=job_count+1,
-        inline_bytes=inline_bytes+excluded.inline_bytes;
+        inline_bytes=inline_bytes+excluded.inline_bytes,
+        terminal_inline_bytes=terminal_inline_bytes+excluded.terminal_inline_bytes;
         END""")
     db.execute(
         "INSERT OR IGNORE INTO broker_schema_migrations(version,name) VALUES(2,?)",
         ("retention_bounded_storage",),
+    )
+    db.execute(
+        "INSERT OR IGNORE INTO broker_schema_migrations(version,name) VALUES(3,?)",
+        ("terminal_inline_usage",),
     )
     return {
         "schema_version": STORAGE_SCHEMA_VERSION,
@@ -659,25 +708,25 @@ class StorageManager:
         }
 
     def _assert_admission_capacity(
-        self, source: str, payload_bytes: int, *, config: dict[str, Any] | None,
+        self, source: str, _payload_bytes: int, *, config: dict[str, Any] | None,
     ) -> None:
         if config is None:
             config = self._source_config(source)
         if not config["retention_enabled"]:
             return
         usage = self.db.execute(
-            "SELECT inline_bytes FROM storage_source_usage WHERE source=?", (source,)
+            "SELECT terminal_inline_bytes FROM storage_source_usage WHERE source=?", (source,)
         ).fetchone()
-        inline_bytes = int(usage[0]) if usage is not None else 0
-        if inline_bytes + payload_bytes > int(config["inline_budget_bytes"]):
+        terminal_inline_bytes = int(usage[0]) if usage is not None else 0
+        if terminal_inline_bytes >= int(config["inline_budget_bytes"]):
             raise StorageContractError(
-                f"source {source!r} inline storage budget is exhausted"
+                f"source {source!r} terminal inline storage budget is exhausted"
             )
         total_inline_bytes = int(self.db.execute(
-            "SELECT coalesce(sum(inline_bytes),0) FROM storage_source_usage"
+            "SELECT coalesce(sum(terminal_inline_bytes),0) FROM storage_source_usage"
         ).fetchone()[0])
-        if total_inline_bytes + payload_bytes > DEFAULT_GLOBAL_INLINE_BUDGET_BYTES:
-            raise StorageContractError("global inline storage budget is exhausted")
+        if total_inline_bytes >= DEFAULT_GLOBAL_INLINE_BUDGET_BYTES:
+            raise StorageContractError("global terminal inline storage budget is exhausted")
 
     def record_admission(
         self, job_id: str, source: str, fields: dict[str, Any], created: float,
@@ -1602,7 +1651,8 @@ class StorageManager:
                 (now, now),
             ).fetchone())
             usage = [dict(row) for row in self.db.execute(
-                "SELECT source,job_count,inline_bytes FROM storage_source_usage "
+                "SELECT source,job_count,inline_bytes,terminal_inline_bytes "
+                "FROM storage_source_usage "
                 "ORDER BY source"
             )]
             effective_wal_autocheckpoint_pages = int(
@@ -1624,4 +1674,5 @@ class StorageManager:
             "destructive_compaction_default": False,
             "database_target_bytes": DEFAULT_DATABASE_TARGET_BYTES,
             "global_inline_budget_bytes": DEFAULT_GLOBAL_INLINE_BUDGET_BYTES,
+            "global_terminal_inline_budget_bytes": DEFAULT_GLOBAL_INLINE_BUDGET_BYTES,
         }

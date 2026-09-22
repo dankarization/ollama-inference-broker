@@ -286,12 +286,29 @@ class RetentionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "retry retention has expired"):
             self.broker.retry(job["id"])
 
-    def test_inline_budget_blocks_only_opted_in_new_admissions(self):
+    def test_inline_budget_ignores_active_payload_but_blocks_terminal_bodies(self):
+        self._write_policy(inline_budget_bytes=1)
+        queued = self._admit("queued", payload={"prompt": "x" * 10_000})
+        self.assertEqual(queued["state"], "queued")
+        second = self._admit("second-queued", payload={"prompt": "y" * 10_000})
+        self.assertEqual(second["state"], "queued")
+        self._write_policy(inline_budget_bytes=1024 * 1024)
+        self.broker.cancel(queued["id"])
+        self.broker.cancel(second["id"])
+        self.clock.value = 106
+        self.broker.storage.maybe_maintain(force=True)
+        terminal = self._admit("terminal")
+        self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
+        self.assertEqual(self.broker.status(terminal["id"])["state"], "completed")
         self._write_policy(inline_budget_bytes=1)
         with self.assertRaisesRegex(StorageContractError, "budget is exhausted"):
             self._admit("too-large")
         self.assertEqual(
-            self.broker.db.execute("SELECT count(*) FROM jobs").fetchone()[0], 0,
+            self.broker.db.execute(
+                "SELECT terminal_inline_bytes FROM storage_source_usage "
+                "WHERE source='producer'"
+            ).fetchone()[0],
+            len("{}") + len(json.dumps({"done": True, "output": "terminal"})),
         )
 
     def test_startup_queued_at_backfill_uses_partial_index(self):

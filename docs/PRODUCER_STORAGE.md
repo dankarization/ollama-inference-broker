@@ -125,9 +125,12 @@ finite values for:
 - `tombstone_retention_seconds`;
 - `inline_budget_bytes`.
 
-The default source budget is 128 MiB. A separate 768 MiB global inline-body
-budget bounds new admissions. Both checks use the trigger-maintained usage
-table.
+The default source budget is 128 MiB. A separate 768 MiB global terminal-body
+budget applies backpressure to new admissions when retained terminal bodies
+reach either limit. Both checks use trigger-maintained terminal usage and do
+not count queued, running, cancel-requested, or retryable payloads: those bodies
+are required for execution, so their growth remains visible but cannot be
+discarded or mistaken for reclaimable retention usage.
 
 Queued, running, cancel-requested, and still-retryable payloads always remain
 inline and byte-identical. Completed payloads are cleared immediately because a
