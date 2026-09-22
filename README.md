@@ -94,7 +94,8 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
   `/v1/correlations` дают payload-free историю очереди, попыток, correlation и
   scheduler fairness. Определения метрик и пример 8:3 — в
   [docs/ANALYTICS.md](docs/ANALYTICS.md).
-- `GET /dashboard` — локальная auto-refresh HTML-панель очереди без payload,
+- `GET /dashboard` — локальная HTML-панель очереди с refresh раз в 30 секунд,
+  ETag/304 для неизменившегося состояния и без payload,
   результатов и ошибок. Она показывает policy (`enabled`, `weight`),
   состояния, lease, retry/delay, активные jobs, completed total/1h/24h и
   read-only **Forecast** под активными jobs: текущую модель и список следующих

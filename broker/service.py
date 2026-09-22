@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 import logging
 import os
@@ -48,6 +49,7 @@ OBSERVER_READ_DEADLINE_SECONDS = 0.75
 SCHEDULING_HORIZON_SECONDS = 60 * 60
 FORECAST_DEFAULT_EXECUTION_SECONDS = 300.0
 MAX_ERROR_SUMMARY_CHARACTERS = 1024
+DASHBOARD_VALIDATOR_INTERVAL_SECONDS = 30.0
 
 
 def bounded_error_summary(error: BaseException) -> str:
@@ -257,6 +259,7 @@ class Broker:
         }
         self._loaded_models_cache: list[dict[str, Any]] = []
         self._dashboard_cache: dict[bool, dict[str, Any]] = {}
+        self._dashboard_instance = uuid.uuid4().hex
         self._metrics_cache: dict[str, Any] = {
             "resource": "mainpc-gpu", "queue_depth": 0, "active": None,
         }
@@ -1249,6 +1252,29 @@ class Broker:
             return stale
         # An observer timeout or lock is not evidence that the queue is empty.
         return {"observation": self._observation("unavailable", now, error)}
+
+    def dashboard_etag(
+        self, policy: SourcePolicy | None = None, *,
+        include_producer_storage: bool = True,
+    ) -> str:
+        """Return a cheap validator without running dashboard observer queries."""
+        policy_snapshot = policy.snapshot() if policy is not None else None
+        with self.lock:
+            revision = {
+                "database_changes": self.db.total_changes,
+                "include_producer_storage": include_producer_storage,
+                "instance": self._dashboard_instance,
+                "policy": policy_snapshot,
+                # Dashboard windows, delayed state, forecasts, timestamps and
+                # observer availability can change without a database write.
+                # Match the HTML refresh cadence so a cached response is never
+                # reused for more than one 30-second observation interval.
+                "time_epoch": int(self.clock() // DASHBOARD_VALIDATOR_INTERVAL_SECONDS),
+            }
+        digest = hashlib.sha256(json.dumps(
+            revision, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        return f'"{digest}"'
 
     def _terminal_history(
         self, db, *, limit: int, cursor: tuple[float, str] | None = None,

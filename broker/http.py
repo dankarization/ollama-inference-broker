@@ -17,8 +17,10 @@ from .storage import ReceiptConflict, StorageContractError
 def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
     broker.use_source_policy(policy)
     class Handler(BaseHTTPRequestHandler):
-        def _json(self, status, value):
-            encoded=json.dumps(value).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
+        def _json(self, status, value, headers=None):
+            encoded=json.dumps(value).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(encoded)))
+            for name, header_value in (headers or {}).items(): self.send_header(name, header_value)
+            self.end_headers(); self.wfile.write(encoded)
         def _stream(self, status, frames):
             encoded=b"".join(frames); self.send_response(status); self.send_header("Content-Type","application/x-ndjson"); self.send_header("Content-Length",str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
         def _admission_blocked(self, error):
@@ -48,6 +50,17 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 self._json(401, {"error": {"code": "storage_auth_required"}})
                 return False
             return True
+        def _dashboard_validator(self, include_producer_storage):
+            etag = broker.dashboard_etag(
+                policy, include_producer_storage=include_producer_storage,
+            )
+            headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+            if self.headers.get("If-None-Match") == etag:
+                self.send_response(304)
+                for name, value in headers.items(): self.send_header(name, value)
+                self.end_headers()
+                return None, headers
+            return etag, headers
         def do_POST(self):
             size=int(self.headers.get("Content-Length", 0))
             try:
@@ -323,19 +336,32 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
             path = parsed.path
             query = parse_qs(parsed.query)
             if path == "/dashboard":
+                include_producer_storage = self._storage_authenticated()
+                etag, headers = self._dashboard_validator(include_producer_storage)
+                if etag is None:
+                    return
                 dashboard = broker.dashboard(
                     policy,
-                    include_producer_storage=self._storage_authenticated(),
+                    include_producer_storage=include_producer_storage,
                 )
                 encoded = render_dashboard(dashboard)
                 status = 503 if dashboard["observation"]["state"] == "unavailable" else 200
-                self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
+                self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(encoded)))
+                for name, value in headers.items(): self.send_header(name, value)
+                self.end_headers(); self.wfile.write(encoded)
             elif path == "/v1/dashboard":
+                include_producer_storage = self._storage_authenticated()
+                etag, headers = self._dashboard_validator(include_producer_storage)
+                if etag is None:
+                    return
                 dashboard = broker.dashboard(
                     policy,
-                    include_producer_storage=self._storage_authenticated(),
+                    include_producer_storage=include_producer_storage,
                 )
-                self._json(503 if dashboard["observation"]["state"] == "unavailable" else 200, dashboard)
+                self._json(
+                    503 if dashboard["observation"]["state"] == "unavailable" else 200,
+                    dashboard, headers,
+                )
             elif path == "/healthz": self._json(200, broker.health())
             elif path == "/v1/metrics": self._json(200, broker.metrics())
             elif path == "/v1/storage/health": self._json(200, broker.storage_health())
