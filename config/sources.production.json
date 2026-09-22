@@ -1,9 +1,9 @@
 {
   "version": 1,
   "sources": {
-    "shutterstock-video": {"enabled": true, "weight": 3},
-    "olya-vision": {"enabled": true, "weight": 8},
-    "olya-decision": {"enabled": true, "weight": 6},
-    "syncopia-telegram-memory": {"enabled": true, "weight": 4}
+    "shutterstock-video": {"enabled": true, "weight": 3, "producer_storage_enabled": true, "producer_storage_mode": "producer_owned", "ack_required": false, "compaction_enabled": false, "legacy_result_fallback": true, "retention_enabled": true},
+    "olya-vision": {"enabled": true, "weight": 8, "producer_storage_enabled": true, "producer_storage_mode": "producer_owned", "ack_required": false, "compaction_enabled": false, "legacy_result_fallback": true, "retention_enabled": true},
+    "olya-decision": {"enabled": true, "weight": 6, "producer_storage_enabled": true, "producer_storage_mode": "producer_owned", "ack_required": false, "compaction_enabled": false, "legacy_result_fallback": true, "retention_enabled": true},
+    "syncopia-telegram-memory": {"enabled": true, "weight": 4, "producer_storage_enabled": true, "producer_storage_mode": "hybrid", "ack_required": false, "compaction_enabled": false, "legacy_result_fallback": true, "retention_enabled": true}
   }
 }

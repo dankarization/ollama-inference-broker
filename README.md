@@ -74,6 +74,9 @@ Ollama, Shutterstock, M101 или MAIN-PC.
 отдельного разрешения на canary dispatch.
 
 ```bash
+install -d -m 0700 ~/.local/state/ollama-inference-broker
+python3 -c 'import pathlib,secrets; pathlib.Path.home().joinpath(".local/state/ollama-inference-broker/storage-api.token").open("x",encoding="utf-8").write(secrets.token_urlsafe(48)+"\n")'
+chmod 0600 ~/.local/state/ollama-inference-broker/storage-api.token
 install -D -m 0644 systemd/ollama-inference-broker.service \
   ~/.config/systemd/user/ollama-inference-broker.service
 systemctl --user daemon-reload
@@ -86,7 +89,7 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
 после отдельной проверки queued jobs.
 
 - `POST /v1/jobs` принимает `{ "profile":"interactive", "kind":"chat|generate", "payload":{...} }` и возвращает сохранённое задание (`202`).
-- `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel` и `GET /v1/metrics` дают доступ к жизненному циклу и данным MAIN-PC `/api/ps`.
+- `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel` и `GET /v1/metrics` дают доступ к жизненному циклу и данным MAIN-PC `/api/ps`. Для producer-storage jobs чтение, cancel и retry требуют owner-only storage bearer token; legacy jobs сохраняют прежний контракт.
 - `GET /v1/analytics`, `/v1/audit-events`, `/v1/jobs/{id}/attempts` и
   `/v1/correlations` дают payload-free историю очереди, попыток, correlation и
   scheduler fairness. Определения метрик и пример 8:3 — в
@@ -94,8 +97,8 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
 - `GET /dashboard` — локальная auto-refresh HTML-панель очереди без payload,
   результатов и ошибок. Она показывает policy (`enabled`, `weight`),
   состояния, lease, retry/delay, активные jobs, completed total/1h/24h и
-  read-only **Forecast** под активными jobs: текущую модель и bounded список
-  следующих weight-only выборов с configured Weight. Forecast помечен как
+  read-only **Forecast** под активными jobs: текущую модель и список следующих
+  десяти выборов тех же model-aware time batches с configured Weight. Forecast помечен как
   contingent: он меняется при новых admissions, завершениях и hot reload
   policy, и никогда не мутирует очередь/leases/аккумуляторы. Машинный
   payload-free снимок доступен как `GET /v1/dashboard` (тот же `forecast`),
@@ -107,7 +110,7 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
   ноль: в текущей модели broker исчерпанная работа —
   terminal `failed`, отдельного state `dead` нет.
 - `GET /v1/forecast` — read-only проекция ближайших выборов scheduler
-  (bounded, по умолчанию 5, максимум 20): текущая модель и следующие
+  (bounded, по умолчанию 10, максимум 20): текущая модель и следующие
   selections с source/model/weight/mode/reason/wait. Проекция
   не пишет в БД и не меняет состояние scheduler; при занятой БД возвращает
   `unavailable` вместо вымышленной пустоты.
@@ -131,7 +134,10 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
 Каждое принятое задание и scheduler decision сохраняются в durable
 audit/attempt history. `POST /v1/jobs` опционально принимает
 `source_item_id`/`external_id`; private payload и значения correlation не
-копируются в structured logs. Существующие request/response поля не удалены.
+копируются в structured logs. `external_id` остаётся idempotency key только для
+специализированных Olya/Syncopia contracts и producer-storage jobs; остальные
+legacy sources могут независимо принять несколько jobs с одним значением.
+Существующие request/response поля не удалены.
 
 Рабочий source `shutterstock` намеренно не имеет broker profile и не может
 получить lease. Новый `shutterstock-canary` — отдельное имя source, а не
@@ -170,16 +176,22 @@ durable `queued`. Это позволяет включить обратимый 
 {
   "version": 1,
   "sources": {
-    "shutterstock-video": {"enabled": true, "weight": 2.0},
-    "pilot-mainpc":      {"enabled": true, "weight": 1.0}
+    "shutterstock-video": {"enabled": true, "admission_allowed": true, "weight": 2.0},
+    "pilot-mainpc":      {"enabled": true, "admission_allowed": true, "weight": 1.0}
   }
 }
 ```
 
-Выбор при наличии policy — только weighted round-robin по source. Weight `1`
-самый важный: effective share равна `1 / weight`, поэтому Weight `2` получает
-примерно в три раза больше выборов, чем Weight `6`, пока оба hard-eligible.
-Внутри source сохраняется FIFO; возраст job и модель не меняют долю.
+При наличии policy scheduler строит повторяющийся 60-минутный execution-time
+horizon для готовых FIFO heads, сгруппированных по `(source, target model)`.
+Weight — прямая доля времени: при готовых Olya Vision / Gemma `10` и
+Shutterstock Video / Nemotron `8` их budgets равны `10/18` = 33m20s и
+`8/18` = 26m40s. Внутри source сохраняется FIFO, а одинаковые target model
+исполняются непрерывным batch, чтобы не unload/load модель после каждого job.
+Job не preempt-ится: целиком измеренное `finished - started` списывается с
+текущего batch, поэтому последний job вправе пересечь его границу. Если lane
+пуста, disabled или временно не eligible, другой ready lane берёт capacity;
+вернувшаяся lane получает долю оставшегося horizon на ближайшей job boundary.
 
 ### Safe dispatcher drain
 
@@ -195,26 +207,97 @@ systemctl --user reload ollama-inference-broker.service
 эта команда сигнализирует весь service cgroup, включая дочерний `curl` активного
 inference, и может прервать job.
 
-Источники делят GPU через deterministic reciprocal-weight round-robin с
-вращающимся accumulator; hard eligibility включает FIFO, per-source concurrency
-и min-interval backpressure. Waiting time никогда не меняет долю и не вызывает
+Источники делят GPU через model-affine weighted time batches; hard eligibility
+включает FIFO, per-source concurrency и min-interval backpressure. Время
+учитывается по исполнению, а не по числу jobs; waiting time не вызывает
 preemption.
 Итоговый allowlist берётся из `enabled`-записей файла, а не из env.
 `GET /v1/sources` отдаёт текущий снапшот политики (без секретов). При
 отсутствии policy поведение — env-allowlist + global FIFO.
 
+### Runtime controls: dispatch и admission — разные состояния
+
+`enabled=false` означает **dispatch pause**: уже queued jobs не меняются,
+текущий running job не прерывается, но после его завершения source не получает
+новую lease. `POST /v1/sources/{source}/dispatch` принимает только
+`{"paused":true|false}`; старый `POST .../enabled` сохраняется без изменения
+контракта. Resume применяется на следующем scheduler tick без рестарта.
+
+`admission_allowed=false` означает **admission block**: все HTTP endpoints,
+которые создают job для этого source, отклоняются до durable job insert с HTTP
+`403` и `error.code="source_admission_blocked"`. Существующая очередь и running
+job не меняются. Поле обратно совместимо: если `admission_allowed` отсутствует
+(или source отсутствует в policy), admission разрешён. Управление:
+`POST /v1/sources/{source}/admission` с `{"allowed":true|false}`.
+
+Bulk operations требуют точное имя configured source и серверное подтверждение
+`{"confirm":true}`:
+
+- `POST /v1/sources/{source}/queued/cancel` переводит только `queued` этого
+  source в `cancelled` и возвращает `cancelled` count;
+- `POST /v1/sources/{source}/failed/retry` переводит только `failed` этого
+  source в новый dispatchable `queued`, увеличивает `retry_count`, сохраняет
+  `attempt_count`, `job_attempts` и audit history и возвращает `retried` count.
+
+Обе операции транзакционны, идемпотентны при повторе и не затрагивают jobs
+другого source либо состояния `running`, `cancel_requested`, `completed` и
+`cancelled`. Каждая policy mutation сериализована, записывается через
+fsync + atomic rename + directory fsync и hot-reloadится. Dashboard показывает
+Dispatch, Admission, counts и подтверждение перед bulk-действиями. Audit events
+содержат только source/job/state/count metadata — payload, result, correlation
+values и error text в control events не копируются.
+
 Канонический production policy хранится в `config/sources.production.json`:
 веса Shutterstock Video / Olya Vision / Olya Decision остаются `3/8/6`, а
 отдельный source `syncopia-telegram-memory` имеет scheduler weight ровно `4`.
-`weight` — единственный scheduling-параметр: он задаёт долю source в weighted
-scheduler. Policy с неизвестным ключом отклоняется, чтобы конфигурация не могла
+Изолированный text-only source `uncensored-eval` принимает только семь
+server-owned Qwen 3.8 comparison profiles. Для них `num_ctx=65536` — нормальный
+режим сравнения; caller может явно выбрать до `131072` только для stress-test.
+Output ограничен `8192`, concurrency `1`, а MTP/draft-параметры и изображения
+fail-closed. Его production weight настраивается отдельно и не задаётся этим
+feature commit.
+`weight` — единственный scheduling-параметр: он задаёт прямую долю source в
+time-batch scheduler. Policy с неизвестным ключом отклоняется, чтобы конфигурация не могла
 молча стать default `1.0`.
 
-### User-facing Weight (1 highest … 10 lowest)
+### Producer-owned storage: additive safe rollout
 
-Weight — единственный soft scheduling input. **1 — самый важный, 10 — самый
-низкий**; lower numeric Weight получает большую относительную частоту. Weight
-не является deadline и не меняется с возрастом job.
+Broker поддерживает opt-in capability `producer_storage` при `POST /v1/jobs`,
+payload-free `GET /v1/jobs/{id}/status`, durable result receipt через
+`POST /v1/jobs/{id}/ack` и recovery через `GET /v1/jobs/{id}/receipt`.
+`GET /v1/jobs/{id}` сохраняет прежнюю форму ответа, но completed payload после
+исполнения равен `{}`: identity/hash/bytes остаются в metadata. Result доступен
+до producer ACK/compaction либо до явного broker-temporary TTL. Для
+producer-storage job endpoint требует тот же owner-only bearer token. Без
+токена history/audit/correlation reads исключают такие jobs и их storage
+evidence; legacy jobs остаются доступны как прежде до окончания их TTL.
+
+Production policy allowlist уже описывает допустимый storage mode каждого
+известного producer, но безопасные начальные флаги остаются
+`ack_required=false`, `compaction_enabled=false` и
+`legacy_result_fallback=true`. Поэтому deployment схемы и receipt API сам по
+себе не удаляет данные. Quarantine/compaction требует отдельного source-scoped
+переключения всех guard-флагов, matching ACK и двух grace periods.
+
+Retention-bounded режим также opt-in: `retention_enabled=false` по умолчанию.
+Он добавляет конечные TTL, source byte budget, bounded maintenance и
+idempotency tombstones. Queued/running/retryable payload остаётся inline;
+completed payload очищается после execution, broker-temporary result — после
+явного TTL, producer-owned result — только после durable ACK. Физический
+repack всегда создаётся в новом SQLite-файле, live DB не вакуумится на месте.
+
+WAL ограничивается `wal_autocheckpoint=4096`,
+`journal_size_limit=67108864`, alert budget 128 MiB и периодическим
+`PASSIVE` checkpoint. Текущая политика и метрики доступны через
+`GET /v1/storage/health`; точный контракт, migration copy tooling и
+lossless rollout/rollback описаны в
+[docs/PRODUCER_STORAGE.md](docs/PRODUCER_STORAGE.md).
+
+### User-facing Weight (1 lowest … 10 highest)
+
+Weight — единственный soft scheduling input. **10 — самая большая доля
+execution time, 1 — самая маленькая**. Weight не является deadline и не
+меняется с возрастом job.
 
 `POST /v1/shutterstock-video/generate` — синхронный bounded контракт локального
 видео-чанка (profile `shutterstock-video`, `nemotron3:33b`): принимает `prompt`,
@@ -237,10 +320,23 @@ Runtime-параметры моделей задаёт broker, caller не мо�
 
 `POST /v1/syncopia-memory/extract` — отдельный синхронный text-only contract
 для локального Phase-2 extractor. Он требует `tools=[]`, `stream=false`, ровно
-system+user messages и JSON Schema, запускает только
-`qwen3.8:ad-iq2-xs` с `num_ctx=65536`, `num_predict=8192`, `think=false` и source
+system+user messages, запускает только
+`qwen3.8:ad-iq2-xs` с `num_ctx=65536`, `num_predict=8192` и source
 `syncopia-telegram-memory`. Request hash используется caller как idempotency
 key; Olya/Shutterstock endpoints и profiles не переиспользуются.
+
+Для свободной текстовой сводки на том же `syncopia-memory-qwen38` необходимо
+**не передавать** оба поля `format`/`response_format` и задать `think="low"`.
+Этот явный freeform mode не добавляет JSON forcing, не усекает messages и
+передаёт `think="low"` в Ollama. Лимиты и options остаются теми же:
+`temperature=0`, `num_ctx=65536`, `num_predict=8192`; сообщения свыше 196608
+UTF-8 JSON bytes отклоняются, а не обрезаются. Schema mode по-прежнему требует
+`format` как JSON Schema object, допускает отсутствующий/`null` response_format
+или `{"type":"json_object"}` и принудительно использует `think=false`.
+Null/частичные format-поля не выбирают freeform mode. Оба режима поддерживаются
+также через `POST /v1/jobs` на выделенных profile/source; producer-storage
+требует прежний bearer, canonical normalized input hash и ACK, без изменения
+storage identity или правил защиты.
 
 ## Проверка и разработка
 

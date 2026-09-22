@@ -14,6 +14,39 @@ class CompatibilityError(ValueError):
     """The supplied Ollama-shaped request cannot enter broker admission."""
 
 
+UNCENSORED_EVAL_PROFILES = frozenset({
+    "uncensored-eval-rvn-iq2m",
+    "uncensored-eval-rvn-iq2s",
+    "uncensored-eval-rvn-iq2xs",
+    "uncensored-eval-rvn-iq2xxs",
+    "uncensored-eval-huihui-q2kxl",
+    "uncensored-eval-unleashed-q2kxl",
+    "uncensored-eval-hauhau-iq2m",
+})
+
+
+def validate_uncensored_eval_payload(payload: Any) -> dict[str, Any]:
+    """Keep comparison jobs text-only and free of speculative draft controls."""
+    if not isinstance(payload, dict):
+        raise CompatibilityError("uncensored evaluation payload must be a JSON object")
+    if payload.get("images") not in (None, []):
+        raise CompatibilityError("uncensored evaluation is text-only")
+    options = payload.get("options", {})
+    if not isinstance(options, dict):
+        raise CompatibilityError("uncensored evaluation options must be an object")
+    for scope, values in (("payload", payload), ("options", options)):
+        prohibited = sorted(
+            str(key) for key in values
+            if "draft" in str(key).lower() or "mtp" in str(key).lower()
+        )
+        if prohibited:
+            raise CompatibilityError(
+                f"uncensored evaluation must not enable MTP/draft parameters in {scope}: "
+                + ", ".join(prohibited)
+            )
+    return dict(payload)
+
+
 def submit(broker: Any, kind: str, request: Any) -> dict[str, Any]:
     if kind not in {"chat", "generate"}:
         raise CompatibilityError("unsupported compatibility endpoint")
@@ -283,7 +316,7 @@ def submit_olya_decision(broker: Any, request: Any) -> dict[str, Any]:
 
 
 def validate_syncopia_memory_payload(request: Any) -> dict[str, Any]:
-    """Validate the tools-disabled Phase-2 Telegram-memory extraction shape."""
+    """Validate schema extraction or explicit low-thinking freeform summaries."""
     if not isinstance(request, dict):
         raise CompatibilityError("request must be a JSON object")
     profile = PROFILES["syncopia-memory-qwen38"]
@@ -303,6 +336,20 @@ def validate_syncopia_memory_payload(request: Any) -> dict[str, Any]:
         raise CompatibilityError("Syncopia memory requires stream=false")
     if request.get("images") not in (None, []):
         raise CompatibilityError("Syncopia memory is text-only")
+    payload = {
+        "messages": messages,
+        "think": False,
+        "options": {
+            "temperature": 0,
+            "num_ctx": profile.max_context,
+            "num_predict": profile.max_output,
+        },
+    }
+    if "format" not in request and "response_format" not in request:
+        if request.get("think") != "low":
+            raise CompatibilityError("Syncopia freeform requires think=low")
+        payload["think"] = "low"
+        return payload
     response_format = request.get("response_format")
     if response_format not in (None, {"type": "json_object"}):
         raise CompatibilityError("response_format must request one JSON object")
@@ -315,16 +362,8 @@ def validate_syncopia_memory_payload(request: Any) -> dict[str, Any]:
         raise CompatibilityError("format must be JSON serializable") from None
     if schema_bytes > profile.max_schema_bytes:
         raise CompatibilityError("format exceeds the Syncopia memory schema limit")
-    return {
-        "messages": messages,
-        "format": schema,
-        "think": False,
-        "options": {
-            "temperature": 0,
-            "num_ctx": profile.max_context,
-            "num_predict": profile.max_output,
-        },
-    }
+    payload["format"] = schema
+    return payload
 
 
 def submit_syncopia_memory(broker: Any, request: Any) -> dict[str, Any]:
