@@ -28,6 +28,7 @@ DEFAULT_CHECKPOINT_INTERVAL_SECONDS = 60.0
 DEFAULT_MAINTENANCE_INTERVAL_SECONDS = 60.0
 DEFAULT_MAINTENANCE_ROWS = 25
 DEFAULT_MAINTENANCE_BYTES = 4 * 1024 * 1024
+DEFAULT_MAINTENANCE_OVERSIZE_BYTES = 64 * 1024 * 1024
 DEFAULT_INCREMENTAL_VACUUM_PAGES = 1024
 DEFAULT_DATABASE_TARGET_BYTES = 1024 * 1024 * 1024
 DEFAULT_GLOBAL_INLINE_BUDGET_BYTES = 768 * 1024 * 1024
@@ -1217,11 +1218,6 @@ class StorageManager:
             "AND NOT EXISTS(SELECT 1 FROM job_delivery_ack_conflicts c WHERE c.job_id=j.id) "
             "AND EXISTS(SELECT 1 FROM job_artifacts a WHERE a.job_id=j.id "
             "AND a.role='result' AND a.state='acked' AND a.content_hash=j.result_hash) "
-            "AND j.input_storage_mode!='broker_temporary' "
-            "AND EXISTS("
-            "SELECT 1 FROM job_artifacts a WHERE a.job_id=j.id AND a.role='input' "
-            "AND a.state='acked' AND a.content_hash=j.input_hash "
-            "AND a.storage_ref=j.input_ref) "
         )
         sql = (
             "SELECT j.id," + inline_expression + " AS inline_bytes " + eligibility
@@ -1365,10 +1361,7 @@ class StorageManager:
             "coalesce(length(CAST(j.result_json AS BLOB)),0) AS inline_bytes "
             "FROM jobs j WHERE j.source=? AND j.state IN ('failed','cancelled') "
             "AND j.compaction_state='full' AND j.body_retention_until IS NOT NULL "
-            "AND j.body_retention_until<=? AND j.input_storage_mode!='broker_temporary' "
-            "AND EXISTS(SELECT 1 FROM job_artifacts a WHERE a.job_id=j.id "
-            "AND a.role='input' AND a.state='acked' AND a.content_hash=j.input_hash "
-            "AND a.storage_ref=j.input_ref) "
+            "AND j.body_retention_until<=? "
             "AND NOT EXISTS(SELECT 1 FROM job_delivery_ack_conflicts c WHERE c.job_id=j.id) "
             "ORDER BY j.body_retention_until,j.id LIMIT ?",
             (source, now, limit),
@@ -1378,7 +1371,8 @@ class StorageManager:
         for row in rows:
             row_bytes = int(row["inline_bytes"] or 0)
             if changed_bytes + row_bytes > max_bytes:
-                break
+                if changed or row_bytes > DEFAULT_MAINTENANCE_OVERSIZE_BYTES:
+                    continue
             cursor = self.db.execute(
                 "UPDATE jobs SET payload='{}',result_json=NULL,"
                 "compaction_state='metadata_only',compacted_at=? "
@@ -1391,11 +1385,69 @@ class StorageManager:
                     "storage.retry_expired", job_id=row["id"], source=row["source"],
                     attempt_no=row["attempt_count"] or None,
                     from_state=row["state"], to_state=row["state"], occurred=now,
-                    reason="finite retry retention elapsed after durable input readback",
+                    reason="finite retry retention elapsed",
                 )
                 changed += 1
                 changed_bytes += row_bytes
+                if changed_bytes > max_bytes:
+                    break
         return {"retry_expired": changed, "retry_expired_bytes": changed_bytes}
+
+    def _compact_expired_broker_results_locked(
+        self, source: str, *, now: float, limit: int, max_bytes: int,
+    ) -> dict[str, int]:
+        """Expire broker-owned completed results after their explicit TTL.
+
+        Producer-owned results are deliberately excluded: without a matching
+        durable ACK they remain fail-closed and consume quota.  Completed input
+        payloads are already discarded at the terminal transition because a
+        completed job can never be retried.
+        """
+        rows = list(self.db.execute(
+            "SELECT j.id,j.source,j.state,j.attempt_count,"
+            "coalesce(length(CAST(j.result_json AS BLOB)),0) AS inline_bytes "
+            "FROM jobs j WHERE j.source=? AND j.state='completed' "
+            "AND j.result_storage_mode='broker_temporary' "
+            "AND j.compaction_state='full' AND j.body_retention_until IS NOT NULL "
+            "AND j.body_retention_until<=? "
+            "ORDER BY j.body_retention_until,j.id LIMIT ?",
+            (source, now, limit),
+        ))
+        changed = 0
+        changed_bytes = 0
+        for row in rows:
+            row_bytes = int(row["inline_bytes"] or 0)
+            if changed_bytes + row_bytes > max_bytes:
+                if changed or row_bytes > DEFAULT_MAINTENANCE_OVERSIZE_BYTES:
+                    continue
+            cursor = self.db.execute(
+                "UPDATE jobs SET payload='{}',result_json=NULL,"
+                "compaction_state='metadata_only',compacted_at=? "
+                "WHERE id=? AND state='completed' "
+                "AND result_storage_mode='broker_temporary' "
+                "AND compaction_state='full'",
+                (now, row["id"]),
+            )
+            if cursor.rowcount:
+                self.db.execute(
+                    "UPDATE job_artifacts SET state='deleted',deleted_at=? "
+                    "WHERE job_id=? AND state!='acked'",
+                    (now, row["id"]),
+                )
+                self.audit(
+                    "storage.broker_result_expired", job_id=row["id"],
+                    source=row["source"], attempt_no=row["attempt_count"] or None,
+                    from_state=row["state"], to_state=row["state"], occurred=now,
+                    reason="finite broker-owned result retention elapsed",
+                )
+                changed += 1
+                changed_bytes += row_bytes
+                if changed_bytes > max_bytes:
+                    break
+        return {
+            "broker_results_expired": changed,
+            "broker_results_expired_bytes": changed_bytes,
+        }
 
     def maybe_maintain(self, *, force: bool = False) -> dict[str, Any] | None:
         """Run one bounded retention cycle; policy-off is a zero-write default."""
@@ -1417,24 +1469,28 @@ class StorageManager:
                 continue
             retention_active = True
             with self._maintenance_source_config(source) as config:
-                guards = (
+                producer_guards = (
                     config["producer_storage_enabled"]
                     and config["ack_required"]
                     and config["compaction_enabled"]
                     and not config["legacy_result_fallback"]
-                    and config["retention_enabled"]
                 )
-                if not guards:
-                    continue
-                quarantined = self._maintenance_locked(
-                    source, operation="quarantine", limit=DEFAULT_MAINTENANCE_ROWS,
-                    confirm=True, max_bytes=DEFAULT_MAINTENANCE_BYTES, config=config,
-                )
-                compacted = self._maintenance_locked(
-                    source, operation="compact", limit=DEFAULT_MAINTENANCE_ROWS,
-                    confirm=True, max_bytes=DEFAULT_MAINTENANCE_BYTES, config=config,
-                )
+                quarantined = {"changed": 0}
+                compacted = {"changed": 0}
+                if producer_guards:
+                    quarantined = self._maintenance_locked(
+                        source, operation="quarantine", limit=DEFAULT_MAINTENANCE_ROWS,
+                        confirm=True, max_bytes=DEFAULT_MAINTENANCE_BYTES, config=config,
+                    )
+                    compacted = self._maintenance_locked(
+                        source, operation="compact", limit=DEFAULT_MAINTENANCE_ROWS,
+                        confirm=True, max_bytes=DEFAULT_MAINTENANCE_BYTES, config=config,
+                    )
                 with self.lock, self.db:
+                    broker_results = self._compact_expired_broker_results_locked(
+                        source, now=now, limit=DEFAULT_MAINTENANCE_ROWS,
+                        max_bytes=DEFAULT_MAINTENANCE_BYTES,
+                    )
                     retry_expired = self._compact_expired_retryable_locked(
                         source, now=now, limit=DEFAULT_MAINTENANCE_ROWS,
                         max_bytes=DEFAULT_MAINTENANCE_BYTES,
@@ -1444,6 +1500,7 @@ class StorageManager:
                     )
                 source_changed = (
                     quarantined["changed"] + compacted["changed"]
+                    + broker_results["broker_results_expired"]
                     + retry_expired["retry_expired"]
                     + purged["metadata_purged"] + purged["receipts_purged"]
                     + purged["tombstones_purged"]
@@ -1452,6 +1509,7 @@ class StorageManager:
                 reports[source] = {
                     "quarantined": quarantined["changed"],
                     "compacted": compacted["changed"],
+                    **broker_results,
                     **retry_expired,
                     **purged,
                 }

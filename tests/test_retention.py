@@ -10,6 +10,7 @@ from broker.retention_migration import (
     RetentionMigrationError,
     build_floor_database,
     build_repacked_database,
+    build_terminal_repacked_database,
     forecast,
     validate_manifest_entry,
 )
@@ -148,10 +149,11 @@ class RetentionTests(unittest.TestCase):
             normalize_source_policy({
                 "sources": {"producer": {"inline_budget_bytes": 0}},
             })
-        with self.assertRaisesRegex(SourcePolicyError, "retention requires"):
-            normalize_source_policy({
-                "sources": {"producer": {"retention_enabled": True}},
-            })
+        temporary = normalize_source_policy({
+            "sources": {"producer": {"retention_enabled": True}},
+        })["producer"]
+        self.assertTrue(temporary["retention_enabled"])
+        self.assertFalse(temporary["producer_storage_enabled"])
 
     def test_acked_bodies_compact_then_metadata_and_receipt_expire(self):
         job = self._admit()
@@ -188,10 +190,77 @@ class RetentionTests(unittest.TestCase):
         self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
         self.clock.value = 106
         self.broker.storage.maybe_maintain(force=True)
+        self.assertEqual(self.broker.status(job["id"])["payload"], {})
         self.assertIn("result", self.broker.status(job["id"]))
         self.assertEqual(self.broker.storage_health()["overdue_unacked_terminal"], 1)
 
-    def test_failed_retry_window_expires_only_with_durable_input(self):
+    def test_broker_temporary_result_expires_but_active_payload_never_does(self):
+        self._write_policy(
+            producer_storage_enabled=False,
+            producer_storage_mode="broker_temporary",
+            ack_required=False,
+            compaction_enabled=False,
+            legacy_result_fallback=True,
+        )
+        queued = self.broker.submit(
+            "interactive", "generate", {"prompt": "queued"}, source="producer",
+        )
+        completed = self.broker.submit(
+            "interactive", "generate", {"prompt": "completed"}, source="producer",
+        )
+        self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
+        # FIFO completed the first row; identify it from durable state.
+        completed_id = self.broker.db.execute(
+            "SELECT id FROM jobs WHERE state='completed'"
+        ).fetchone()[0]
+        queued_id = self.broker.db.execute(
+            "SELECT id FROM jobs WHERE state='queued'"
+        ).fetchone()[0]
+        self.assertEqual(self.broker.status(completed_id)["payload"], {})
+        self.assertIn("result", self.broker.status(completed_id))
+        self.assertIn(
+            self.broker.status(queued_id)["payload"],
+            ({"prompt": "queued"}, {"prompt": "completed"}),
+        )
+        self.clock.value = 106
+        cycle = self.broker.storage.maybe_maintain(force=True)
+        self.assertEqual(cycle["sources"]["producer"]["broker_results_expired"], 1)
+        self.assertNotIn("result", self.broker.status(completed_id))
+        self.assertNotEqual(self.broker.status(queued_id)["payload"], {})
+
+    def test_representative_terminal_regrowth_is_bounded(self):
+        self._write_policy(
+            producer_storage_enabled=False,
+            producer_storage_mode="broker_temporary",
+            ack_required=False,
+            compaction_enabled=False,
+            legacy_result_fallback=True,
+            inline_budget_bytes=8 * 1024 * 1024,
+        )
+        for index in range(20):
+            self.broker.submit(
+                "interactive", "generate",
+                {"prompt": f"{index}:" + "x" * 100_000},
+                source="producer",
+            )
+            self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
+        usage = self.broker.db.execute(
+            "SELECT inline_bytes FROM storage_source_usage WHERE source='producer'"
+        ).fetchone()[0]
+        # Only the completed results remain during their forensic TTL; the
+        # equally large input payloads were discarded at completion.
+        self.assertLess(usage, 2_100_000)
+        self.clock.value = 106
+        cycle = self.broker.storage.maybe_maintain(force=True)
+        self.assertEqual(
+            cycle["sources"]["producer"]["broker_results_expired"], 20,
+        )
+        usage = self.broker.db.execute(
+            "SELECT inline_bytes FROM storage_source_usage WHERE source='producer'"
+        ).fetchone()[0]
+        self.assertEqual(usage, 2 * 20)
+
+    def test_failed_retry_window_expires_after_finite_deadline(self):
         job = self._admit("failed")
         self._ack_input(job)
         with self.broker.lock, self.broker.db:
@@ -315,6 +384,59 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(floor_report["integrity_check"], "ok")
         self.assertEqual(floor_report["protected_jobs"]["rows"], 1)
         self.assertIn("jobs_missing_queued_at", " ".join(floor_report["queued_at_plan"]))
+
+    def test_terminal_repack_preserves_active_and_recent_retry_bodies(self):
+        self._write_policy(
+            producer_storage_enabled=False,
+            producer_storage_mode="broker_temporary",
+            ack_required=False,
+            compaction_enabled=False,
+            legacy_result_fallback=True,
+        )
+        completed = self.broker.submit(
+            "interactive", "generate", {"prompt": "done"}, source="producer",
+        )
+        self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
+        queued = self.broker.submit(
+            "interactive", "generate", {"prompt": "keep-active"}, source="producer",
+        )
+        failed = self.broker.submit(
+            "interactive", "generate", {"prompt": "keep-retry"}, source="producer",
+        )
+        with self.broker.db:
+            self.broker.db.execute(
+                "UPDATE jobs SET state='failed',finished=? WHERE id=?",
+                (104.0, failed["id"]),
+            )
+            self.broker.storage.record_terminal_retention(
+                failed["id"], "producer", "failed", 104.0,
+            )
+        self.broker.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.broker.db.close()
+        before = hashlib.sha256(self.database.read_bytes()).hexdigest()
+        output = self.root / "terminal.sqlite3"
+        report = build_terminal_repacked_database(
+            self.database, output, self.policy_path, now=106.0,
+        )
+        self.assertTrue(report["target_met"])
+        self.assertEqual(report["output_wal_bytes"], 0)
+        self.assertEqual(report["protected_jobs"]["rows"], 1)
+        self.assertEqual(hashlib.sha256(self.database.read_bytes()).hexdigest(), before)
+        db = sqlite3.connect(output)
+        self.addCleanup(db.close)
+        completed_body = db.execute(
+            "SELECT payload,result_json,compaction_state,input_hash,result_hash "
+            "FROM jobs WHERE id=?", (completed["id"],),
+        ).fetchone()
+        self.assertEqual(completed_body[0:3], ("{}", None, "metadata_only"))
+        self.assertTrue(completed_body[3].startswith("sha256:"))
+        self.assertTrue(completed_body[4].startswith("sha256:"))
+        self.assertIn("keep-active", db.execute(
+            "SELECT payload FROM jobs WHERE id=?", (queued["id"],),
+        ).fetchone()[0])
+        self.assertIn("keep-retry", db.execute(
+            "SELECT payload FROM jobs WHERE id=?", (failed["id"],),
+        ).fetchone()[0])
 
 
 if __name__ == "__main__":

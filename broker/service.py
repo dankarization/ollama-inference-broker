@@ -46,6 +46,12 @@ LOGGER = logging.getLogger("ollama_inference_broker.audit")
 OBSERVER_READ_DEADLINE_SECONDS = 0.75
 SCHEDULING_HORIZON_SECONDS = 60 * 60
 FORECAST_DEFAULT_EXECUTION_SECONDS = 300.0
+MAX_ERROR_SUMMARY_CHARACTERS = 1024
+
+
+def bounded_error_summary(error: BaseException) -> str:
+    value = str(error)
+    return value[:MAX_ERROR_SUMMARY_CHARACTERS]
 
 
 class SourceAdmissionBlocked(Exception):
@@ -1648,20 +1654,21 @@ class Broker:
         except Exception as exc:
             with self.lock, self.db:
                 finished = self.clock()
+                error_summary = bounded_error_summary(exc)
                 self._complete_time_batch(finished)
-                self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (finished, str(exc), row["id"]))
+                self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (finished, error_summary, row["id"]))
                 self.storage.record_terminal_retention(
                     row["id"], row["source"], "failed", finished,
                 )
                 self.db.execute(
                     "UPDATE job_attempts SET finished=?,outcome='failed',error=? "
                     "WHERE job_id=? AND attempt_no=?",
-                    (finished, str(exc), row["id"], attempt_no),
+                    (finished, error_summary, row["id"], attempt_no),
                 )
                 self._audit(
                     "job.failed", job_id=row["id"], source=row["source"],
                     attempt_no=attempt_no, from_state="running", to_state="failed",
-                    reason=str(exc), occurred=finished,
+                    reason=error_summary, occurred=finished,
                 )
                 self._refresh_health_cache_locked()
                 self.completed.notify_all()
@@ -1721,8 +1728,12 @@ class Broker:
             state = self.db.execute("SELECT state FROM jobs WHERE id=?", (row["id"],)).fetchone()[0]
             final = "cancelled" if state == "cancel_requested" else "completed"
             finished = self.clock()
-            self.db.execute("UPDATE jobs SET state=?,finished=?,lease_until=NULL,switch_reason=?,result_json=? WHERE id=?",
-                            (final, finished, reason, result_json, row["id"]))
+            self.db.execute(
+                "UPDATE jobs SET state=?,finished=?,lease_until=NULL,switch_reason=?,"
+                "payload=CASE WHEN ?='completed' THEN '{}' ELSE payload END,result_json=? "
+                "WHERE id=?",
+                (final, finished, reason, final, result_json, row["id"]),
+            )
             if final == "completed":
                 self.storage.record_result(row["id"], row["source"], result, finished)
             else:

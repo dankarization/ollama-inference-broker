@@ -265,10 +265,12 @@ time-batch scheduler. Policy с неизвестным ключом отклон
 Broker поддерживает opt-in capability `producer_storage` при `POST /v1/jobs`,
 payload-free `GET /v1/jobs/{id}/status`, durable result receipt через
 `POST /v1/jobs/{id}/ack` и recovery через `GET /v1/jobs/{id}/receipt`.
-Старый `GET /v1/jobs/{id}` сохраняет полный payload/result, пока для source
-включён `legacy_result_fallback`, но для producer-storage job требует тот же
-owner-only bearer token. Без токена history/audit/correlation reads исключают
-такие jobs и их storage evidence; legacy jobs остаются доступны как прежде.
+`GET /v1/jobs/{id}` сохраняет прежнюю форму ответа, но completed payload после
+исполнения равен `{}`: identity/hash/bytes остаются в metadata. Result доступен
+до producer ACK/compaction либо до явного broker-temporary TTL. Для
+producer-storage job endpoint требует тот же owner-only bearer token. Без
+токена history/audit/correlation reads исключают такие jobs и их storage
+evidence; legacy jobs остаются доступны как прежде до окончания их TTL.
 
 Production policy allowlist уже описывает допустимый storage mode каждого
 известного producer, но безопасные начальные флаги остаются
@@ -279,9 +281,10 @@ Production policy allowlist уже описывает допустимый stora
 
 Retention-bounded режим также opt-in: `retention_enabled=false` по умолчанию.
 Он добавляет конечные TTL, source byte budget, bounded maintenance и
-idempotency tombstones. Исторические jobs принимаются только через
-source-scoped manifest с hash/readback evidence; физический repack всегда
-создаётся в новом SQLite-файле, live DB не вакуумится на месте.
+idempotency tombstones. Queued/running/retryable payload остаётся inline;
+completed payload очищается после execution, broker-temporary result — после
+явного TTL, producer-owned result — только после durable ACK. Физический
+repack всегда создаётся в новом SQLite-файле, live DB не вакуумится на месте.
 
 WAL ограничивается `wal_autocheckpoint=4096`,
 `journal_size_limit=67108864`, alert budget 128 MiB и периодическим

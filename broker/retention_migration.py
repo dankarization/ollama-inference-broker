@@ -31,6 +31,8 @@ from .storage_policy import same_file
 
 ACTIVE_STATES = ("queued", "running", "cancel_requested")
 TERMINAL_STATES = ("completed", "failed", "cancelled")
+ROLLOUT_DATABASE_TARGET_BYTES = 2 * 1024 * 1024 * 1024
+MAX_ERROR_SUMMARY_CHARACTERS = 1024
 
 
 class RetentionMigrationError(ValueError):
@@ -117,15 +119,13 @@ def _proven_compactable(db: sqlite3.Connection) -> dict[str, int]:
         "SELECT count(*) AS rows,coalesce(sum(length(CAST(j.payload AS BLOB))+"
         "coalesce(length(CAST(j.result_json AS BLOB)),0)),0) AS inline_bytes "
         "FROM jobs j WHERE j.state='completed' AND j.delivery_state='acked' "
-        "AND j.input_storage_mode!='broker_temporary' "
         "AND j.result_storage_mode!='broker_temporary' "
         "AND NOT EXISTS(SELECT 1 FROM job_delivery_ack_conflicts c WHERE c.job_id=j.id) "
         "AND EXISTS(SELECT 1 FROM job_delivery_acks a WHERE a.job_id=j.id "
         "AND a.producer=j.source AND a.producer_attempt_id=j.producer_attempt_id "
         "AND a.result_hash=j.result_hash AND a.storage_ref=j.result_ref) "
         "AND EXISTS(SELECT 1 FROM job_artifacts a WHERE a.job_id=j.id "
-        "AND a.role='input' AND a.state='acked' AND a.content_hash=j.input_hash "
-        "AND a.storage_ref=j.input_ref)"
+        "AND a.role='result' AND a.state='acked' AND a.content_hash=j.result_hash)"
     ).fetchone()
     return {"rows": int(row["rows"]), "inline_bytes": int(row["inline_bytes"])}
 
@@ -149,6 +149,31 @@ def _protected_identity(db: sqlite3.Connection) -> dict[str, Any]:
         "FROM jobs WHERE state IN ('queued','running','cancel_requested') "
         "ORDER BY queued_at,id"
     ):
+        digest.update(canonical_json_bytes(dict(row)))
+        digest.update(b"\n")
+        rows += 1
+    return {"rows": rows, "sha256": digest.hexdigest()}
+
+
+def _retryable_identity(
+    db: sqlite3.Connection,
+    policy: dict[str, dict[str, Any]],
+    *,
+    now: float,
+) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    rows = 0
+    for row in db.execute(
+        "SELECT id,profile,kind,source,payload,state,created,finished,queued_at,"
+        "attempt_count,retry_count,requeue_count FROM jobs "
+        "WHERE state IN ('failed','cancelled') ORDER BY finished,id"
+    ):
+        config = _terminal_config(policy, row["source"])
+        deadline = float(row["finished"] or now) + float(
+            config["failed_cancelled_retention_seconds"]
+        )
+        if deadline <= now:
+            continue
         digest.update(canonical_json_bytes(dict(row)))
         digest.update(b"\n")
         rows += 1
@@ -225,11 +250,17 @@ def validate_manifest_entry(db: sqlite3.Connection, value: dict[str, Any]) -> di
     input_evidence = _artifact(value.get("input"), "input")
     result_evidence = _artifact(value.get("result"), "result")
     try:
-        payload = json.loads(row["payload"])
         result = json.loads(row["result_json"])
     except (TypeError, ValueError) as error:
-        raise RetentionMigrationError("job inline bodies are not canonical JSON") from error
-    input_hash, input_bytes = content_evidence(payload)
+        raise RetentionMigrationError("job result body is not canonical JSON") from error
+    if row["payload"] == "{}" and row["input_hash"] and row["input_bytes"] is not None:
+        input_hash, input_bytes = row["input_hash"], int(row["input_bytes"])
+    else:
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError) as error:
+            raise RetentionMigrationError("job input body is not canonical JSON") from error
+        input_hash, input_bytes = content_evidence(payload)
     result_hash, result_bytes = content_evidence(result)
     if (input_hash, input_bytes) != (
         input_evidence["content_hash"], input_evidence["byte_size"],
@@ -318,6 +349,233 @@ def _copy_database(source: Path, destination: Path) -> sqlite3.Connection:
     finally:
         source_db.close()
     return target
+
+
+def _terminal_config(
+    policy: dict[str, dict[str, Any]], source: str,
+) -> dict[str, Any]:
+    config = policy.get(source)
+    if config is None:
+        raise RetentionMigrationError(
+            f"source {source!r} is absent from terminal retention policy"
+        )
+    if not config["retention_enabled"]:
+        raise RetentionMigrationError(
+            f"source {source!r} terminal retention is disabled"
+        )
+    return config
+
+
+def _canonical_evidence(raw: str | None, role: str) -> tuple[str | None, int | None]:
+    if raw is None:
+        return None, None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as error:
+        raise RetentionMigrationError(f"{role} body is not valid JSON") from error
+    return content_evidence(value)
+
+
+def _apply_terminal_retention(
+    db: sqlite3.Connection,
+    policy: dict[str, dict[str, Any]],
+    *,
+    now: float,
+) -> dict[str, Any]:
+    """Rewrite only terminal bodies whose execution/retry lifetime is over."""
+    report = {
+        "rows_scanned": 0,
+        "completed_payloads_cleared": 0,
+        "completed_results_cleared": 0,
+        "retry_bodies_cleared": 0,
+        "preserved_retryable_rows": 0,
+        "payload_bytes_cleared": 0,
+        "result_bytes_cleared": 0,
+    }
+    last_rowid = 0
+    while True:
+        row = db.execute(
+            "SELECT rowid AS migration_rowid,id,source,state,finished,error,payload,"
+            "result_json,delivery_state,result_storage_mode,producer_attempt_id,"
+            "result_ref,result_hash,result_bytes FROM jobs "
+            "WHERE rowid>? ORDER BY rowid LIMIT 1",
+            (last_rowid,),
+        ).fetchone()
+        if row is None:
+            break
+        last_rowid = int(row["migration_rowid"])
+        report["rows_scanned"] += 1
+        payload_hash, payload_bytes = _canonical_evidence(row["payload"], "payload")
+        result_hash, result_bytes = _canonical_evidence(row["result_json"], "result")
+        updates: dict[str, Any] = {
+            "input_hash": payload_hash,
+            "input_bytes": payload_bytes,
+        }
+        if result_hash is not None:
+            updates.update(result_hash=result_hash, result_bytes=result_bytes)
+        state = row["state"]
+        config = None
+        if state in TERMINAL_STATES:
+            config = _terminal_config(policy, row["source"])
+            finished = float(row["finished"] or now)
+            updates["metadata_retention_until"] = (
+                now + float(config["metadata_retention_seconds"])
+            )
+            updates["retention_class"] = (
+                "producer" if row["result_storage_mode"] != "broker_temporary"
+                else "broker"
+            )
+            if row["error"]:
+                updates["error"] = str(row["error"])[:MAX_ERROR_SUMMARY_CHARACTERS]
+
+            if state == "completed":
+                if row["payload"] != "{}":
+                    updates["payload"] = "{}"
+                    report["completed_payloads_cleared"] += 1
+                    report["payload_bytes_cleared"] += len(row["payload"].encode())
+                ttl = float(config["unacked_terminal_retention_seconds"])
+                body_until = finished + ttl
+                updates["body_retention_until"] = body_until
+                durable_ack = (
+                    row["delivery_state"] == "acked"
+                    and row["producer_attempt_id"] is not None
+                    and row["result_ref"] is not None
+                    and db.execute(
+                        "SELECT 1 FROM job_delivery_acks a WHERE a.job_id=? "
+                        "AND a.producer=? AND a.producer_attempt_id=? "
+                        "AND a.storage_ref=? AND a.result_hash=? "
+                        "AND NOT EXISTS(SELECT 1 FROM job_delivery_ack_conflicts c "
+                        "WHERE c.job_id=a.job_id) LIMIT 1",
+                        (row["id"], row["source"], row["producer_attempt_id"],
+                         row["result_ref"], result_hash or row["result_hash"]),
+                    ).fetchone() is not None
+                )
+                broker_expired = (
+                    row["result_storage_mode"] == "broker_temporary"
+                    and body_until <= now
+                )
+                if row["result_json"] is not None and (durable_ack or broker_expired):
+                    updates["result_json"] = None
+                    updates["compaction_state"] = "metadata_only"
+                    updates["compacted_at"] = now
+                    report["completed_results_cleared"] += 1
+                    report["result_bytes_cleared"] += len(row["result_json"].encode())
+            elif state in {"failed", "cancelled"}:
+                ttl = float(config["failed_cancelled_retention_seconds"])
+                body_until = finished + ttl
+                updates["body_retention_until"] = body_until
+                if body_until <= now:
+                    if row["payload"] != "{}":
+                        report["payload_bytes_cleared"] += len(row["payload"].encode())
+                    if row["result_json"] is not None:
+                        report["result_bytes_cleared"] += len(row["result_json"].encode())
+                    updates.update(
+                        payload="{}", result_json=None,
+                        compaction_state="metadata_only", compacted_at=now,
+                    )
+                    report["retry_bodies_cleared"] += 1
+                else:
+                    report["preserved_retryable_rows"] += 1
+
+        assignments = ",".join(f"{name}=?" for name in updates)
+        db.execute(
+            f"UPDATE jobs SET {assignments} WHERE id=?",
+            (*updates.values(), row["id"]),
+        )
+    db.execute("DELETE FROM storage_source_usage")
+    db.execute(
+        "INSERT INTO storage_source_usage(source,job_count,inline_bytes) "
+        "SELECT source,count(*),sum(length(CAST(payload AS BLOB))+"
+        "coalesce(length(CAST(result_json AS BLOB)),0)) FROM jobs GROUP BY source"
+    )
+    return report
+
+
+def build_terminal_repacked_database(
+    source: Path,
+    output: Path,
+    policy_path: Path,
+    *,
+    now: float | None = None,
+    target_bytes: int = ROLLOUT_DATABASE_TARGET_BYTES,
+) -> dict[str, Any]:
+    """Build a deployable DB that preserves active/retryable bodies exactly."""
+    policy = normalize_source_policy(json.loads(policy_path.read_text(encoding="utf-8")))
+    migration_time = time.time() if now is None else float(now)
+    source_db = _open_read_only(source)
+    try:
+        protected_before = _protected_identity(source_db)
+        retryable_before = _retryable_identity(
+            source_db, policy, now=migration_time,
+        )
+    finally:
+        source_db.close()
+    staging = output.with_name(f".{output.name}.terminal-staging")
+    if staging.exists() or output.exists():
+        raise RetentionMigrationError("output or terminal staging database already exists")
+    db = _copy_database(source, staging)
+    try:
+        # The staging file is disposable until integrity/FK/identity checks pass
+        # and the final fsync+rename publishes it.  OFF avoids a database-sized
+        # rollback/WAL while rewriting historical bodies out of place.
+        db.execute("PRAGMA journal_mode=OFF")
+        db.execute("PRAGMA synchronous=OFF")
+        migrate_storage_schema(db)
+        db.commit()
+        rewrite = _apply_terminal_retention(db, policy, now=migration_time)
+        db.commit()
+        db.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        db.execute("VACUUM")
+        db.execute("PRAGMA journal_mode=DELETE")
+        db.execute("PRAGMA synchronous=FULL")
+        integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
+        foreign_keys = len(list(db.execute("PRAGMA foreign_key_check")))
+        protected_after = _protected_identity(db)
+        retryable_after = _retryable_identity(db, policy, now=migration_time)
+        queued_at_plan = _queued_at_plan(db)
+        output_bytes = staging.stat().st_size
+        if integrity != "ok" or foreign_keys:
+            raise RetentionMigrationError("terminal repack failed integrity verification")
+        if protected_after != protected_before:
+            raise RetentionMigrationError(
+                "terminal repack changed active job identity or FIFO"
+            )
+        if retryable_after != retryable_before:
+            raise RetentionMigrationError(
+                "terminal repack changed a still-retryable job body or identity"
+            )
+        if output_bytes >= target_bytes:
+            raise RetentionMigrationError(
+                f"terminal repack is {output_bytes} bytes; target is < {target_bytes}"
+            )
+    finally:
+        db.close()
+    os.replace(staging, output)
+    descriptor = os.open(output, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    descriptor = os.open(output.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return {
+        "output_database": str(output),
+        "output_bytes": output.stat().st_size,
+        "target_bytes": target_bytes,
+        "target_met": output.stat().st_size < target_bytes,
+        "output_wal_bytes": 0,
+        "integrity_check": "ok",
+        "foreign_key_violation_count": 0,
+        "auto_vacuum_mode": 2,
+        "protected_jobs": protected_after,
+        "protected_retryable_jobs": retryable_after,
+        "queued_at_plan": queued_at_plan,
+        "rewrite": rewrite,
+        "source_unchanged": True,
+    }
 
 
 def _policy_for_source(policy: dict[str, dict[str, Any]], source: str) -> dict[str, Any]:
@@ -505,30 +763,38 @@ def main() -> None:
     parser.add_argument("--policy", type=Path)
     parser.add_argument("--manifest", action="append", default=[], type=Path)
     parser.add_argument("--output-database", type=Path)
+    parser.add_argument("--terminal-output", type=Path)
     parser.add_argument("--floor-output", type=Path)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
     if not args.database.is_file():
         parser.error("--database must name an existing SQLite file")
-    for path in (args.output_database, args.floor_output, args.report):
+    for path in (
+        args.output_database, args.terminal_output, args.floor_output, args.report,
+    ):
         if path is not None and same_file(args.database, path):
             parser.error("output paths must not alias --database")
-    if (
-        args.report is not None
-        and args.output_database is not None
-        and same_file(args.report, args.output_database)
+    for output_name, output_path in (
+        ("--output-database", args.output_database),
+        ("--terminal-output", args.terminal_output),
+        ("--floor-output", args.floor_output),
     ):
-        parser.error("--report must not alias --output-database")
-    if (
-        args.report is not None
-        and args.floor_output is not None
-        and same_file(args.report, args.floor_output)
-    ):
-        parser.error("--report must not alias --floor-output")
+        if (
+            args.report is not None
+            and output_path is not None
+            and same_file(args.report, output_path)
+        ):
+            parser.error(f"--report must not alias {output_name}")
     if args.output_database is not None and (args.policy is None or not args.manifest):
         parser.error("--output-database requires --policy and at least one --manifest")
     if args.output_database is not None and args.floor_output is not None:
         parser.error("--output-database and --floor-output are mutually exclusive")
+    if args.terminal_output is not None and args.policy is None:
+        parser.error("--terminal-output requires --policy")
+    if sum(path is not None for path in (
+        args.output_database, args.terminal_output, args.floor_output,
+    )) > 1:
+        parser.error("database output modes are mutually exclusive")
     try:
         manifests = _load_manifests(args.manifest)
         source = _open_read_only(args.database)
@@ -543,6 +809,10 @@ def main() -> None:
                 )
             report["repacked"] = build_repacked_database(
                 args.database, args.output_database, args.policy, manifests,
+            )
+        if args.terminal_output is not None:
+            report["terminal_repacked"] = build_terminal_repacked_database(
+                args.database, args.terminal_output, args.policy,
             )
         if args.floor_output is not None:
             report["physical_floor"] = build_floor_database(

@@ -506,7 +506,7 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
         fetched = self.broker.status(job["id"])
         self.assertEqual(fetched["state"], "completed")
-        self.assertEqual(fetched["payload"], {"prompt": "legacy"})
+        self.assertEqual(fetched["payload"], {})
         self.assertEqual(fetched["result"]["done"], True)
         self.assertNotIn("result_storage_mode", fetched)
         self.assertNotIn("result_ref", fetched)
@@ -717,26 +717,26 @@ class ProducerStorageTests(unittest.TestCase):
         )
         tiny_budget = self.broker.storage_maintenance("producer", max_bytes=1)
         self.assertEqual(tiny_budget["candidate_count"], 0)
-        self.assertEqual(tiny_budget["skipped_oversize"], 1)
+        self.assertEqual(tiny_budget["skipped_oversize"], 2)
         preview = self.broker.storage_maintenance("producer")
-        self.assertEqual(preview["job_ids"], [job["id"]])
+        self.assertEqual(preview["job_ids"], [job["id"], input_unacked["id"]])
         quarantined = self.broker.storage_maintenance(
             "producer", operation="quarantine", confirm=True,
         )
-        self.assertEqual(quarantined["changed"], 1)
+        self.assertEqual(quarantined["changed"], 2)
         compacted = self.broker.storage_maintenance(
             "producer", operation="compact", confirm=True,
         )
-        self.assertEqual(compacted["changed"], 1)
+        self.assertEqual(compacted["changed"], 2)
         self.assertEqual(self.broker.status(job["id"])["payload"], {})
         self.assertNotIn("result", self.broker.status(job["id"]))
         self.assertIn("result", self.broker.status(unacked["id"]))
-        self.assertIn("result", self.broker.status(input_unacked["id"]))
+        self.assertNotIn("result", self.broker.status(input_unacked["id"]))
         self.assertNotEqual(self.broker.status(running["id"])["payload"], {})
         self.assertNotEqual(self.broker.status(cancel_requested["id"])["payload"], {})
         self.assertFalse(compacted["vacuum_performed"])
 
-    def test_cleanup_preserves_broker_temporary_inputs_without_durable_copy(self):
+    def test_completed_input_is_garbage_even_when_it_was_broker_temporary(self):
         self._write_policy(ack_required=True, legacy_result_fallback=False)
         jobs = []
         for external_id, explicit_input in (
@@ -762,12 +762,18 @@ class ProducerStorageTests(unittest.TestCase):
             ack_required=True, compaction_enabled=True, legacy_result_fallback=False,
         )
         preview = self.broker.storage_maintenance("producer")
-        self.assertEqual(preview["job_ids"], [])
+        self.assertEqual(preview["job_ids"], [job["id"] for job, _ in jobs])
+        self.broker.storage_maintenance(
+            "producer", operation="quarantine", confirm=True,
+        )
+        self.broker.storage_maintenance(
+            "producer", operation="compact", confirm=True,
+        )
         for job, payload in jobs:
-            self.assertEqual(self.broker.status(job["id"])["payload"], payload)
-            self.assertIn("result", self.broker.status(job["id"]))
+            self.assertEqual(self.broker.status(job["id"])["payload"], {})
+            self.assertNotIn("result", self.broker.status(job["id"]))
             self.assertEqual(
-                self.broker.compact_status(job["id"])["compaction_state"], "full",
+                self.broker.compact_status(job["id"])["compaction_state"], "metadata_only",
             )
 
     def test_oversized_compaction_candidate_does_not_starve_later_jobs(self):

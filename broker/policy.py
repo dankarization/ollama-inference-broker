@@ -138,16 +138,10 @@ def normalize_source_policy(raw: Any) -> dict[str, dict[str, Any]]:
             raise SourcePolicyError(
                 f"source {name!r} cannot enable compaction without producer storage"
             )
-        if retention["retention_enabled"] and not (
-            producer_storage_enabled
-            and ack_required
-            and compaction_enabled
-            and not legacy_result_fallback
-        ):
-            raise SourcePolicyError(
-                f"source {name!r} retention requires producer storage, mandatory ACK, "
-                "compaction, and disabled legacy fallback"
-            )
+        # Retention is also the finite retry/result window for broker-temporary
+        # jobs.  Producer-owned result compaction still has the stronger ACK,
+        # compaction, and legacy-fallback guards in StorageManager; enabling a
+        # finite broker-owned TTL must not falsely claim producer durability.
         if retention["retention_enabled"]:
             body_deadlines = (
                 retention["acked_body_retention_seconds"],

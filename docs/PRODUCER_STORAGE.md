@@ -97,10 +97,10 @@ Mutation requires `confirm=true`. All four source guards must be true:
 The job must also have persisted `ack_required=true` and
 `legacy_result_fallback=false` from its own admission, be `completed`, have a
 matching durable receipt and ACKed result artifact, and pass the configured
-grace periods. It must also have a producer-owned input artifact with a
-matching durable input receipt; broker-temporary inputs never qualify because
-the inline payload is their only durable copy. Enabling destructive source
-flags later never adopts jobs admitted under additive/legacy defaults.
+grace periods. A completed input is execution garbage and is not a prerequisite
+for result compaction: the broker retains its hash/byte evidence but clears the
+inline payload at the completed transition. Enabling destructive source flags
+later never adopts results admitted under additive/legacy defaults.
 `quarantine` only marks eligibility. `compact` removes inline payload/result
 after quarantine.
 Each compact transaction is capped by both `limit` (default 100 rows) and
@@ -126,16 +126,18 @@ finite values for:
 - `inline_budget_bytes`.
 
 The default source budget is 128 MiB. A separate 768 MiB global inline-body
-budget leaves headroom for metadata and indexes under the 1 GiB database
-target. Both checks use the trigger-maintained usage table.
+budget bounds new admissions. Both checks use the trigger-maintained usage
+table.
 
-ACKed bodies still require both producer input readback and result ACK. Failed
-or cancelled bodies remain retryable until their finite deadline and are
-removed only when the producer input has a matching readback receipt. An
-unacked completed result is never deleted at its deadline: it becomes overdue,
-remains visible in storage health, and the per-source byte budget stops new
-admissions before unresolved data can grow without bound. A broker-temporary
-input has no durable sink and is never compacted merely because time elapsed.
+Queued, running, cancel-requested, and still-retryable payloads always remain
+inline and byte-identical. Completed payloads are cleared immediately because a
+completed job cannot be retried. A producer-owned completed result remains
+fail-closed until a matching durable ACK; a broker-temporary completed result
+expires after `unacked_terminal_retention_seconds`. Failed/cancelled payloads
+remain retryable until `failed_cancelled_retention_seconds`, then become
+`metadata_only` and explicit retry fails closed. The retained metadata includes
+identity, source/state/timestamps, attempts, hashes/byte sizes, bounded error
+diagnostics, and receipts where present.
 
 The dispatcher runs at most one small retention cycle per minute. Each source
 cycle quarantines/compacts at most 25 rows and 4 MiB, then expires at most 25
@@ -211,6 +213,21 @@ python3 -m broker.retention_migration \
 by removing terminal bodies without durability evidence. Use it only to prove
 the physical floor imposed by queued/running data. It is not a migration
 candidate.
+
+For the terminal-lifecycle contract, build a deployable out-of-place database
+with the exact live policy (including disabled historical sources):
+
+```bash
+python3 -m broker.retention_migration \
+  --database /path/to/broker.snapshot.sqlite3 \
+  --policy /path/to/staged-sources.json \
+  --terminal-output /path/to/broker.terminal-repacked.sqlite3 \
+  --report /path/to/terminal-repack-report.json
+```
+
+The tool hashes bodies before clearing them, preserves active/FIFO and recent
+retry-body SHA-256 identities, uses a disposable staging file, and publishes
+only after `integrity_check`, FK, WAL=0, and strict `<2 GiB` checks pass.
 
 Stage safe flags in the **live** policy without copying the repository's sample
 weights over operator changes:
