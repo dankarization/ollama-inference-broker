@@ -2,7 +2,9 @@ import hashlib
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -293,6 +295,27 @@ class RetentionTests(unittest.TestCase):
             cycle = self.broker.storage.maybe_maintain(force=True)
         self.assertEqual(cycle["changed"], 0)
         self.assertIn("result", self.broker.status(job["id"]))
+
+    def test_automatic_maintenance_acquires_broker_before_policy_file_lock(self):
+        broker_lock_available = []
+
+        @contextmanager
+        def inspect_policy_lock(_path):
+            def probe_broker_lock():
+                acquired = self.broker.lock.acquire(timeout=0.1)
+                broker_lock_available.append(acquired)
+                if acquired:
+                    self.broker.lock.release()
+
+            probe = threading.Thread(target=probe_broker_lock)
+            probe.start()
+            probe.join(timeout=1)
+            self.assertFalse(probe.is_alive())
+            yield
+
+        with patch("broker.storage.source_policy_write_lock", inspect_policy_lock):
+            self.broker.storage.maybe_maintain(force=True)
+        self.assertEqual(broker_lock_available, [False])
 
     def test_representative_terminal_regrowth_is_bounded(self):
         self._write_policy(

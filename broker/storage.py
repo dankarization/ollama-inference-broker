@@ -1567,7 +1567,10 @@ class StorageManager:
         for source, observed in policy.snapshot()["sources"].items():
             if not observed["retention_enabled"]:
                 continue
-            with self._maintenance_source_config(source) as config:
+            # Keep the same broker -> policy-file order as manual maintenance.
+            # Holding the broker lock across the source cycle also prevents the
+            # policy from changing between revalidation and destructive writes.
+            with self.lock, self._maintenance_source_config(source) as config:
                 # Recheck the hot policy while holding its writer lock.  A
                 # disable that races the outer snapshot must stop all deletes.
                 if not config["retention_enabled"]:

@@ -294,7 +294,8 @@ class DashboardTests(unittest.TestCase):
     def test_unchanged_dashboard_etag_skips_regeneration_and_transfer(self):
         db = tempfile.NamedTemporaryFile()
         self.addCleanup(db.close)
-        broker = Broker(db.name, FakeOllama(), FakeWol())
+        clock = [120.0]
+        broker = Broker(db.name, FakeOllama(), FakeWol(), clock=lambda: clock[0])
         self.addCleanup(broker.db.close)
         server = serve(broker, port=0)
         self.addCleanup(server.server_close)
@@ -327,12 +328,26 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(unchanged_headers["ETag"], etag)
             self.assertEqual(regenerate.call_count, 1)
 
+            clock[0] = 149.0
+            status, body, same_epoch_headers = get({"If-None-Match": etag})
+            self.assertEqual((status, body), (304, b""))
+            self.assertEqual(same_epoch_headers["ETag"], etag)
+            self.assertEqual(regenerate.call_count, 1)
+
+            clock[0] = 150.0
+            status, body, aged_headers = get({"If-None-Match": etag})
+            self.assertEqual(status, 200)
+            self.assertTrue(body)
+            self.assertNotEqual(aged_headers["ETag"], etag)
+            self.assertEqual(regenerate.call_count, 2)
+
+            etag = aged_headers["ETag"]
             broker.submit("interactive", "generate", {"prompt": "changed"})
             status, body, changed_headers = get({"If-None-Match": etag})
             self.assertEqual(status, 200)
             self.assertTrue(body)
             self.assertNotEqual(changed_headers["ETag"], etag)
-            self.assertEqual(regenerate.call_count, 2)
+            self.assertEqual(regenerate.call_count, 3)
 
     def test_html_renders_active_timestamps_in_tbilisi_and_nulls_as_dash(self):
         timestamp = datetime(2026, 8, 29, 8, 30, tzinfo=timezone.utc).timestamp()

@@ -49,6 +49,7 @@ OBSERVER_READ_DEADLINE_SECONDS = 0.75
 SCHEDULING_HORIZON_SECONDS = 60 * 60
 FORECAST_DEFAULT_EXECUTION_SECONDS = 300.0
 MAX_ERROR_SUMMARY_CHARACTERS = 1024
+DASHBOARD_VALIDATOR_INTERVAL_SECONDS = 30.0
 
 
 def bounded_error_summary(error: BaseException) -> str:
@@ -1264,6 +1265,11 @@ class Broker:
                 "include_producer_storage": include_producer_storage,
                 "instance": self._dashboard_instance,
                 "policy": policy_snapshot,
+                # Dashboard windows, delayed state, forecasts, timestamps and
+                # observer availability can change without a database write.
+                # Match the HTML refresh cadence so a cached response is never
+                # reused for more than one 30-second observation interval.
+                "time_epoch": int(self.clock() // DASHBOARD_VALIDATOR_INTERVAL_SECONDS),
             }
         digest = hashlib.sha256(json.dumps(
             revision, sort_keys=True, separators=(",", ":"),
