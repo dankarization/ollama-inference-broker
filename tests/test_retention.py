@@ -154,6 +154,10 @@ class RetentionTests(unittest.TestCase):
         })["producer"]
         self.assertTrue(temporary["retention_enabled"])
         self.assertFalse(temporary["producer_storage_enabled"])
+        self.assertEqual(
+            self.broker.storage_health()["database_target_bytes"],
+            2 * 1024 * 1024 * 1024,
+        )
 
     def test_acked_bodies_compact_then_metadata_and_receipt_expire(self):
         job = self._admit()

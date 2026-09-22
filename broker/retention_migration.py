@@ -31,7 +31,6 @@ from .storage_policy import same_file
 
 ACTIVE_STATES = ("queued", "running", "cancel_requested")
 TERMINAL_STATES = ("completed", "failed", "cancelled")
-ROLLOUT_DATABASE_TARGET_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ERROR_SUMMARY_CHARACTERS = 1024
 
 
@@ -497,7 +496,7 @@ def build_terminal_repacked_database(
     policy_path: Path,
     *,
     now: float | None = None,
-    target_bytes: int = ROLLOUT_DATABASE_TARGET_BYTES,
+    target_bytes: int = DEFAULT_DATABASE_TARGET_BYTES,
 ) -> dict[str, Any]:
     """Build a deployable DB that preserves active/retryable bodies exactly."""
     policy = normalize_source_policy(json.loads(policy_path.read_text(encoding="utf-8")))
