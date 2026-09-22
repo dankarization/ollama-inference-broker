@@ -68,16 +68,48 @@ def _queued_at_plan(db: sqlite3.Connection) -> list[str]:
 
 
 def _group_forecast(db: sqlite3.Connection) -> list[dict[str, Any]]:
-    return [dict(row) for row in db.execute(
+    # Do not use a SQL GROUP BY here.  SQLite's sorter records retain the
+    # aggregate input values, which makes a forecast over multi-megabyte
+    # payload/result columns consume database-sized temp/swap space.  Stream
+    # only group keys and measured byte counts; the number of groups is bounded
+    # by the source/state/storage-mode cardinality, not by job or body size.
+    groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in db.execute(
         "SELECT source,state,delivery_state,input_storage_mode,result_storage_mode,"
-        "compaction_state,count(*) AS rows,"
-        "sum(length(CAST(payload AS BLOB))) AS payload_bytes,"
-        "sum(coalesce(length(CAST(result_json AS BLOB)),0)) AS result_bytes,"
-        "sum(length(CAST(payload AS BLOB))+"
-        "coalesce(length(CAST(result_json AS BLOB)),0)) AS inline_bytes "
-        "FROM jobs GROUP BY source,state,delivery_state,input_storage_mode,"
-        "result_storage_mode,compaction_state ORDER BY source,state,delivery_state"
-    )]
+        "compaction_state,length(CAST(payload AS BLOB)) AS payload_bytes,"
+        "coalesce(length(CAST(result_json AS BLOB)),0) AS result_bytes "
+        "FROM jobs"
+    ):
+        key = tuple(row[name] for name in (
+            "source", "state", "delivery_state", "input_storage_mode",
+            "result_storage_mode", "compaction_state",
+        ))
+        group = groups.setdefault(key, {
+            "source": key[0],
+            "state": key[1],
+            "delivery_state": key[2],
+            "input_storage_mode": key[3],
+            "result_storage_mode": key[4],
+            "compaction_state": key[5],
+            "rows": 0,
+            "payload_bytes": 0,
+            "result_bytes": 0,
+            "inline_bytes": 0,
+        })
+        payload_bytes = int(row["payload_bytes"] or 0)
+        result_bytes = int(row["result_bytes"] or 0)
+        group["rows"] += 1
+        group["payload_bytes"] += payload_bytes
+        group["result_bytes"] += result_bytes
+        group["inline_bytes"] += payload_bytes + result_bytes
+    return sorted(
+        groups.values(),
+        key=lambda row: (
+            str(row["source"]), str(row["state"]), str(row["delivery_state"]),
+            str(row["input_storage_mode"]), str(row["result_storage_mode"]),
+            str(row["compaction_state"]),
+        ),
+    )
 
 
 def _proven_compactable(db: sqlite3.Connection) -> dict[str, int]:

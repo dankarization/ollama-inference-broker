@@ -298,8 +298,17 @@ class RetentionTests(unittest.TestCase):
         source = sqlite3.connect(f"file:{self.database}?mode=ro", uri=True)
         source.row_factory = sqlite3.Row
         self.addCleanup(source.close)
+        forecast_statements = []
+        source.set_trace_callback(forecast_statements.append)
         summary = forecast(source, self.database, [entry])
         self.assertEqual(summary["manifest_validated"]["rows"], 1)
+        self.assertFalse(any(
+            "GROUP BY" in statement.upper()
+            for statement in forecast_statements
+        ))
+        self.assertEqual(
+            sum(group["rows"] for group in summary["groups"]), 2,
+        )
         floor = self.root / "floor.sqlite3"
         floor_report = build_floor_database(self.database, floor)
         self.assertTrue(floor_report["non_deployable"])
