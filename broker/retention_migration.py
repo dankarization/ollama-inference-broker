@@ -98,14 +98,14 @@ def _proven_compactable(db: sqlite3.Connection) -> dict[str, int]:
     return {"rows": int(row["rows"]), "inline_bytes": int(row["inline_bytes"])}
 
 
-def _state_bytes(db: sqlite3.Connection, states: tuple[str, ...]) -> dict[str, int]:
-    placeholders = ",".join("?" for _ in states)
-    row = db.execute(
-        "SELECT count(*) AS rows,coalesce(sum(length(CAST(payload AS BLOB))+"
-        "coalesce(length(CAST(result_json AS BLOB)),0)),0) AS inline_bytes "
-        f"FROM jobs WHERE state IN ({placeholders})", states,
-    ).fetchone()
-    return {"rows": int(row["rows"]), "inline_bytes": int(row["inline_bytes"])}
+def _group_totals(
+    groups: list[dict[str, Any]], states: tuple[str, ...],
+) -> dict[str, int]:
+    selected = [row for row in groups if row["state"] in states]
+    return {
+        "rows": sum(int(row["rows"] or 0) for row in selected),
+        "inline_bytes": sum(int(row["inline_bytes"] or 0) for row in selected),
+    }
 
 
 def _protected_identity(db: sqlite3.Connection) -> dict[str, Any]:
@@ -227,10 +227,11 @@ def forecast(
             validated.append(validate_manifest_entry(db, entry))
         except (RetentionMigrationError, ValueError) as error:
             errors.append({"job_id": str(entry.get("job_id")), "error": str(error)})
+    groups = _group_forecast(db)
     proven = _proven_compactable(db)
-    active = _state_bytes(db, ACTIVE_STATES)
-    retryable = _state_bytes(db, ("failed", "cancelled"))
-    terminal = _state_bytes(db, TERMINAL_STATES)
+    active = _group_totals(groups, ACTIVE_STATES)
+    retryable = _group_totals(groups, ("failed", "cancelled"))
+    terminal = _group_totals(groups, TERMINAL_STATES)
     metrics = _database_metrics(db)
     manifest_bytes = sum(item["inline_bytes"] for item in validated)
     estimated_after_proven = max(
@@ -253,7 +254,7 @@ def forecast(
             )
         ] if has_migrations else [],
         "source_queued_at_plan": _queued_at_plan(db),
-        "groups": _group_forecast(db),
+        "groups": groups,
         "physical": metrics,
         "proven_compactable": proven,
         "manifest_validated": {
