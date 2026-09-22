@@ -1162,6 +1162,13 @@ class ProducerStorageTests(unittest.TestCase):
             external_id="legacy-public-read",
         )
         self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
+        protected_queued = self._admit(external_id="protected-dashboard-queued")
+        protected_active = self._admit(external_id="protected-dashboard-active")
+        with self.broker.db:
+            self.broker.db.execute(
+                "UPDATE jobs SET state='running',started=100,lease_until=200 "
+                "WHERE id=?", (protected_active["id"],),
+            )
 
         token = "test-storage-token-with-at-least-32-characters"
         authorization = {"Authorization": f"Bearer {token}"}
@@ -1175,6 +1182,10 @@ class ProducerStorageTests(unittest.TestCase):
         def get(path, headers=None):
             with urlopen(Request(f"{base}{path}", headers=headers or {})) as response:
                 return json.loads(response.read())
+
+        def get_text(path, headers=None):
+            with urlopen(Request(f"{base}{path}", headers=headers or {})) as response:
+                return response.read().decode()
 
         for suffix in ("", "/attempts"):
             with self.subTest(suffix=suffix), self.assertRaises(HTTPError) as caught:
@@ -1203,6 +1214,14 @@ class ProducerStorageTests(unittest.TestCase):
         self.assertIn(legacy["id"], {item["id"] for item in public_history})
         self.assertNotIn(job["id"], {item["id"] for item in public_history})
         self.assertIn(job["id"], {item["id"] for item in protected_history})
+
+        public_dashboard = json.dumps(get("/v1/dashboard"))
+        protected_dashboard = json.dumps(get("/v1/dashboard", authorization))
+        public_html = get_text("/dashboard")
+        for protected_id in (job["id"], protected_queued["id"], protected_active["id"]):
+            self.assertNotIn(protected_id, public_dashboard)
+            self.assertNotIn(protected_id, public_html)
+            self.assertIn(protected_id, protected_dashboard)
 
     def test_http_cancel_and_retry_require_producer_storage_auth(self):
         completed = self._admit(external_id="protected-completed-mutation")

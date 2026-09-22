@@ -323,12 +323,18 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
             path = parsed.path
             query = parse_qs(parsed.query)
             if path == "/dashboard":
-                dashboard = broker.dashboard(policy)
+                dashboard = broker.dashboard(
+                    policy,
+                    include_producer_storage=self._storage_authenticated(),
+                )
                 encoded = render_dashboard(dashboard)
                 status = 503 if dashboard["observation"]["state"] == "unavailable" else 200
                 self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(encoded))); self.end_headers(); self.wfile.write(encoded)
             elif path == "/v1/dashboard":
-                dashboard = broker.dashboard(policy)
+                dashboard = broker.dashboard(
+                    policy,
+                    include_producer_storage=self._storage_authenticated(),
+                )
                 self._json(503 if dashboard["observation"]["state"] == "unavailable" else 200, dashboard)
             elif path == "/healthz": self._json(200, broker.health())
             elif path == "/v1/metrics": self._json(200, broker.metrics())
@@ -347,7 +353,10 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
             elif path == "/v1/forecast":
                 try:
                     limit = int(query.get("limit", ["10"])[0])
-                    self._json(200, broker.forecast(policy, limit=limit))
+                    self._json(200, broker.forecast(
+                        policy, limit=limit,
+                        include_producer_storage=self._storage_authenticated(),
+                    ))
                 except ValueError:
                     self._json(400, {"error":"limit must be an integer"})
             elif path == "/v1/history":

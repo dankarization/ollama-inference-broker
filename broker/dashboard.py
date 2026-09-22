@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .storage import PUBLIC_JOB_PREDICATE
+
 
 LOCAL_TIMEZONE = ZoneInfo("Asia/Tbilisi")
 
@@ -33,11 +35,13 @@ def timestamp_title(value: float | None) -> str | None:
 
 
 def snapshot(
-    db: sqlite3.Connection, *, now: float, policy_snapshot: dict[str, Any] | None
+    db: sqlite3.Connection, *, now: float, policy_snapshot: dict[str, Any] | None,
+    include_producer_storage: bool = True,
 ) -> dict[str, Any]:
     """Return operational data only; request payloads, results and errors are excluded."""
     policy_sources = (policy_snapshot or {}).get("sources", {})
     policy_active = policy_snapshot is not None
+    public_clause = "" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE
     schedules = dict(db.execute("SELECT source,next_allowed FROM source_schedules"))
     # Do not discover sources by scanning all historical jobs.  `jobs` holds
     # payloads and can be multiple GiB, so even an index-only global scan can
@@ -50,7 +54,7 @@ def snapshot(
         row["source"]
         for row in db.execute(
             "SELECT DISTINCT source FROM jobs INDEXED BY jobs_state_source "
-            "WHERE state IN ('queued','running','cancel_requested')"
+            "WHERE state IN ('queued','running','cancel_requested')" + public_clause
         )
     )
     sources: list[dict[str, Any]] = []
@@ -62,7 +66,8 @@ def snapshot(
             row["state"]: row["count"]
             for row in db.execute(
                 "SELECT state,count(*) AS count FROM jobs "
-                "INDEXED BY jobs_source_state WHERE source=? GROUP BY state",
+                "INDEXED BY jobs_source_state WHERE source=?" + public_clause +
+                " GROUP BY state",
                 (source,),
             )
         }
@@ -77,18 +82,19 @@ def snapshot(
             "coalesce(sum(occurred>=?),0) AS completed_1h,"
             "coalesce(sum(occurred>=?),0) AS completed_24h "
             "FROM audit_events INDEXED BY audit_events_source_time "
-            "WHERE source=? AND occurred>=? AND event_type='job.completed'",
+            "WHERE source=? AND occurred>=? AND event_type='job.completed'" +
+            ("" if include_producer_storage else " AND producer_storage=0"),
             (now - 3_600, now - 86_400, source, now - 86_400),
         ).fetchone()
         retry = db.execute(
             "SELECT count(*) FROM jobs INDEXED BY jobs_source_state_retry "
-            "WHERE source=? AND state='queued' AND retry_count>0",
+            "WHERE source=? AND state='queued' AND retry_count>0" + public_clause,
             (source,),
         ).fetchone()[0]
         lease = db.execute(
             "SELECT count(*) FROM jobs INDEXED BY jobs_source_state "
             "WHERE source=? AND state IN ('running','cancel_requested') "
-            "AND lease_until IS NOT NULL",
+            "AND lease_until IS NOT NULL" + public_clause,
             (source,),
         ).fetchone()[0]
         states = {
@@ -121,7 +127,8 @@ def snapshot(
 
     active_jobs = [dict(row) for row in db.execute(
         "SELECT id,source,state,created,started,lease_until,attempt_count,retry_count "
-        "FROM jobs WHERE state IN ('running','cancel_requested') ORDER BY started,created,id"
+        "FROM jobs WHERE state IN ('running','cancel_requested')" + public_clause +
+        " ORDER BY started,created,id"
     )]
     return {
         "timestamp": now,

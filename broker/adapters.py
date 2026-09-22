@@ -65,8 +65,8 @@ class OllamaHTTP:
         except json.JSONDecodeError as exc:
             raise RuntimeError("Ollama returned invalid JSON") from exc
 
-    def ps(self) -> dict:
-        return self._request("/api/ps")
+    def ps(self, timeout_seconds: float | None = None) -> dict:
+        return self._request("/api/ps", timeout_seconds=timeout_seconds)
 
     def is_ready(self, model: str) -> bool:
         return any(item.get("name") == model for item in self.ps().get("models", []))
@@ -119,7 +119,10 @@ class OllamaHTTP:
         unload_requested: set[str] = set()
         load_requested = False
         while True:
-            models = self.ps().get("models", [])
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            models = self.ps(timeout_seconds=remaining).get("models", [])
             loaded = {
                 item.get("name")
                 for item in models

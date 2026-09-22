@@ -288,6 +288,85 @@ class RetentionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "retry retention has expired"):
             self.broker.retry(job["id"])
 
+    def test_startup_recovery_applies_loaded_retention_policy(self):
+        job = self._admit("startup-expired")
+        with self.broker.db:
+            self.broker.db.execute(
+                "UPDATE jobs SET state='running',started=90,lease_until=99,"
+                "attempt_count=1 WHERE id=?", (job["id"],),
+            )
+        self.broker.db.close()
+        self.clock.value = 106
+        recovered = Broker(
+            self.database, FakeOllama(), FakeWol(), clock=self.clock,
+            source_policy=self.policy,
+        )
+        self.addCleanup(recovered.db.close)
+        status = recovered.compact_status(job["id"])
+        self.assertEqual(status["state"], "failed")
+        deadlines = recovered.db.execute(
+            "SELECT body_retention_until,metadata_retention_until FROM jobs WHERE id=?",
+            (job["id"],),
+        ).fetchone()
+        self.assertEqual(tuple(deadlines), (111, 116))
+
+    def test_legacy_external_id_is_reusable_after_metadata_purge(self):
+        self._write_policy(
+            producer_storage_enabled=False,
+            producer_storage_mode="broker_temporary",
+            ack_required=False,
+            compaction_enabled=False,
+            legacy_result_fallback=True,
+        )
+        first = self.broker.submit(
+            "interactive", "generate", {"prompt": "legacy-reuse"},
+            source="producer", external_id="legacy-reuse",
+        )
+        self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
+        self.clock.value = 106
+        self.broker.storage.maybe_maintain(force=True)
+        self.clock.value = 111
+        self.broker.storage.maybe_maintain(force=True)
+        self.assertEqual(
+            self.broker.status(first["id"])["retention_state"], "tombstone",
+        )
+        second = self.broker.submit(
+            "interactive", "generate", {"prompt": "legacy-reuse"},
+            source="producer", external_id="legacy-reuse",
+        )
+        self.assertNotEqual(second["id"], first["id"])
+
+    def test_oversized_expired_retry_body_does_not_pin_scan(self):
+        jobs = []
+        for external_id, size in (("old-oversized", 2048), ("later-small", 16)):
+            job = self._admit(external_id, payload={"prompt": "x" * size})
+            with self.broker.db:
+                self.broker.db.execute(
+                    "UPDATE jobs SET state='failed',finished=100 WHERE id=?",
+                    (job["id"],),
+                )
+                self.broker.storage.record_terminal_retention(
+                    job["id"], "producer", "failed", 100,
+                )
+            jobs.append(job)
+        self.clock.value = 106
+        with (
+            patch("broker.storage.DEFAULT_MAINTENANCE_OVERSIZE_BYTES", 1024),
+            self.broker.lock,
+            self.broker.db,
+        ):
+            result = self.broker.storage._compact_expired_retryable_locked(
+                "producer", now=106, limit=1, max_bytes=512,
+            )
+        self.assertEqual(result["retry_expired"], 1)
+        self.assertEqual(
+            self.broker.compact_status(jobs[0]["id"])["compaction_state"], "full",
+        )
+        self.assertEqual(
+            self.broker.compact_status(jobs[1]["id"])["compaction_state"],
+            "metadata_only",
+        )
+
     def test_inline_budget_ignores_active_payload_but_blocks_terminal_bodies(self):
         self._write_policy(inline_budget_bytes=1)
         queued = self._admit("queued", payload={"prompt": "x" * 10_000})
@@ -446,6 +525,7 @@ class RetentionTests(unittest.TestCase):
             "interactive", "generate", {"prompt": "done"}, source="producer",
         )
         self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
+        completed_evidence = self.broker.compact_status(completed["id"])
         queued = self.broker.submit(
             "interactive", "generate", {"prompt": "keep-active"}, source="producer",
         )
@@ -474,11 +554,12 @@ class RetentionTests(unittest.TestCase):
         db = sqlite3.connect(output)
         self.addCleanup(db.close)
         completed_body = db.execute(
-            "SELECT payload,result_json,compaction_state,input_hash,result_hash "
+            "SELECT payload,result_json,compaction_state,input_hash,result_hash,input_bytes "
             "FROM jobs WHERE id=?", (completed["id"],),
         ).fetchone()
         self.assertEqual(completed_body[0:3], ("{}", None, "metadata_only"))
-        self.assertTrue(completed_body[3].startswith("sha256:"))
+        self.assertEqual(completed_body[3], completed_evidence["input_hash"])
+        self.assertEqual(completed_body[5], completed_evidence["input_bytes"])
         self.assertTrue(completed_body[4].startswith("sha256:"))
         self.assertIn("keep-active", db.execute(
             "SELECT payload FROM jobs WHERE id=?", (queued["id"],),
@@ -486,6 +567,50 @@ class RetentionTests(unittest.TestCase):
         self.assertIn("keep-retry", db.execute(
             "SELECT payload FROM jobs WHERE id=?", (failed["id"],),
         ).fetchone()[0])
+        terminal_usage = db.execute(
+            "SELECT terminal_inline_bytes FROM storage_source_usage "
+            "WHERE source='producer'",
+        ).fetchone()[0]
+        expected_usage = db.execute(
+            "SELECT sum(length(CAST(payload AS BLOB))+"
+            "coalesce(length(CAST(result_json AS BLOB)),0)) FROM jobs "
+            "WHERE source='producer' AND state IN ('completed','failed','cancelled') "
+            "AND compaction_state='full'",
+        ).fetchone()[0]
+        self.assertEqual(terminal_usage, expected_usage)
+
+    def test_terminal_repack_honors_compaction_guard_and_backfills_receipt_ttl(self):
+        job = self._admit("guarded-repack")
+        self._ack_input(job)
+        self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
+        receipt = self._ack_result(job)
+        with self.broker.db:
+            self.broker.db.execute(
+                "UPDATE job_delivery_acks SET retention_until=NULL WHERE receipt_id=?",
+                (receipt["receipt_id"],),
+            )
+        self.broker.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.broker.db.close()
+        self._write_policy(compaction_enabled=False)
+        output = self.root / "guarded-terminal.sqlite3"
+        build_terminal_repacked_database(
+            self.database, output, self.policy_path, now=106,
+        )
+        db = sqlite3.connect(output)
+        self.addCleanup(db.close)
+        body = db.execute(
+            "SELECT result_json,compaction_state FROM jobs WHERE id=?",
+            (job["id"],),
+        ).fetchone()
+        self.assertIsNotNone(body[0])
+        self.assertEqual(body[1], "full")
+        self.assertEqual(
+            db.execute(
+                "SELECT retention_until FROM job_delivery_acks WHERE receipt_id=?",
+                (receipt["receipt_id"],),
+            ).fetchone()[0],
+            126,
+        )
 
 
 if __name__ == "__main__":

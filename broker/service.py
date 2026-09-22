@@ -243,7 +243,8 @@ class Broker:
                  journal_size_limit_bytes=DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
                  wal_budget_bytes=DEFAULT_WAL_BUDGET_BYTES,
                  checkpoint_interval_seconds=DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
-                 min_free_space_bytes=DEFAULT_MIN_FREE_SPACE_BYTES):
+                 min_free_space_bytes=DEFAULT_MIN_FREE_SPACE_BYTES,
+                 source_policy: SourcePolicy | None = None):
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
         self.database = str(database)
         self.db = sqlite3.connect(self.database, check_same_thread=False)
@@ -255,7 +256,7 @@ class Broker:
             "active_job_id": None, "timestamp": self.clock(),
         }
         self._loaded_models_cache: list[dict[str, Any]] = []
-        self._dashboard_cache: dict[str, Any] | None = None
+        self._dashboard_cache: dict[bool, dict[str, Any]] = {}
         self._metrics_cache: dict[str, Any] = {
             "resource": "mainpc-gpu", "queue_depth": 0, "active": None,
         }
@@ -271,7 +272,7 @@ class Broker:
         self._active_time_batch: dict[str, Any] | None = None
         # Immutable copy written under the lock for the lock-free forecast.
         self._scheduler_snapshot: dict[str, Any] | None = None
-        self.source_policy: SourcePolicy | None = None
+        self.source_policy = source_policy
         self.wal_autocheckpoint_pages = int(wal_autocheckpoint_pages)
         self.journal_size_limit_bytes = int(journal_size_limit_bytes)
         self._init_db()
@@ -644,7 +645,12 @@ class Broker:
                         "WHERE source=? AND external_id=?",
                         (source, external_id),
                     ).fetchone()
-                    if tombstone is not None:
+                    tombstone_is_idempotent = tombstone is not None and (
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory"}
+                        or producer_storage is not None
+                        or tombstone["producer_attempt_id"] is not None
+                    )
+                    if tombstone_is_idempotent:
                         input_hash = content_evidence(payload)[0]
                         if (
                             tombstone["profile"] != profile
@@ -1101,7 +1107,10 @@ class Broker:
             observation.update(error)
         return observation
 
-    def forecast(self, policy: SourcePolicy | None = None, limit: int = 10) -> dict:
+    def forecast(
+        self, policy: SourcePolicy | None = None, limit: int = 10, *,
+        include_producer_storage: bool = True,
+    ) -> dict:
         """Read-only projection of upcoming dispatcher selections.
 
         The projection never mutates the queue, leases, accumulators or batch
@@ -1114,7 +1123,10 @@ class Broker:
         """
         now = self.clock()
         data, error = self._observer_read(
-            lambda db: self._forecast(db, policy, now, limit)
+            lambda db: self._forecast(
+                db, policy, now, limit,
+                include_producer_storage=include_producer_storage,
+            )
         )
         if data is None:
             return {
@@ -1124,20 +1136,26 @@ class Broker:
             }
         return data
 
-    def _forecast(self, db, policy, now: float, limit: int) -> dict[str, Any]:
+    def _forecast(
+        self, db, policy, now: float, limit: int, *,
+        include_producer_storage: bool = True,
+    ) -> dict[str, Any]:
         """Projection body; reads only, never writes."""
         bounded = max(1, min(int(limit), 20))
         allowed = None
         if policy is not None:
             allowed = policy.enabled_sources()
         running = db.execute(
-            "SELECT profile FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1"
+            "SELECT profile FROM jobs WHERE state IN ('running','cancel_requested')" +
+            ("" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE) +
+            " LIMIT 1"
         ).fetchone()
         # The next dispatch can occur only after the one active job completes.
         # Project that slot release; keep all other hard eligibility checks.
         candidates = self._candidates(
             allowed, db=db, release_running=running is not None,
             limit_per_source=bounded,
+            include_producer_storage=include_producer_storage,
         )
         snapshot = self._scheduler_snapshot or {}
         cycle = deepcopy(snapshot.get("time_cycle"))
@@ -1198,23 +1216,35 @@ class Broker:
             "next_selections": selections,
         }
 
-    def dashboard(self, policy: SourcePolicy | None = None) -> dict:
+    def dashboard(
+        self, policy: SourcePolicy | None = None, *,
+        include_producer_storage: bool = True,
+    ) -> dict:
         """Payload-free live queue data for the local operational dashboard."""
         policy_snapshot = policy.snapshot() if policy is not None else None
         now = self.clock()
         snapshot, error = self._observer_read(
             lambda db: {
-                **dashboard_snapshot(db, now=now, policy_snapshot=policy_snapshot),
-                "forecast": self._forecast(db, policy, now, 10),
-                "history": self._terminal_history(db, limit=10),
+                **dashboard_snapshot(
+                    db, now=now, policy_snapshot=policy_snapshot,
+                    include_producer_storage=include_producer_storage,
+                ),
+                "forecast": self._forecast(
+                    db, policy, now, 10,
+                    include_producer_storage=include_producer_storage,
+                ),
+                "history": self._terminal_history(
+                    db, limit=10,
+                    include_producer_storage=include_producer_storage,
+                ),
             }
         )
         if snapshot is not None:
             snapshot["observation"] = self._observation("live", now)
-            self._dashboard_cache = snapshot
+            self._dashboard_cache[include_producer_storage] = snapshot
             return snapshot
-        if self._dashboard_cache is not None:
-            stale = deepcopy(self._dashboard_cache)
+        if include_producer_storage in self._dashboard_cache:
+            stale = deepcopy(self._dashboard_cache[include_producer_storage])
             stale["observation"] = self._observation("stale", now, error)
             return stale
         # An observer timeout or lock is not evidence that the queue is empty.
@@ -1290,7 +1320,8 @@ class Broker:
             return [dict(row) for row in rows]
 
     def _candidates(self, allowed_sources: frozenset[str] | None = None, db=None,
-                    release_running: bool = False, limit_per_source: int | None = None):
+                    release_running: bool = False, limit_per_source: int | None = None,
+                    include_producer_storage: bool = True):
         """Queued rows eligible now, ordered FIFO.
 
         Per-source concurrency and min-interval backpressure are applied here
@@ -1313,6 +1344,8 @@ class Broker:
             placeholders = ",".join("?" for _ in allowed_sources)
             query += f" AND source IN ({placeholders})"
             values = tuple(sorted(allowed_sources))
+        if not include_producer_storage:
+            query += " AND " + PUBLIC_JOB_PREDICATE
         if limit_per_source is not None:
             query = (
                 "SELECT id,profile,source,created,queued_at,attempt_count FROM ("

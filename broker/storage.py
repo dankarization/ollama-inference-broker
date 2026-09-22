@@ -1451,8 +1451,10 @@ class StorageManager:
             "AND j.compaction_state='full' AND j.body_retention_until IS NOT NULL "
             "AND j.body_retention_until<=? "
             "AND NOT EXISTS(SELECT 1 FROM job_delivery_ack_conflicts c WHERE c.job_id=j.id) "
+            "AND length(CAST(j.payload AS BLOB))+"
+            "coalesce(length(CAST(j.result_json AS BLOB)),0)<=? "
             "ORDER BY j.body_retention_until,j.id LIMIT ?",
-            (source, now, limit),
+            (source, now, DEFAULT_MAINTENANCE_OVERSIZE_BYTES, limit),
         ))
         changed = 0
         changed_bytes = 0

@@ -120,7 +120,9 @@ class BrokerTests(unittest.TestCase):
             {"models": [{"name": target}]},
         ))
         calls = []
-        client.ps = lambda: (calls.append("ps"), next(states))[1]
+        client.ps = lambda timeout_seconds=None: (
+            calls.append(("ps", timeout_seconds)), next(states)
+        )[1]
         client.unload = lambda model, timeout_seconds=None: calls.append(
             ("unload", model, timeout_seconds)
         )
@@ -134,8 +136,23 @@ class BrokerTests(unittest.TestCase):
         unload_index = next(i for i, call in enumerate(calls) if isinstance(call, tuple) and call[0] == "unload")
         load_index = next(i for i, call in enumerate(calls) if isinstance(call, tuple) and call[0] == "load")
         self.assertGreater(load_index, unload_index)
-        self.assertGreaterEqual(calls[:load_index].count("ps"), 3)
+        self.assertGreaterEqual(
+            sum(1 for call in calls[:load_index] if call[0] == "ps"), 3,
+        )
         self.assertEqual(calls[load_index][2], {"model": target, "keep_alive": "1800s"})
+
+    def test_model_readiness_poll_uses_remaining_deadline(self):
+        client = OllamaHTTP()
+        observed = []
+        client.ps = lambda timeout_seconds=None: (
+            observed.append(timeout_seconds),
+            {"models": [{"name": "qwen3.8:ad-iq2-xs"}]},
+        )[1]
+        with patch("broker.adapters.time.monotonic", side_effect=(100.0, 101.5)):
+            self.assertTrue(client.ensure_model_ready(
+                "qwen3.8:ad-iq2-xs", keep_alive="1800s", timeout_seconds=5,
+            ))
+        self.assertEqual(observed, [3.5])
 
     def test_dispatch_uses_profile_bounded_exclusive_model_switch(self):
         class ExclusiveSwitchOllama(FakeOllama):

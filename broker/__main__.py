@@ -95,6 +95,10 @@ def main() -> None:
     configured_storage_token = storage_token(
         os.environ.get("BROKER_STORAGE_TOKEN_FILE")
     )
+    policy = None
+    configured_policy = policy_path(os.environ.get("BROKER_SOURCES_POLICY"))
+    if configured_policy is not None:
+        policy = SourcePolicy(configured_policy)
     broker = Broker(
         os.environ.get("BROKER_DB", "broker.sqlite3"),
         OllamaHTTP(
@@ -122,11 +126,8 @@ def main() -> None:
             os.environ.get("BROKER_MIN_FREE_SPACE_BYTES"), 2 * 1024 * 1024 * 1024,
             "BROKER_MIN_FREE_SPACE_BYTES",
         ),
+        source_policy=policy,
     )
-    policy = None
-    configured_policy = policy_path(os.environ.get("BROKER_SOURCES_POLICY"))
-    if configured_policy is not None:
-        policy = SourcePolicy(configured_policy)
     dispatcher = None
     if dispatch_enabled(os.environ.get("BROKER_DISPATCH_ENABLED")):
         allowed_sources = None

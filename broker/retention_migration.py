@@ -396,7 +396,8 @@ def _apply_terminal_retention(
         row = db.execute(
             "SELECT rowid AS migration_rowid,id,source,state,finished,error,payload,"
             "result_json,delivery_state,result_storage_mode,producer_attempt_id,"
-            "result_ref,result_hash,result_bytes FROM jobs "
+            "result_ref,result_hash,result_bytes,input_hash,input_bytes,"
+            "ack_required,legacy_result_fallback FROM jobs "
             "WHERE rowid>? ORDER BY rowid LIMIT 1",
             (last_rowid,),
         ).fetchone()
@@ -404,7 +405,15 @@ def _apply_terminal_retention(
             break
         last_rowid = int(row["migration_rowid"])
         report["rows_scanned"] += 1
-        payload_hash, payload_bytes = _canonical_evidence(row["payload"], "payload")
+        if (
+            row["payload"] == "{}"
+            and row["input_hash"]
+            and row["input_bytes"] is not None
+        ):
+            payload_hash = row["input_hash"]
+            payload_bytes = int(row["input_bytes"])
+        else:
+            payload_hash, payload_bytes = _canonical_evidence(row["payload"], "payload")
         result_hash, result_bytes = _canonical_evidence(row["result_json"], "result")
         updates: dict[str, Any] = {
             "input_hash": payload_hash,
@@ -435,12 +444,12 @@ def _apply_terminal_retention(
                 ttl = float(config["unacked_terminal_retention_seconds"])
                 body_until = finished + ttl
                 updates["body_retention_until"] = body_until
-                durable_ack = (
+                durable_receipt = (
                     row["delivery_state"] == "acked"
                     and row["producer_attempt_id"] is not None
                     and row["result_ref"] is not None
                     and db.execute(
-                        "SELECT 1 FROM job_delivery_acks a WHERE a.job_id=? "
+                        "SELECT a.rowid FROM job_delivery_acks a WHERE a.job_id=? "
                         "AND a.producer=? AND a.producer_attempt_id=? "
                         "AND a.storage_ref=? AND a.result_hash=? "
                         "AND NOT EXISTS(SELECT 1 FROM job_delivery_ack_conflicts c "
@@ -448,6 +457,37 @@ def _apply_terminal_retention(
                         (row["id"], row["source"], row["producer_attempt_id"],
                          row["result_ref"], result_hash or row["result_hash"]),
                     ).fetchone() is not None
+                )
+                if durable_receipt:
+                    db.execute(
+                        "UPDATE job_delivery_acks SET retention_until=coalesce("
+                        "retention_until,?) WHERE job_id=? AND producer=? "
+                        "AND producer_attempt_id=? AND storage_ref=? "
+                        "AND result_hash=?",
+                        (now + float(config["receipt_retention_seconds"]), row["id"],
+                         row["source"], row["producer_attempt_id"], row["result_ref"],
+                         result_hash or row["result_hash"]),
+                    )
+                source_compaction_guards = (
+                    config["producer_storage_enabled"]
+                    and config["ack_required"]
+                    and config["compaction_enabled"]
+                    and not config["legacy_result_fallback"]
+                )
+                persisted_compaction_guards = (
+                    bool(row["ack_required"])
+                    and not bool(row["legacy_result_fallback"])
+                )
+                acked_result_artifact = db.execute(
+                    "SELECT 1 FROM job_artifacts WHERE job_id=? AND role='result' "
+                    "AND state='acked' AND content_hash=? LIMIT 1",
+                    (row["id"], result_hash or row["result_hash"]),
+                ).fetchone() is not None
+                durable_ack = (
+                    durable_receipt
+                    and source_compaction_guards
+                    and persisted_compaction_guards
+                    and acked_result_artifact
                 )
                 broker_expired = (
                     row["result_storage_mode"] == "broker_temporary"
@@ -483,9 +523,14 @@ def _apply_terminal_retention(
         )
     db.execute("DELETE FROM storage_source_usage")
     db.execute(
-        "INSERT INTO storage_source_usage(source,job_count,inline_bytes) "
+        "INSERT INTO storage_source_usage("
+        "source,job_count,inline_bytes,terminal_inline_bytes) "
         "SELECT source,count(*),sum(length(CAST(payload AS BLOB))+"
-        "coalesce(length(CAST(result_json AS BLOB)),0)) FROM jobs GROUP BY source"
+        "coalesce(length(CAST(result_json AS BLOB)),0)),"
+        "sum(CASE WHEN state IN ('completed','failed','cancelled') "
+        "AND compaction_state='full' THEN length(CAST(payload AS BLOB))+"
+        "coalesce(length(CAST(result_json AS BLOB)),0) ELSE 0 END) "
+        "FROM jobs GROUP BY source"
     )
     return report
 
