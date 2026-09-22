@@ -557,8 +557,10 @@ def build_terminal_repacked_database(
     staging = output.with_name(f".{output.name}.terminal-staging")
     if staging.exists() or output.exists():
         raise RetentionMigrationError("output or terminal staging database already exists")
-    db = _copy_database(source, staging)
+    db = None
+    validated = False
     try:
+        db = _copy_database(source, staging)
         # The staging file is disposable until integrity/FK/identity checks pass
         # and the final fsync+rename publishes it.  OFF avoids a database-sized
         # rollback/WAL while rewriting historical bodies out of place.
@@ -592,9 +594,17 @@ def build_terminal_repacked_database(
             raise RetentionMigrationError(
                 f"terminal repack is {output_bytes} bytes; target is < {target_bytes}"
             )
+        validated = True
     finally:
-        db.close()
-    os.replace(staging, output)
+        if db is not None:
+            db.close()
+        if not validated:
+            staging.unlink(missing_ok=True)
+    try:
+        os.replace(staging, output)
+    except OSError:
+        staging.unlink(missing_ok=True)
+        raise
     descriptor = os.open(output, os.O_RDONLY)
     try:
         os.fsync(descriptor)
@@ -688,6 +698,10 @@ def _apply_entry(
          entry["result"]["storage_ref"], entry["result"]["content_hash"],
          entry["result"]["byte_size"], entry["result"]["schema_version"],
          entry["result"]["persisted_at"], now, receipt_until),
+    )
+    db.execute(
+        "UPDATE audit_events SET producer_storage=1 WHERE job_id=?",
+        (job_id,),
     )
     db.execute(
         "INSERT INTO audit_events(occurred,event_type,job_id,source,from_state,to_state,"

@@ -190,6 +190,41 @@ class RetentionTests(unittest.TestCase):
         self.broker.storage.maybe_maintain(force=True)
         self.assertIsNone(self.broker.status(job["id"]))
 
+    def test_tombstone_outlives_persisted_receipt_deadline(self):
+        self._write_policy(
+            receipt_retention_seconds=100,
+            tombstone_retention_seconds=100,
+        )
+        job = self._admit("long-receipt")
+        self._ack_input(job)
+        self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
+        receipt = self._ack_result(job)
+        self.broker.storage.maybe_maintain(force=True)
+        persisted_until = self.broker.db.execute(
+            "SELECT retention_until FROM job_delivery_acks WHERE receipt_id=?",
+            (receipt["receipt_id"],),
+        ).fetchone()[0]
+        self.assertEqual(persisted_until, 200)
+
+        self._write_policy(
+            receipt_retention_seconds=20,
+            tombstone_retention_seconds=20,
+        )
+        self.clock.value = 111
+        self.broker.storage.maybe_maintain(force=True)
+        tombstone_until = self.broker.db.execute(
+            "SELECT expires_at FROM job_retention_tombstones WHERE job_id=?",
+            (job["id"],),
+        ).fetchone()[0]
+        self.assertEqual(tombstone_until, persisted_until)
+        self.clock.value = 132
+        self.broker.storage.maybe_maintain(force=True)
+        self.assertEqual(self.broker.status(job["id"])["retention_state"], "tombstone")
+        self.clock.value = 201
+        self.broker.storage.maybe_maintain(force=True)
+        self.assertIsNone(self.broker.receipt(job["id"]))
+        self.assertIsNone(self.broker.status(job["id"]))
+
     def test_unacked_terminal_is_reported_and_never_blindly_compacted(self):
         job = self._admit("unacked")
         self._ack_input(job)
@@ -233,6 +268,31 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(cycle["sources"]["producer"]["broker_results_expired"], 1)
         self.assertNotIn("result", self.broker.status(completed_id))
         self.assertNotEqual(self.broker.status(queued_id)["payload"], {})
+
+    def test_retention_disable_race_stops_destructive_maintenance(self):
+        temporary = {
+            "producer_storage_enabled": False,
+            "producer_storage_mode": "broker_temporary",
+            "ack_required": False,
+            "compaction_enabled": False,
+            "legacy_result_fallback": True,
+        }
+        self._write_policy(**temporary)
+        job = self.broker.submit(
+            "interactive", "generate", {"prompt": "retain-me"}, source="producer",
+        )
+        self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
+        self.clock.value = 106
+        observed = self.policy.snapshot()
+
+        def disable_after_snapshot():
+            self._write_policy(retention_enabled=False, **temporary)
+            return observed
+
+        with patch.object(self.policy, "snapshot", side_effect=disable_after_snapshot):
+            cycle = self.broker.storage.maybe_maintain(force=True)
+        self.assertEqual(cycle["changed"], 0)
+        self.assertIn("result", self.broker.status(job["id"]))
 
     def test_representative_terminal_regrowth_is_bounded(self):
         self._write_policy(
@@ -434,6 +494,12 @@ class RetentionTests(unittest.TestCase):
         completed = self._admit("historical", payload=payload)
         self.assertTrue(self.broker.dispatch_once(frozenset({"producer"})))
         status = self.broker.compact_status(completed["id"])
+        with self.broker.db:
+            self.broker.db.execute(
+                "INSERT INTO audit_events(occurred,event_type,job_id,source,"
+                "producer_storage) VALUES(?,?,?,?,0)",
+                (99, "legacy.historical", completed["id"], "producer"),
+            )
         queued = self._admit("queued", payload={"prompt": "keep-me"})
         self.broker.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self.broker.db.close()
@@ -487,6 +553,14 @@ class RetentionTests(unittest.TestCase):
             "SELECT payload,result_json FROM jobs WHERE id=?", (completed["id"],)
         ).fetchone()
         self.assertEqual(body, ("{}", None))
+        self.assertEqual(
+            db.execute(
+                "SELECT count(*) FROM audit_events WHERE job_id=? "
+                "AND producer_storage=0",
+                (completed["id"],),
+            ).fetchone()[0],
+            0,
+        )
         queued_body = db.execute(
             "SELECT payload,state FROM jobs WHERE id=?", (queued["id"],)
         ).fetchone()
@@ -611,6 +685,18 @@ class RetentionTests(unittest.TestCase):
             ).fetchone()[0],
             126,
         )
+
+    def test_failed_terminal_repack_removes_staging_database(self):
+        self.broker.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.broker.db.close()
+        output = self.root / "too-large.sqlite3"
+        staging = self.root / ".too-large.sqlite3.terminal-staging"
+        with self.assertRaisesRegex(RetentionMigrationError, "target is < 1"):
+            build_terminal_repacked_database(
+                self.database, output, self.policy_path, now=106, target_bytes=1,
+            )
+        self.assertFalse(staging.exists())
+        self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

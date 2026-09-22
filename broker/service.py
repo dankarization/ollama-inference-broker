@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 import logging
 import os
@@ -257,6 +258,7 @@ class Broker:
         }
         self._loaded_models_cache: list[dict[str, Any]] = []
         self._dashboard_cache: dict[bool, dict[str, Any]] = {}
+        self._dashboard_instance = uuid.uuid4().hex
         self._metrics_cache: dict[str, Any] = {
             "resource": "mainpc-gpu", "queue_depth": 0, "active": None,
         }
@@ -1249,6 +1251,24 @@ class Broker:
             return stale
         # An observer timeout or lock is not evidence that the queue is empty.
         return {"observation": self._observation("unavailable", now, error)}
+
+    def dashboard_etag(
+        self, policy: SourcePolicy | None = None, *,
+        include_producer_storage: bool = True,
+    ) -> str:
+        """Return a cheap validator without running dashboard observer queries."""
+        policy_snapshot = policy.snapshot() if policy is not None else None
+        with self.lock:
+            revision = {
+                "database_changes": self.db.total_changes,
+                "include_producer_storage": include_producer_storage,
+                "instance": self._dashboard_instance,
+                "policy": policy_snapshot,
+            }
+        digest = hashlib.sha256(json.dumps(
+            revision, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        return f'"{digest}"'
 
     def _terminal_history(
         self, db, *, limit: int, cursor: tuple[float, str] | None = None,

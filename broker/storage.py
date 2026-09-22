@@ -1395,15 +1395,25 @@ class StorageManager:
         for row in rows:
             receipt = self.db.execute(
                 "SELECT receipt_id,job_id,producer,producer_attempt_id,storage_ref,"
-                "result_hash,result_bytes,schema_version,persisted_at,received_at "
+                "result_hash,result_bytes,schema_version,persisted_at,received_at,"
+                "retention_until "
                 "FROM job_delivery_acks WHERE job_id=? ORDER BY received_at LIMIT 1",
                 (row["id"],),
             ).fetchone()
             receipt_hash = None
+            tombstone_expires_at = now + float(config["tombstone_retention_seconds"])
             if receipt is not None:
+                receipt_evidence = {
+                    key: receipt[key] for key in receipt.keys()
+                    if key != "retention_until"
+                }
                 receipt_hash = "sha256:" + hashlib.sha256(
-                    canonical_json_bytes(dict(receipt))
+                    canonical_json_bytes(receipt_evidence)
                 ).hexdigest()
+                if receipt["retention_until"] is not None:
+                    tombstone_expires_at = max(
+                        tombstone_expires_at, float(receipt["retention_until"]),
+                    )
             self.db.execute(
                 "INSERT OR IGNORE INTO job_retention_tombstones("
                 "job_id,source,external_id,profile,kind,final_state,input_hash,result_hash,"
@@ -1412,7 +1422,7 @@ class StorageManager:
                 (row["id"], row["source"], row["external_id"], row["profile"],
                  row["kind"], row["state"], row["input_hash"], row["result_hash"],
                  row["producer_attempt_id"], receipt_hash, row["created"], row["finished"],
-                 now, now + float(config["tombstone_retention_seconds"])),
+                 now, tombstone_expires_at),
             )
             self.db.execute("DELETE FROM job_artifacts WHERE job_id=?", (row["id"],))
             self.db.execute("DELETE FROM job_attempts WHERE job_id=?", (row["id"],))
@@ -1557,8 +1567,12 @@ class StorageManager:
         for source, observed in policy.snapshot()["sources"].items():
             if not observed["retention_enabled"]:
                 continue
-            retention_active = True
             with self._maintenance_source_config(source) as config:
+                # Recheck the hot policy while holding its writer lock.  A
+                # disable that races the outer snapshot must stop all deletes.
+                if not config["retention_enabled"]:
+                    continue
+                retention_active = True
                 producer_guards = (
                     config["producer_storage_enabled"]
                     and config["ack_required"]

@@ -164,10 +164,10 @@ def render(data: dict[str, Any]) -> bytes:
         reason = html.escape(str(observation.get("reason", "dashboard data unavailable")))
         observed_at = timestamp_cell(observation.get("observed_at"), tag="code")
         return f"""<!doctype html><html lang=en><meta charset=utf-8>
-<meta http-equiv=refresh content=15><title>Ollama broker queue unavailable</title>
+<meta http-equiv=refresh content=30><title>Ollama broker queue unavailable</title>
 <style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}.error{{color:#a00}}</style>
 <h1>Ollama inference broker queue</h1><p class=error>Dashboard data unavailable: {reason}.</p>
-<p>Observed at: {observed_at} · refreshes every 15 seconds.</p>
+<p>Observed at: {observed_at} · refreshes every 30 seconds.</p>
 </html>""".encode("utf-8")
 
     def weight_cell(source: str, value: float | None) -> str:
@@ -215,8 +215,16 @@ def render(data: dict[str, Any]) -> bytes:
             '<span class="bulk-feedback" aria-live="polite"></span></td>'
         )
 
+    def source_order(item: dict[str, Any]) -> tuple[bool, float, str]:
+        weight = item["scheduler"].get("weight")
+        return (
+            weight is None,
+            float(weight) if weight is not None else float("inf"),
+            str(item["source"]).casefold(),
+        )
+
     rows = []
-    for item in data["sources"]:
+    for item in sorted(data["sources"], key=source_order):
         scheduler, states = item["scheduler"], item["states"]
         rows.append("<tr>" + "".join((
             f"<td>{cell(item['source'])}</td>",
@@ -280,9 +288,9 @@ def render(data: dict[str, Any]) -> bytes:
             )
     overall = data["overall"]
     document = f"""<!doctype html><html lang=en><meta charset=utf-8>
-<meta http-equiv=refresh content=15><title>Ollama broker queue</title>
+<meta http-equiv=refresh content=30><title>Ollama broker queue</title>
 <style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}.weight-form,.enabled-form,.admission-form{{display:flex;gap:.35rem;align-items:center;justify-content:flex-end}}.weight-feedback,.enabled-feedback,.admission-feedback,.bulk-feedback{{min-width:4rem;text-align:left}}.error{{color:#a00}}button{{margin:.15rem}}</style>
-<h1>Ollama inference broker queue</h1><p>Snapshot timestamp: {timestamp_cell(data['timestamp'], tag='code')} · refreshes every 15 seconds.</p>
+<h1>Ollama inference broker queue</h1><p>Snapshot timestamp: {timestamp_cell(data['timestamp'], tag='code')} · refreshes every 30 seconds.</p>
 {('<p class=error>Showing stale data: ' + html.escape(str(observation.get('reason', 'database observer read unavailable'))) + '.</p>') if observation['state'] == 'stale' else ''}
 <p class=summary>Completed: <b>{overall['states']['completed']}</b> total · <b>{overall['completed_last_hour']}</b> last hour · <b>{overall['completed_last_24_hours']}</b> last 24 hours.</p>
 <h2>Sources</h2><table><thead><tr><th>Source</th><th>Dispatch</th><th>Admission</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th><th>Bulk actions</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=15>None</td></tr>'}</tbody></table>

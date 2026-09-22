@@ -103,6 +103,52 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("addEventListener('change'", html)
         self.assertIn("while(desired!==saved)", html)
         self.assertIn("desired===value", html)
+        self.assertIn("<meta http-equiv=refresh content=30>", html)
+        self.assertIn("refreshes every 30 seconds", html)
+        self.assertNotIn("content=15", html)
+        unavailable = render({
+            "observation": {"state": "unavailable", "observed_at": 1},
+        }).decode()
+        self.assertIn("<meta http-equiv=refresh content=30>", unavailable)
+        self.assertIn("refreshes every 30 seconds", unavailable)
+        self.assertNotIn("content=15", unavailable)
+
+    def test_sources_are_sorted_by_numeric_weight_then_source(self):
+        def source(name, weight):
+            return {
+                "source": name,
+                "scheduler": {
+                    "enabled": True, "admission_allowed": True,
+                    "weight": weight, "next_allowed": None,
+                },
+                "states": {
+                    name: 0 for name in (
+                        "queued", "running", "lease", "retry", "delayed",
+                        "failed", "cancelled", "completed",
+                    )
+                },
+                "completed_last_hour": 0,
+                "completed_last_24_hours": 0,
+            }
+
+        rendered = render({
+            "timestamp": 1,
+            "sources": [
+                source("weight-10", 10), source("weight-1-b", 1),
+                source("weight-2", 2), source("weight-1-a", 1),
+            ],
+            "active_jobs": [],
+            "overall": {
+                "states": {"completed": 0},
+                "completed_last_hour": 0,
+                "completed_last_24_hours": 0,
+            },
+        }).decode()
+        positions = [
+            rendered.index(f"<td>{name}</td>")
+            for name in ("weight-1-a", "weight-1-b", "weight-2", "weight-10")
+        ]
+        self.assertEqual(positions, sorted(positions))
     def test_payload_history_uses_the_bounded_observer_index_path(self):
         db = tempfile.NamedTemporaryFile()
         self.addCleanup(db.close)
@@ -244,6 +290,49 @@ class DashboardTests(unittest.TestCase):
         empty = Broker(empty_db.name, FakeOllama(), FakeWol()).dashboard()
         self.assertEqual(empty["observation"]["state"], "live")
         self.assertEqual(empty["overall"]["states"]["queued"], 0)
+
+    def test_unchanged_dashboard_etag_skips_regeneration_and_transfer(self):
+        db = tempfile.NamedTemporaryFile()
+        self.addCleanup(db.close)
+        broker = Broker(db.name, FakeOllama(), FakeWol())
+        self.addCleanup(broker.db.close)
+        server = serve(broker, port=0)
+        self.addCleanup(server.server_close)
+
+        def get(headers=None):
+            worker = threading.Thread(target=server.handle_request)
+            worker.start()
+            request = Request(
+                f"http://127.0.0.1:{server.server_port}/dashboard",
+                headers=headers or {},
+            )
+            try:
+                with urlopen(request) as response:
+                    result = response.status, response.read(), response.headers
+            except HTTPError as error:
+                result = error.code, error.read(), error.headers
+            worker.join(timeout=1)
+            return result
+
+        with patch.object(broker, "dashboard", wraps=broker.dashboard) as regenerate:
+            status, body, headers = get()
+            self.assertEqual(status, 200)
+            self.assertTrue(body)
+            etag = headers["ETag"]
+            self.assertEqual(headers["Cache-Control"], "private, no-cache")
+            self.assertEqual(regenerate.call_count, 1)
+
+            status, body, unchanged_headers = get({"If-None-Match": etag})
+            self.assertEqual((status, body), (304, b""))
+            self.assertEqual(unchanged_headers["ETag"], etag)
+            self.assertEqual(regenerate.call_count, 1)
+
+            broker.submit("interactive", "generate", {"prompt": "changed"})
+            status, body, changed_headers = get({"If-None-Match": etag})
+            self.assertEqual(status, 200)
+            self.assertTrue(body)
+            self.assertNotEqual(changed_headers["ETag"], etag)
+            self.assertEqual(regenerate.call_count, 2)
 
     def test_html_renders_active_timestamps_in_tbilisi_and_nulls_as_dash(self):
         timestamp = datetime(2026, 8, 29, 8, 30, tzinfo=timezone.utc).timestamp()
