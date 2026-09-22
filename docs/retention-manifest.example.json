@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "source": "example-producer",
+  "entries": [
+    {
+      "job_id": "00000000-0000-0000-0000-000000000000",
+      "producer_attempt_id": "historical-attempt-1",
+      "input": {
+        "storage_ref": "cas://example/inputs/sha256-object",
+        "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "byte_size": 0,
+        "persisted_at": "2026-09-22T00:00:00Z",
+        "readback_at": "2026-09-22T00:00:01Z"
+      },
+      "result": {
+        "storage_ref": "cas://example/results/sha256-object",
+        "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "byte_size": 0,
+        "schema_version": "result-v1",
+        "persisted_at": "2026-09-22T00:00:02Z",
+        "readback_at": "2026-09-22T00:00:03Z"
+      }
+    }
+  ]
+}

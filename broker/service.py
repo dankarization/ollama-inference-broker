@@ -14,17 +14,60 @@ from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
 from .dashboard import snapshot as dashboard_snapshot
-from .compat import (CompatibilityError, validate_olya_decision_payload,
+from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES,
+                     validate_olya_decision_payload,
                      validate_olya_vision_payload,
                      validate_shutterstock_canary_payload,
                      validate_shutterstock_video_payload,
-                     validate_syncopia_memory_payload)
+                     validate_syncopia_memory_payload,
+                     validate_uncensored_eval_payload)
 from .profiles import PROFILES
-from .policy import SourcePolicyError, normalize_source_policy
+from .policy import (
+    RETENTION_DEFAULTS,
+    SourcePolicyError,
+    normalize_source_policy,
+    source_policy_write_lock,
+)
+from .rollback_guard import LEGACY_HIDDEN_STORAGE_FIELDS
+from .storage import (
+    DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
+    DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+    DEFAULT_MIN_FREE_SPACE_BYTES,
+    DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+    DEFAULT_WAL_BUDGET_BYTES,
+    PUBLIC_JOB_PREDICATE,
+    PRODUCER_STORAGE_JOB_PREDICATE,
+    StorageManager,
+    content_evidence,
+    migrate_storage_schema,
+)
 
 
 LOGGER = logging.getLogger("ollama_inference_broker.audit")
 OBSERVER_READ_DEADLINE_SECONDS = 0.75
+SCHEDULING_HORIZON_SECONDS = 60 * 60
+FORECAST_DEFAULT_EXECUTION_SECONDS = 300.0
+MAX_ERROR_SUMMARY_CHARACTERS = 1024
+
+
+def bounded_error_summary(error: BaseException) -> str:
+    value = str(error)
+    return value[:MAX_ERROR_SUMMARY_CHARACTERS]
+
+
+class SourceAdmissionBlocked(Exception):
+    """A source policy rejected admission before a job was persisted."""
+
+    code = "source_admission_blocked"
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+        super().__init__(f"new admissions are blocked for source {source!r}")
+
+
+class StorageAuthorizationRequired(PermissionError):
+    """A bulk mutation selected at least one producer-storage job."""
+
 
 class SourcePolicy:
     """Runtime-reloadable per-source weights and enablement.
@@ -100,70 +143,108 @@ class SourcePolicy:
             entry = self._sources.get(source)
             return entry["weight"] if entry else None
 
+    def admission_allowed(self, source: str) -> bool:
+        """Default old policy entries and unknown sources to admission allowed."""
+        with self._lock:
+            self._load_locked()
+            entry = self._sources.get(source)
+            return True if entry is None else entry["admission_allowed"]
+
+    def storage_config(self, source: str) -> dict[str, Any]:
+        """Return fail-closed producer-storage flags for one source."""
+        with self._lock:
+            self._load_locked()
+            entry = self._sources.get(source)
+            if entry is None:
+                return {
+                    "producer_storage_enabled": False,
+                    "producer_storage_mode": "broker_temporary",
+                    "ack_required": False,
+                    "compaction_enabled": False,
+                    "legacy_result_fallback": True,
+                    "compaction_grace_seconds": 86400.0,
+                    "quarantine_grace_seconds": 86400.0,
+                    **RETENTION_DEFAULTS,
+                }
+            return {
+                key: entry[key]
+                for key in (
+                    "producer_storage_enabled", "producer_storage_mode", "ack_required",
+                    "compaction_enabled", "legacy_result_fallback",
+                    "compaction_grace_seconds", "quarantine_grace_seconds",
+                    *RETENTION_DEFAULTS,
+                )
+            }
+
+    def _mutate_source(self, source: str, field: str, value: Any) -> Any:
+        """Serialize and durably atomically replace one source policy field."""
+        with self._lock:
+            try:
+                with source_policy_write_lock(self.path):
+                    raw = json.loads(self.path.read_text(encoding="utf-8"))
+                    normalized = normalize_source_policy(raw)
+                    if source not in normalized:
+                        raise SourcePolicyError(f"source {source!r} is not configured")
+                    raw["sources"][source][field] = value
+                    temporary: str | None = None
+                    try:
+                        mode = self.path.stat().st_mode & 0o7777
+                        descriptor, temporary = tempfile.mkstemp(
+                            prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent,
+                        )
+                        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                            json.dump(raw, handle, indent=2, sort_keys=True)
+                            handle.write("\n")
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        os.chmod(temporary, mode)
+                        os.replace(temporary, self.path)
+                        directory = os.open(self.path.parent, os.O_RDONLY)
+                        try:
+                            os.fsync(directory)
+                        finally:
+                            os.close(directory)
+                    finally:
+                        if temporary is not None and os.path.exists(temporary):
+                            try:
+                                os.unlink(temporary)
+                            except OSError:
+                                pass
+            except SourcePolicyError:
+                raise
+            except (OSError, ValueError) as error:
+                raise SourcePolicyError("policy is unavailable or invalid") from error
+            self._signature = None
+            self._load_locked()
+            return value
+
     def set_weight(self, source: str, weight: Any) -> int:
         """Atomically update one configured source with a dashboard-safe weight."""
         if isinstance(weight, bool) or not isinstance(weight, int) or not 1 <= weight <= 10:
             raise SourcePolicyError("weight must be an integer from 1 through 10")
-        with self._lock:
-            try:
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
-                normalized = normalize_source_policy(raw)
-            except (OSError, ValueError, SourcePolicyError) as error:
-                raise SourcePolicyError("policy is unavailable or invalid") from error
-            if source not in normalized:
-                raise SourcePolicyError(f"source {source!r} is not configured")
-
-            raw["sources"][source]["weight"] = weight
-            try:
-                original_mode = self.path.stat().st_mode & 0o7777
-                descriptor, temporary = tempfile.mkstemp(
-                    prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent,
-                )
-                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    json.dump(raw, handle, indent=2, sort_keys=True)
-                    handle.write("\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.chmod(temporary, original_mode)
-                os.replace(temporary, self.path)
-            except OSError as error:
-                try:
-                    os.unlink(temporary)
-                except (OSError, UnboundLocalError):
-                    pass
-                raise SourcePolicyError("unable to save policy") from error
-            self._signature = None
-            self._load_locked()
-            return weight
+        return self._mutate_source(source, "weight", weight)
 
     def set_enabled(self, source: str, enabled: Any) -> bool:
         if not isinstance(enabled, bool):
             raise SourcePolicyError("enabled must be a boolean")
-        with self._lock:
-            try:
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
-                normalized = normalize_source_policy(raw)
-            except (OSError, ValueError, SourcePolicyError) as error:
-                raise SourcePolicyError("policy is unavailable or invalid") from error
-            if source not in normalized:
-                raise SourcePolicyError(f"source {source!r} is not configured")
-            raw["sources"][source]["enabled"] = enabled
-            try:
-                mode = self.path.stat().st_mode & 0o7777
-                descriptor, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent)
-                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    json.dump(raw, handle, indent=2, sort_keys=True); handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
-                os.chmod(temporary, mode); os.replace(temporary, self.path)
-            except OSError as error:
-                raise SourcePolicyError("unable to save policy") from error
-            self._signature = None; self._load_locked()
-            return enabled
+        return self._mutate_source(source, "enabled", enabled)
+
+    def set_admission_allowed(self, source: str, allowed: Any) -> bool:
+        if not isinstance(allowed, bool):
+            raise SourcePolicyError("allowed must be a boolean")
+        return self._mutate_source(source, "admission_allowed", allowed)
 
 
 class Broker:
-    """One-resource scheduler with FIFO per source and weight-only sharing."""
+    """One-resource scheduler with FIFO source heads and time-weighted batches."""
     def __init__(self, database: str | Path, ollama, wol, clock=time.time,
-                 lease_seconds=60):
+                 lease_seconds=60, *,
+                 wal_autocheckpoint_pages=DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+                 journal_size_limit_bytes=DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+                 wal_budget_bytes=DEFAULT_WAL_BUDGET_BYTES,
+                 checkpoint_interval_seconds=DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
+                 min_free_space_bytes=DEFAULT_MIN_FREE_SPACE_BYTES,
+                 source_policy: SourcePolicy | None = None):
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
         self.database = str(database)
         self.db = sqlite3.connect(self.database, check_same_thread=False)
@@ -175,18 +256,53 @@ class Broker:
             "active_job_id": None, "timestamp": self.clock(),
         }
         self._loaded_models_cache: list[dict[str, Any]] = []
-        self._dashboard_cache: dict[str, Any] | None = None
+        self._dashboard_cache: dict[bool, dict[str, Any]] = {}
         self._metrics_cache: dict[str, Any] = {
             "resource": "mainpc-gpu", "queue_depth": 0, "active": None,
         }
-        # In-memory weighted-round-robin state; policy changes never reset it.
+        # Kept as an inert compatibility attribute for observer users of older
+        # releases.  Policy scheduling is now time-budgeted rather than
+        # dispatch-count weighted round-robin.
         self._weight_accumulator: dict[str, float] = {}
+        # A cycle is deliberately process-local.  Queue durability and lease
+        # recovery stay in SQLite; a restart simply begins a fresh fair
+        # 60-minute allocation from the durable ready queue.
+        self._time_cycle: dict[str, Any] | None = None
+        self._duration_estimates: dict[tuple[str, str], float] = {}
+        self._active_time_batch: dict[str, Any] | None = None
         # Immutable copy written under the lock for the lock-free forecast.
         self._scheduler_snapshot: dict[str, Any] | None = None
+        self.source_policy = source_policy
+        self.wal_autocheckpoint_pages = int(wal_autocheckpoint_pages)
+        self.journal_size_limit_bytes = int(journal_size_limit_bytes)
         self._init_db()
+        self.storage = StorageManager(
+            self.db, self.database, self.lock, self.clock, self._audit,
+            lambda: self.source_policy,
+            wal_autocheckpoint_pages=self.wal_autocheckpoint_pages,
+            journal_size_limit_bytes=self.journal_size_limit_bytes,
+            wal_budget_bytes=int(wal_budget_bytes),
+            checkpoint_interval_seconds=float(checkpoint_interval_seconds),
+            min_free_space_bytes=int(min_free_space_bytes),
+        )
         self.recover()
+        self.storage.reconcile()
         with self.lock:
             self._refresh_health_cache_locked()
+
+    def use_source_policy(self, policy: SourcePolicy | None) -> None:
+        """Install the shared hot-reload policy used by HTTP admissions."""
+        self.source_policy = policy
+
+    def audit_source_control(
+        self, event_type: str, source: str, metadata: dict[str, Any]
+    ) -> None:
+        """Persist payload-free evidence of a successful source policy change."""
+        with self.lock, self.db:
+            self._audit(
+                event_type, source=source, reason="runtime source policy changed",
+                metadata=metadata,
+            )
 
     def _refresh_health_cache_locked(self) -> None:
         queued = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0]
@@ -243,19 +359,20 @@ class Broker:
                 self.db.execute(
                     "ALTER TABLE jobs ADD COLUMN requeue_count INTEGER NOT NULL DEFAULT 0"
                 )
+            # The one-time index build belongs to migration.  On every later
+            # startup this partial index proves there are no legacy NULLs
+            # without scanning payload-heavy rows.
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_missing_queued_at "
+                "ON jobs(id) WHERE queued_at IS NULL"
+            )
             self.db.execute("UPDATE jobs SET queued_at=created WHERE queued_at IS NULL")
             self._retire_priority_column()
-            self.db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                occurred REAL NOT NULL,
-                event_type TEXT NOT NULL,
-                job_id TEXT,
-                source TEXT,
-                attempt_no INTEGER,
-                from_state TEXT,
-                to_state TEXT,
-                reason TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}')""")
+            migrate_storage_schema(
+                self.db,
+                wal_autocheckpoint_pages=self.wal_autocheckpoint_pages,
+                journal_size_limit_bytes=self.journal_size_limit_bytes,
+            )
             self.db.execute("""CREATE TABLE IF NOT EXISTS job_attempts (
                 job_id TEXT NOT NULL,
                 attempt_no INTEGER NOT NULL,
@@ -380,11 +497,20 @@ class Broker:
     ) -> None:
         timestamp = self.clock() if occurred is None else occurred
         safe_metadata = metadata or {}
+        producer_storage = int(
+            job_id is not None
+            and self.db.execute(
+                f"SELECT 1 FROM jobs WHERE id=? AND {PRODUCER_STORAGE_JOB_PREDICATE}",
+                (job_id,),
+            ).fetchone() is not None
+        )
         self.db.execute(
             "INSERT INTO audit_events(occurred,event_type,job_id,source,attempt_no,"
-            "from_state,to_state,reason,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)",
+            "from_state,to_state,reason,metadata_json,producer_storage) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
             (timestamp, event_type, job_id, source, attempt_no, from_state,
-             to_state, reason, json.dumps(safe_metadata, sort_keys=True)),
+             to_state, reason, json.dumps(safe_metadata, sort_keys=True),
+             producer_storage),
         )
         # Deliberately omit payload, result, correlation values and error text.
         LOGGER.info(json.dumps({
@@ -428,6 +554,9 @@ class Broker:
                     "WHERE id=?",
                     (now, row["id"]),
                 )
+                self.storage.record_terminal_retention(
+                    row["id"], row["source"], "failed", now,
+                )
                 self._audit(
                     "job.failed", job_id=row["id"], source=row["source"],
                     attempt_no=attempt_no, from_state=row["state"],
@@ -436,10 +565,10 @@ class Broker:
             if expired:
                 self._refresh_health_cache_locked()
             self.completed.notify_all()
-
     def submit(self, profile: str, kind: str, payload: dict, source: str | None = None,
                source_item_id: str | None = None,
-               external_id: str | None = None) -> dict:
+               external_id: str | None = None,
+               producer_storage: dict[str, Any] | None = None) -> dict:
         if profile not in PROFILES:
             raise ValueError("unknown profile")
         if kind not in {"chat", "generate"}:
@@ -491,24 +620,117 @@ class Broker:
                 })
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
+        if profile in UNCENSORED_EVAL_PROFILES:
+            if source != "uncensored-eval":
+                raise ValueError("uncensored evaluation profiles must use source uncensored-eval")
+            try:
+                payload = validate_uncensored_eval_payload(payload)
+            except CompatibilityError as exc:
+                raise ValueError(str(exc)) from exc
         source_item_id = self._correlation_value("source_item_id", source_item_id)
         external_id = self._correlation_value("external_id", external_id)
         job_id, now = str(uuid.uuid4()), self.clock()
         with self.lock, self.db:
-            if source in {"olya-vision", "olya-decision", "syncopia-telegram-memory"} and external_id is not None:
+            existing = None
+            existing_has_producer_storage = False
+            if external_id is not None:
                 existing = self.db.execute(
-                    "SELECT id FROM jobs WHERE source=? AND external_id=? "
+                    "SELECT * FROM jobs WHERE source=? AND external_id=? "
                     "ORDER BY created DESC,id DESC LIMIT 1",
                     (source, external_id),
                 ).fetchone()
+                if existing is None:
+                    tombstone = self.db.execute(
+                        "SELECT * FROM job_retention_tombstones "
+                        "WHERE source=? AND external_id=?",
+                        (source, external_id),
+                    ).fetchone()
+                    tombstone_is_idempotent = tombstone is not None and (
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory"}
+                        or producer_storage is not None
+                        or tombstone["producer_attempt_id"] is not None
+                    )
+                    if tombstone_is_idempotent:
+                        input_hash = content_evidence(payload)[0]
+                        if (
+                            tombstone["profile"] != profile
+                            or tombstone["kind"] != kind
+                            or tombstone["input_hash"] != input_hash
+                            or (
+                                producer_storage is not None
+                                and tombstone["producer_attempt_id"]
+                                != producer_storage.get("producer_attempt_id")
+                            )
+                        ):
+                            raise ValueError(
+                                "retained idempotency conflict for expired correlation"
+                            )
+                        raise ValueError(
+                            "job retention expired; recover the durable producer artifact"
+                        )
                 if existing is not None:
-                    return self.status(existing["id"])
+                    existing_has_producer_storage = (
+                        existing["producer_attempt_id"] is not None
+                        or existing["input_storage_mode"] != "broker_temporary"
+                        or existing["result_storage_mode"] != "broker_temporary"
+                    )
+                    if (
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory"}
+                        or producer_storage is not None
+                        or existing_has_producer_storage
+                    ):
+                        if (producer_storage is not None) != existing_has_producer_storage:
+                            raise ValueError(
+                                "producer storage idempotency conflict for existing correlation"
+                            )
+                        if producer_storage is not None:
+                            storage_fields = self.storage.prepare_admission(
+                                source, payload, producer_storage, persisted=existing,
+                            )
+                            checks = {
+                                "profile": profile,
+                                "kind": kind,
+                                "producer_attempt_id": storage_fields["producer_attempt_id"],
+                                "input_ref": storage_fields["input_ref"],
+                                "input_hash": storage_fields["input_hash"],
+                                "input_bytes": storage_fields["input_bytes"],
+                                "input_storage_mode": storage_fields["input_storage_mode"],
+                                "result_storage_mode": storage_fields["result_storage_mode"],
+                                "artifact_schema_version": storage_fields["artifact_schema_version"],
+                            }
+                            if any(existing[key] != value for key, value in checks.items()):
+                                raise ValueError(
+                                    "producer storage idempotency conflict for existing correlation"
+                                )
+                        return self.status(existing["id"])
+            storage_fields = self.storage.prepare_admission(source, payload, producer_storage)
+            if self.source_policy is not None and not self.source_policy.admission_allowed(source):
+                self._audit(
+                    "admission.rejected", source=source,
+                    reason="source admission policy blocked new jobs", occurred=now,
+                    metadata={
+                        "code": SourceAdmissionBlocked.code,
+                        "profile": profile,
+                        "kind": kind,
+                    },
+                )
+                # Rejection itself is durable observability, despite aborting admission.
+                self.db.commit()
+                raise SourceAdmissionBlocked(source)
             self.db.execute(
                 "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
-                "queued_at,source_item_id,external_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "queued_at,source_item_id,external_id,input_storage_mode,input_ref,input_hash,"
+                "input_bytes,result_storage_mode,artifact_schema_version,producer_attempt_id,"
+                "ack_required,legacy_result_fallback) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, profile, kind, source, json.dumps(payload), "queued", now,
-                 now, source_item_id, external_id),
+                 now, source_item_id, external_id, storage_fields["input_storage_mode"],
+                 storage_fields["input_ref"], storage_fields["input_hash"],
+                 storage_fields["input_bytes"], storage_fields["result_storage_mode"],
+                 storage_fields["artifact_schema_version"], storage_fields["producer_attempt_id"],
+                 storage_fields["ack_required"], storage_fields["legacy_result_fallback"]),
             )
+            self.storage.record_admission(job_id, source, storage_fields, now)
             self._audit(
                 "admission.accepted", job_id=job_id, source=source,
                 from_state=None, to_state="queued", occurred=now,
@@ -517,10 +739,113 @@ class Broker:
                     "kind": kind,
                     "has_source_item_id": source_item_id is not None,
                     "has_external_id": external_id is not None,
+                    "producer_storage": producer_storage is not None,
+                    "result_storage_mode": storage_fields["result_storage_mode"],
                 },
             )
             self._refresh_health_cache_locked()
         return self.status(job_id)
+
+    @staticmethod
+    def _bulk_source(source: str) -> str:
+        if not isinstance(source, str) or not source.strip() or len(source) > 256:
+            raise ValueError("source must be a non-empty string up to 256 characters")
+        return source.strip()
+
+    def bulk_cancel_queued(
+        self, source: str, *, allow_producer_storage: bool = False,
+    ) -> dict[str, Any]:
+        """Cancel only queued jobs for one exact source in one transaction."""
+        source = self._bulk_source(source)
+        now = self.clock()
+        with self.lock, self.db:
+            rows = list(self.db.execute(
+                "SELECT id,attempt_count," + PRODUCER_STORAGE_JOB_PREDICATE +
+                " AS producer_storage FROM jobs WHERE source=? AND state='queued' "
+                "ORDER BY queued_at,id", (source,),
+            ))
+            if not allow_producer_storage and any(
+                row["producer_storage"] for row in rows
+            ):
+                raise StorageAuthorizationRequired
+            for row in rows:
+                self.db.execute(
+                    "UPDATE jobs SET state='cancelled',finished=? "
+                    "WHERE id=? AND state='queued'", (now, row["id"]),
+                )
+                self.storage.record_terminal_retention(
+                    row["id"], source, "cancelled", now,
+                )
+                self._audit(
+                    "job.cancelled", job_id=row["id"], source=source,
+                    attempt_no=row["attempt_count"] or None,
+                    from_state="queued", to_state="cancelled",
+                    reason="bulk source cancellation", occurred=now,
+                )
+            count = len(rows)
+            self._audit(
+                "source.bulk_cancel", source=source,
+                reason="bulk queued cancellation", occurred=now,
+                metadata={"cancelled": count},
+            )
+            self._refresh_health_cache_locked()
+            self.completed.notify_all()
+        return {"source": source, "cancelled": count}
+
+    def bulk_retry_failed(
+        self, source: str, *, allow_producer_storage: bool = False,
+    ) -> dict[str, Any]:
+        """Requeue only failed jobs while retaining attempts and audit history."""
+        source = self._bulk_source(source)
+        now = self.clock()
+        with self.lock, self.db:
+            rows = list(self.db.execute(
+                "SELECT id,attempt_count,compaction_state," + PRODUCER_STORAGE_JOB_PREDICATE +
+                " AS producer_storage FROM jobs WHERE source=? AND state='failed' "
+                "ORDER BY finished,id", (source,),
+            ))
+            if not allow_producer_storage and any(
+                row["producer_storage"] for row in rows
+            ):
+                raise StorageAuthorizationRequired
+            if any(row["compaction_state"] != "full" for row in rows):
+                raise ValueError("one or more failed jobs have expired retry bodies")
+            for row in rows:
+                attempt_no = row["attempt_count"] or None
+                self._audit(
+                    "job.retry_requested", job_id=row["id"], source=source,
+                    attempt_no=attempt_no, from_state="failed",
+                    reason="bulk source retry", occurred=now,
+                )
+                self.db.execute(
+                    "UPDATE jobs SET state='queued',queued_at=?,started=NULL,finished=NULL,"
+                    "lease_until=NULL,error=NULL,switch_reason=NULL,result_json=NULL,"
+                    "result_ref=NULL,result_hash=NULL,result_bytes=NULL,delivery_state='pending',"
+                    "delivery_attempt_count=0,last_delivery_at=NULL,acked_at=NULL,"
+                    "compaction_after=NULL,compaction_state='full',quarantined_at=NULL,"
+                    "compacted_at=NULL,body_retention_until=NULL,"
+                    "metadata_retention_until=NULL,retry_count=retry_count+1 "
+                    "WHERE id=? AND state='failed'",
+                    (now, row["id"]),
+                )
+                self.db.execute(
+                    "DELETE FROM job_artifacts WHERE job_id=? AND role='result'",
+                    (row["id"],),
+                )
+                self._audit(
+                    "job.requeued", job_id=row["id"], source=source,
+                    attempt_no=attempt_no, from_state="failed", to_state="queued",
+                    reason="bulk source retry", occurred=now,
+                )
+            count = len(rows)
+            self._audit(
+                "source.bulk_retry", source=source,
+                reason="bulk failed retry", occurred=now,
+                metadata={"retried": count},
+            )
+            self._refresh_health_cache_locked()
+            self.completed.notify_all()
+        return {"source": source, "retried": count}
 
     @staticmethod
     def _correlation_value(name: str, value: str | None) -> str | None:
@@ -533,11 +858,50 @@ class Broker:
     def status(self, job_id: str) -> dict | None:
         with self.lock:
             row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-            return self._job(row) if row else None
+            return self._job(row) if row else self.storage.tombstone_status(job_id)
+
+    def compact_status(self, job_id: str) -> dict | None:
+        return self.storage.compact_status(job_id) or self.storage.tombstone_status(job_id)
+
+    def receipt(self, job_id: str) -> dict | None:
+        return self.storage.receipt(job_id)
+
+    def acknowledge_result(self, job_id: str, body: dict[str, Any]) -> dict | None:
+        return self.storage.acknowledge_result(job_id, body)
+
+    def acknowledge_input(self, job_id: str, body: dict[str, Any]) -> dict | None:
+        return self.storage.acknowledge_input(job_id, body)
+
+    def storage_maintenance(
+        self, source: str, *, operation: str = "preview", limit: int = 100,
+        confirm: bool = False, max_bytes: int = 16 * 1024 * 1024,
+    ) -> dict[str, Any]:
+        return self.storage.maintenance(
+            source, operation=operation, limit=limit, confirm=confirm,
+            max_bytes=max_bytes,
+        )
+
+    def storage_health(self) -> dict[str, Any]:
+        return self.storage.health()
+
+    def producer_storage_job(self, job_id: str) -> bool:
+        with self.lock:
+            active = self.db.execute(
+                f"SELECT 1 FROM jobs WHERE id=? AND {PRODUCER_STORAGE_JOB_PREDICATE}",
+                (job_id,),
+            ).fetchone()
+            if active is not None:
+                return True
+            return self.db.execute(
+                "SELECT 1 FROM job_retention_tombstones "
+                "WHERE job_id=? AND producer_attempt_id IS NOT NULL", (job_id,),
+            ).fetchone() is not None
 
     def _job(self, row):
         data = dict(row)
         data.pop("priority", None)  # inert historic column is never public
+        for field in LEGACY_HIDDEN_STORAGE_FIELDS:
+            data.pop(field, None)
         data["payload"] = json.loads(data["payload"])
         if data.get("result_json") is not None:
             data["result"] = json.loads(data.pop("result_json"))
@@ -564,6 +928,9 @@ class Broker:
                 self.db.execute(
                     "UPDATE jobs SET state='cancelled', finished=? WHERE id=?", (now, job_id)
                 )
+                self.storage.record_terminal_retention(
+                    job_id, row["source"], "cancelled", now,
+                )
                 self._audit(
                     "job.cancelled", job_id=job_id, source=row["source"],
                     from_state="queued", to_state="cancelled", occurred=now,
@@ -585,12 +952,19 @@ class Broker:
         """Explicitly requeue a failed/cancelled job without changing payload."""
         with self.lock, self.db:
             row = self.db.execute(
-                "SELECT state,source,attempt_count FROM jobs WHERE id=?", (job_id,)
+                "SELECT state,source,attempt_count,compaction_state "
+                "FROM jobs WHERE id=?", (job_id,)
             ).fetchone()
             if row is None:
+                if self.db.execute(
+                    "SELECT 1 FROM job_retention_tombstones WHERE job_id=?", (job_id,),
+                ).fetchone() is not None:
+                    raise ValueError("job retry retention has expired")
                 return None
             if row["state"] not in {"failed", "cancelled"}:
                 raise ValueError("only failed or cancelled jobs may be retried")
+            if row["compaction_state"] != "full":
+                raise ValueError("job retry retention has expired")
             now = self.clock()
             self._audit(
                 "job.retry_requested", job_id=job_id, source=row["source"],
@@ -600,8 +974,15 @@ class Broker:
             self.db.execute(
                 "UPDATE jobs SET state='queued',queued_at=?,started=NULL,finished=NULL,"
                 "lease_until=NULL,error=NULL,switch_reason=NULL,result_json=NULL,"
-                "retry_count=retry_count+1 WHERE id=?",
+                "result_ref=NULL,result_hash=NULL,result_bytes=NULL,delivery_state='pending',"
+                "delivery_attempt_count=0,last_delivery_at=NULL,acked_at=NULL,"
+                "compaction_after=NULL,compaction_state='full',quarantined_at=NULL,"
+                "compacted_at=NULL,body_retention_until=NULL,"
+                "metadata_retention_until=NULL,retry_count=retry_count+1 WHERE id=?",
                 (now, job_id),
+            )
+            self.db.execute(
+                "DELETE FROM job_artifacts WHERE job_id=? AND role='result'", (job_id,)
             )
             self._audit(
                 "job.requeued", job_id=job_id, source=row["source"],
@@ -653,10 +1034,12 @@ class Broker:
     def audit_events(
         self, *, limit: int = 100, job_id: str | None = None,
         source: str | None = None, since: float | None = None,
+        include_producer_storage: bool = True,
     ) -> list[dict[str, Any]]:
         with self.lock:
             return audit_history(
-                self.db, limit=limit, job_id=job_id, source=source, since=since
+                self.db, limit=limit, job_id=job_id, source=source, since=since,
+                include_producer_storage=include_producer_storage,
             )
 
     def analytics(
@@ -724,18 +1107,26 @@ class Broker:
             observation.update(error)
         return observation
 
-    def forecast(self, policy: SourcePolicy | None = None, limit: int = 5) -> dict:
+    def forecast(
+        self, policy: SourcePolicy | None = None, limit: int = 10, *,
+        include_producer_storage: bool = True,
+    ) -> dict:
         """Read-only projection of upcoming dispatcher selections.
 
         The projection never mutates the queue, leases, accumulators or batch
         state: it simulates the same ``_select_candidate`` routine on private
         copies and is explicitly contingent on later admissions and state
-        changes.  A locked database yields ``unavailable`` instead of fake
-        emptiness.  Bounded by ``limit`` (1..20) next selections.
+        changes.  It uses the same model/source time-batch selector as real
+        dispatch and advances only a private cycle copy with observed per-lane
+        duration estimates.  A locked database yields ``unavailable`` instead
+        of fake emptiness.  Bounded by ``limit`` (1..20) next selections.
         """
         now = self.clock()
         data, error = self._observer_read(
-            lambda db: self._forecast(db, policy, now, limit)
+            lambda db: self._forecast(
+                db, policy, now, limit,
+                include_producer_storage=include_producer_storage,
+            )
         )
         if data is None:
             return {
@@ -745,23 +1136,39 @@ class Broker:
             }
         return data
 
-    def _forecast(self, db, policy, now: float, limit: int) -> dict[str, Any]:
+    def _forecast(
+        self, db, policy, now: float, limit: int, *,
+        include_producer_storage: bool = True,
+    ) -> dict[str, Any]:
         """Projection body; reads only, never writes."""
         bounded = max(1, min(int(limit), 20))
         allowed = None
         if policy is not None:
             allowed = policy.enabled_sources()
         running = db.execute(
-            "SELECT profile FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1"
+            "SELECT profile FROM jobs WHERE state IN ('running','cancel_requested')" +
+            ("" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE) +
+            " LIMIT 1"
         ).fetchone()
         # The next dispatch can occur only after the one active job completes.
         # Project that slot release; keep all other hard eligibility checks.
         candidates = self._candidates(
             allowed, db=db, release_running=running is not None,
             limit_per_source=bounded,
+            include_producer_storage=include_producer_storage,
         )
         snapshot = self._scheduler_snapshot or {}
-        accumulator = dict(snapshot.get("accumulator") or {})
+        cycle = deepcopy(snapshot.get("time_cycle"))
+        estimates = dict(snapshot.get("duration_estimates") or {})
+        active = snapshot.get("active_time_batch")
+        # The active lease will release before any projected selection.  Its
+        # true duration is unknown until completion, so forecast uses the same
+        # lane estimate it uses for all subsequent non-preemptive boundaries.
+        if policy is not None and running is not None and active is not None and cycle:
+            self._record_time_usage(
+                cycle, tuple(active["lane"]),
+                self._forecast_duration(tuple(active["lane"]), estimates),
+            )
         remaining = [dict(row) for row in candidates]
         selections: list[dict[str, Any]] = []
         for _ in range(bounded):
@@ -771,14 +1178,18 @@ class Broker:
                 picked = remaining[0]
                 mode, reason = "fifo", "oldest queued job"
                 eligible = [picked["source"]]
+                decision: dict[str, Any] = {}
             else:
-                picked = self._weighted_pick(remaining, policy, accumulator)
+                picked, cycle, decision = self._time_batch_pick(
+                    remaining, policy, now, cycle,
+                )
                 if picked is None:
                     break
-                mode, reason = "weighted_round_robin", "weight-only source selection"
-                eligible = sorted({row["source"] for row in remaining})
+                mode, reason = decision["mode"], decision["reason"]
+                eligible = decision["eligible_sources"]
             queued_at = picked["queued_at"] if picked["queued_at"] is not None else picked["created"]
             wait = max(0.0, now - queued_at)
+            lane = self._lane_key(picked)
             selections.append({
                 "job_id": picked["id"],
                 "source": picked["source"],
@@ -791,39 +1202,58 @@ class Broker:
                 "wait_seconds": round(wait, 3),
             })
             remaining = [row for row in remaining if row["id"] != picked["id"]]
+            if policy is not None:
+                self._record_time_usage(
+                    cycle, lane, self._forecast_duration(lane, estimates),
+                )
         return {
             "contingent": True,
             "contingency": (
-                "read-only post-completion projection; it changes as jobs are admitted, "
-                "complete and when the source policy reloads"
+                "read-only time-batch projection; non-preemptive boundaries use recent "
+                "execution estimates and change as jobs are admitted, complete or policy reloads"
             ),
             "current_model": PROFILES[running["profile"]].model if running else None,
             "next_selections": selections,
         }
 
-    def dashboard(self, policy: SourcePolicy | None = None) -> dict:
+    def dashboard(
+        self, policy: SourcePolicy | None = None, *,
+        include_producer_storage: bool = True,
+    ) -> dict:
         """Payload-free live queue data for the local operational dashboard."""
         policy_snapshot = policy.snapshot() if policy is not None else None
         now = self.clock()
         snapshot, error = self._observer_read(
             lambda db: {
-                **dashboard_snapshot(db, now=now, policy_snapshot=policy_snapshot),
-                "forecast": self._forecast(db, policy, now, 8),
-                "history": self._terminal_history(db, limit=10),
+                **dashboard_snapshot(
+                    db, now=now, policy_snapshot=policy_snapshot,
+                    include_producer_storage=include_producer_storage,
+                ),
+                "forecast": self._forecast(
+                    db, policy, now, 10,
+                    include_producer_storage=include_producer_storage,
+                ),
+                "history": self._terminal_history(
+                    db, limit=10,
+                    include_producer_storage=include_producer_storage,
+                ),
             }
         )
         if snapshot is not None:
             snapshot["observation"] = self._observation("live", now)
-            self._dashboard_cache = snapshot
+            self._dashboard_cache[include_producer_storage] = snapshot
             return snapshot
-        if self._dashboard_cache is not None:
-            stale = deepcopy(self._dashboard_cache)
+        if include_producer_storage in self._dashboard_cache:
+            stale = deepcopy(self._dashboard_cache[include_producer_storage])
             stale["observation"] = self._observation("stale", now, error)
             return stale
         # An observer timeout or lock is not evidence that the queue is empty.
         return {"observation": self._observation("unavailable", now, error)}
 
-    def _terminal_history(self, db, *, limit: int, cursor: tuple[float, str] | None = None):
+    def _terminal_history(
+        self, db, *, limit: int, cursor: tuple[float, str] | None = None,
+        include_producer_storage: bool = True,
+    ):
         values: list[Any] = []
         clause = ""
         if cursor is not None:
@@ -831,17 +1261,29 @@ class Broker:
             # keyset predicate into a multi-index OR that needs a temp sort.
             clause = " AND (finished,id) < (?,?)"
             values.extend(cursor)
+        storage_clause = "" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE
+        history_index = (
+            "jobs_terminal_history_v3" if include_producer_storage
+            else "jobs_public_terminal_history"
+        )
         rows = db.execute(
             "SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count "
-            "FROM jobs INDEXED BY jobs_terminal_history_v3 "
-            "WHERE state IN ('completed','failed','cancelled') AND finished IS NOT NULL" + clause +
+            f"FROM jobs INDEXED BY {history_index} "
+            "WHERE state IN ('completed','failed','cancelled') AND finished IS NOT NULL"
+            + storage_clause + clause +
             " ORDER BY finished DESC,id DESC LIMIT ?",
             (*values, max(1, min(limit, 30))),
         )
         return [dict(row) for row in rows]
 
-    def terminal_history(self, *, limit: int = 30, cursor: tuple[float, str] | None = None):
-        data, error = self._observer_read(lambda db: self._terminal_history(db, limit=limit, cursor=cursor))
+    def terminal_history(
+        self, *, limit: int = 30, cursor: tuple[float, str] | None = None,
+        include_producer_storage: bool = True,
+    ):
+        data, error = self._observer_read(lambda db: self._terminal_history(
+            db, limit=limit, cursor=cursor,
+            include_producer_storage=include_producer_storage,
+        ))
         if data is None:
             return {"unavailable": True, "reason": (error or {}).get("reason")}
         next_cursor = None if not data else [data[-1]["finished"], data[-1]["id"]]
@@ -850,6 +1292,7 @@ class Broker:
     def correlations(
         self, *, source: str | None = None, source_item_id: str | None = None,
         external_id: str | None = None, limit: int = 100,
+        include_producer_storage: bool = True,
     ) -> list[dict[str, Any]]:
         if source_item_id is None and external_id is None:
             raise ValueError("source_item_id or external_id is required")
@@ -864,6 +1307,8 @@ class Broker:
                 clauses.append(f"{column}=?")
                 values.append(value)
         bounded_limit = max(1, min(int(limit), 1_000))
+        if not include_producer_storage:
+            clauses.append(f"NOT {PRODUCER_STORAGE_JOB_PREDICATE}")
         with self.lock:
             rows = self.db.execute(
                 "SELECT id AS job_id,source,profile,state,created,finished,"
@@ -875,7 +1320,8 @@ class Broker:
             return [dict(row) for row in rows]
 
     def _candidates(self, allowed_sources: frozenset[str] | None = None, db=None,
-                    release_running: bool = False, limit_per_source: int | None = None):
+                    release_running: bool = False, limit_per_source: int | None = None,
+                    include_producer_storage: bool = True):
         """Queued rows eligible now, ordered FIFO.
 
         Per-source concurrency and min-interval backpressure are applied here
@@ -898,6 +1344,8 @@ class Broker:
             placeholders = ",".join("?" for _ in allowed_sources)
             query += f" AND source IN ({placeholders})"
             values = tuple(sorted(allowed_sources))
+        if not include_producer_storage:
+            query += " AND " + PUBLIC_JOB_PREDICATE
         if limit_per_source is not None:
             query = (
                 "SELECT id,profile,source,created,queued_at,attempt_count FROM ("
@@ -926,46 +1374,235 @@ class Broker:
                 candidates.append(row)
         return candidates
 
-    def _weighted_pick(self, candidates, policy: SourcePolicy, accumulator=None):
-        """Pick a candidate by weighted round-robin across sources.
+    @staticmethod
+    def _lane_key(row) -> tuple[str, str]:
+        return (str(row["source"]), PROFILES[row["profile"]].model)
 
-        Weights are relative shares of dispatch opportunities per source; the
-        first candidate of each source is ordered FIFO. A deterministic rotating accumulator keeps the
-        schedule fair and stable across policy reloads.  When the policy has
-        no entry for a source, the source keeps the default weight of 1.
-        ``accumulator`` may be a caller-owned dict for read-only projections;
-        the real dispatcher uses the broker-owned accumulator.
+    @staticmethod
+    def _source_heads(candidates) -> dict[tuple[str, str], Any]:
+        """Return exactly one FIFO-eligible job for each source/model lane.
+
+        A source's oldest eligible row is its only dispatchable head.  This is
+        important when one source has jobs targeting different models: model
+        affinity must not let a younger job overtake that source's FIFO head.
         """
-        by_source: dict[str, list] = {}
+        heads_by_source: dict[str, Any] = {}
         for row in candidates:
-            by_source.setdefault(row["source"], []).append(row)
-        if not by_source:
-            return None
-        if accumulator is None:
-            accumulator = getattr(self, "_weight_accumulator", None)
-            if accumulator is None:
-                accumulator = self._weight_accumulator = {}
-        total_weight = 0.0
-        for source in by_source:
-            configured = policy.weight(source) or 1.0
-            share = 1.0 / configured
-            total_weight += share
-            accumulator[source] = accumulator.get(source, 0.0) + share
-        # Ignore accumulator entries for sources no longer eligible after a
-        # hot policy reload or an emptied queue.
-        chosen_source = max(by_source, key=lambda source: accumulator[source])
-        accumulator[chosen_source] -= total_weight
-        return by_source[chosen_source][0]
+            heads_by_source.setdefault(row["source"], row)
+        return {
+            Broker._lane_key(row): row for row in heads_by_source.values()
+        }
+
+    @staticmethod
+    def _policy_signature(policy: SourcePolicy) -> tuple[tuple[str, float], ...]:
+        sources = policy.snapshot().get("sources", {})
+        return tuple(
+            (source, float(entry["weight"]))
+            for source, entry in sorted(sources.items())
+            if entry.get("enabled", True)
+        )
+
+    @staticmethod
+    def _lane_order(lanes: dict[tuple[str, str], dict[str, Any]]) -> list[tuple[str, str]]:
+        """Order full model blocks, then source/model lanes within a block."""
+        model_totals: dict[str, float] = {}
+        model_oldest: dict[str, tuple[float, str]] = {}
+        for key, lane in lanes.items():
+            source, model = key
+            model_totals[model] = model_totals.get(model, 0.0) + lane["weight"]
+            candidate_key = (lane["queued_at"], source)
+            if model not in model_oldest or candidate_key < model_oldest[model]:
+                model_oldest[model] = candidate_key
+        models = sorted(
+            model_totals,
+            key=lambda model: (-model_totals[model], model_oldest[model], model),
+        )
+        order: list[tuple[str, str]] = []
+        for model in models:
+            order.extend(sorted(
+                (key for key in lanes if key[1] == model),
+                key=lambda key: (-lanes[key]["weight"], lanes[key]["queued_at"], key[0]),
+            ))
+        return order
+
+    def _new_time_cycle(
+        self,
+        available: dict[tuple[str, str], Any],
+        policy: SourcePolicy,
+        now: float,
+        previous: dict[str, Any] | None = None,
+        *,
+        preserve_current: bool = False,
+    ) -> dict[str, Any]:
+        """Create/rebase a cycle from ready model/source FIFO heads.
+
+        Budgets are measured in actual claimed-job execution seconds.  When a
+        new lane becomes ready mid-cycle, only the *remaining* horizon is
+        divided again; execution already charged to a previous lane is never
+        erased.  That makes an empty lane work-conserving without allowing a
+        reactivated lane to wait forever.
+        """
+        previous = previous or {}
+        total_used = min(
+            SCHEDULING_HORIZON_SECONDS, float(previous.get("total_used", 0.0)),
+        )
+        remaining = max(0.0, SCHEDULING_HORIZON_SECONDS - total_used)
+        weights = {
+            key: float(policy.weight(row["source"]) or 1.0)
+            for key, row in available.items()
+        }
+        weight_total = sum(weights.values())
+        old_lanes = previous.get("lanes", {})
+        lanes: dict[tuple[str, str], dict[str, Any]] = {}
+        for key, row in available.items():
+            used = float(old_lanes.get(key, {}).get("used", 0.0))
+            lanes[key] = {
+                "source": key[0],
+                "model": key[1],
+                "weight": weights[key],
+                "queued_at": row["queued_at"] if row["queued_at"] is not None else row["created"],
+                "used": used,
+                "budget": used + (remaining * weights[key] / weight_total if weight_total else 0.0),
+            }
+        current = previous.get("current") if preserve_current else None
+        if current not in lanes:
+            current = None
+        return {
+            "started_at": previous.get("started_at", now),
+            "signature": self._policy_signature(policy),
+            "total_used": total_used,
+            "lanes": lanes,
+            "order": self._lane_order(lanes),
+            "current": current,
+        }
+
+    @staticmethod
+    def _budget_remaining(lane: dict[str, Any]) -> bool:
+        # A tiny tolerance avoids treating a floating-point round-off as a
+        # distinct dispatchable time slice.
+        return lane["used"] + 1e-9 < lane["budget"]
+
+    def _time_batch_pick(
+        self,
+        candidates,
+        policy: SourcePolicy,
+        now: float,
+        cycle: dict[str, Any] | None = None,
+    ) -> tuple[Any | None, dict[str, Any] | None, dict[str, Any]]:
+        """Select a source FIFO head using contiguous weighted time batches."""
+        available = self._source_heads(candidates)
+        if not available:
+            return None, cycle, {}
+        signature = self._policy_signature(policy)
+        if cycle is None or cycle.get("total_used", 0.0) >= SCHEDULING_HORIZON_SECONDS:
+            cycle = self._new_time_cycle(available, policy, now)
+        elif cycle.get("signature") != signature:
+            # A hot policy change takes effect at the next non-preemptive job
+            # boundary.  The active request has already completed here.
+            cycle = self._new_time_cycle(available, policy, now, cycle)
+        elif any(key not in cycle.get("lanes", {}) for key in available):
+            # A source/model lane became ready after an empty/failing period.
+            # Preserve the current contiguous batch, but divide the remaining
+            # horizon so the returning lane receives bounded service.
+            cycle = self._new_time_cycle(
+                available, policy, now, cycle, preserve_current=True,
+            )
+
+        selected_key = cycle.get("current")
+        if (
+            selected_key not in available
+            or selected_key not in cycle["lanes"]
+            or not self._budget_remaining(cycle["lanes"][selected_key])
+        ):
+            selected_key = next(
+                (
+                    key for key in cycle["order"]
+                    if key in available and self._budget_remaining(cycle["lanes"][key])
+                ),
+                None,
+            )
+        if selected_key is None:
+            # All ready planned lanes exhausted their allocations, or planned
+            # lanes are empty.  Start the next horizon from what is ready so
+            # no GPU time is intentionally left idle.
+            cycle = self._new_time_cycle(available, policy, now)
+            selected_key = next(
+                key for key in cycle["order"] if key in available
+            )
+
+        cycle["current"] = selected_key
+        selected = available[selected_key]
+        lane = cycle["lanes"][selected_key]
+        eligible_sources = sorted({row["source"] for row in available.values()})
+        decision = {
+            "mode": "time_batch",
+            "reason": "60-minute weighted time batch with model affinity",
+            "eligible_sources": eligible_sources,
+            "active_weights": {
+                source: weight for source, weight in self._policy_signature(policy)
+            },
+            "selected_source": selected["source"],
+            "selected_model": selected_key[1],
+            "horizon_seconds": SCHEDULING_HORIZON_SECONDS,
+            "time_budget_seconds": round(lane["budget"], 6),
+            "time_used_seconds": round(lane["used"], 6),
+        }
+        return selected, cycle, decision
+
+    @staticmethod
+    def _record_time_usage(
+        cycle: dict[str, Any] | None,
+        lane_key: tuple[str, str],
+        elapsed: float,
+    ) -> None:
+        if cycle is None or lane_key not in cycle.get("lanes", {}):
+            return
+        charged = max(0.0, float(elapsed))
+        lane = cycle["lanes"][lane_key]
+        lane["used"] += charged
+        cycle["total_used"] += charged
+
+    @staticmethod
+    def _forecast_duration(
+        lane_key: tuple[str, str], estimates: dict[tuple[str, str], float],
+    ) -> float:
+        return max(1.0, float(estimates.get(lane_key, FORECAST_DEFAULT_EXECUTION_SECONDS)))
+
+    def _publish_scheduler_snapshot(self) -> None:
+        self._scheduler_snapshot = {
+            "time_cycle": deepcopy(self._time_cycle),
+            "duration_estimates": dict(self._duration_estimates),
+            "active_time_batch": deepcopy(self._active_time_batch),
+            "last": dict(self._last_scheduler_decision)
+            if getattr(self, "_last_scheduler_decision", None) else None,
+        }
+
+    def _complete_time_batch(self, finished: float) -> None:
+        """Charge one completed non-preemptive attempt to its selected lane."""
+        active = self._active_time_batch
+        if active is None:
+            return
+        lane = tuple(active["lane"])
+        elapsed = max(0.0, float(finished) - float(active["started"]))
+        self._record_time_usage(self._time_cycle, lane, elapsed)
+        previous = self._duration_estimates.get(lane)
+        self._duration_estimates[lane] = (
+            elapsed if previous is None else ((previous + elapsed) / 2.0)
+        )
+        self._active_time_batch = None
+        self._publish_scheduler_snapshot()
 
     def _next(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None):
-        # With a policy, sources share the GPU only by their configured weight;
-        # each selected source contributes its FIFO head.
+        # Without policy, retain the durable global FIFO compatibility path.
+        # With policy, dispatch source FIFO heads in contiguous target-model
+        # batches charged against a recurring 60-minute execution horizon.
+        if policy is not None and allowed_sources is None:
+            allowed_sources = policy.enabled_sources()
         candidates = self._candidates(allowed_sources)
         if not candidates:
             self._last_scheduler_decision = None
             self._scheduler_snapshot = None
             return None
-        now = self.clock()
         if policy is None:
             selected = candidates[0]
             decision = {
@@ -974,34 +1611,15 @@ class Broker:
                 "eligible_sources": sorted({row["source"] for row in candidates}),
             }
         else:
-            selected = self._weighted_pick(candidates, policy)
+            selected, self._time_cycle, decision = self._time_batch_pick(
+                candidates, policy, self.clock(), self._time_cycle,
+            )
             if selected is None:
                 self._last_scheduler_decision = None
                 self._scheduler_snapshot = None
                 return None
-            decision = {
-                "mode": "weighted_round_robin",
-                "reason": "weight-only source selection",
-                "eligible_sources": sorted({row["source"] for row in candidates}),
-            }
-        policy_sources = policy.snapshot().get("sources", {}) if policy is not None else {}
-        active_weights = {
-            source: float(entry["weight"])
-            for source, entry in sorted(policy_sources.items())
-            if entry.get("enabled", True)
-        }
-        self._last_scheduler_decision = {
-            "mode": decision["mode"],
-            "reason": decision["reason"],
-            "eligible_sources": decision["eligible_sources"],
-            "active_weights": active_weights,
-            "selected_source": selected["source"],
-            "selected_model": PROFILES[selected["profile"]].model,
-        }
-        self._scheduler_snapshot = {
-            "accumulator": dict(self._weight_accumulator),
-            "last": dict(self._last_scheduler_decision),
-        }
+        self._last_scheduler_decision = dict(decision)
+        self._publish_scheduler_snapshot()
         return selected
 
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None) -> bool:
@@ -1045,6 +1663,12 @@ class Broker:
                 attempt_no=attempt_no, from_state="queued", to_state="running",
                 occurred=now, metadata={"lease_until": lease_until},
             )
+            if policy is not None:
+                self._active_time_batch = {
+                    "lane": self._lane_key(row),
+                    "started": now,
+                }
+                self._publish_scheduler_snapshot()
             interval = PROFILES[row["profile"]].min_interval_seconds
             if interval:
                 self.db.execute(
@@ -1066,16 +1690,21 @@ class Broker:
         except Exception as exc:
             with self.lock, self.db:
                 finished = self.clock()
-                self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (finished, str(exc), row["id"]))
+                error_summary = bounded_error_summary(exc)
+                self._complete_time_batch(finished)
+                self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (finished, error_summary, row["id"]))
+                self.storage.record_terminal_retention(
+                    row["id"], row["source"], "failed", finished,
+                )
                 self.db.execute(
                     "UPDATE job_attempts SET finished=?,outcome='failed',error=? "
                     "WHERE job_id=? AND attempt_no=?",
-                    (finished, str(exc), row["id"], attempt_no),
+                    (finished, error_summary, row["id"], attempt_no),
                 )
                 self._audit(
                     "job.failed", job_id=row["id"], source=row["source"],
                     attempt_no=attempt_no, from_state="running", to_state="failed",
-                    reason=str(exc), occurred=finished,
+                    reason=error_summary, occurred=finished,
                 )
                 self._refresh_health_cache_locked()
                 self.completed.notify_all()
@@ -1088,25 +1717,40 @@ class Broker:
         self._loaded_models_cache = [dict(model) for model in models if isinstance(model, dict)]
         loaded = [m.get("name") for m in models]
         others = [m for m in loaded if m != profile.model]
-        if others:
-            for model in others: self.ollama.unload(model)
-            reason = "unloaded incompatible model before switch"
-        else:
-            reason = "target already resident" if profile.model in loaded else "target model requested"
-        # A no-op generation is Ollama's explicit model-load/readiness contract.
-        if not self.ollama.is_ready(profile.model):
-            self.ollama.run("generate", {"model": profile.model, "prompt": "", "keep_alive": f"{profile.keep_alive_seconds}s"})
-        wait_ready = getattr(self.ollama, "wait_ready", None)
-        ready = (
-            wait_ready(profile.model, timeout_seconds=30)
-            if wait_ready is not None
-            else self.ollama.is_ready(profile.model)
+        reason = (
+            "unloaded incompatible model before switch" if others
+            else "target already resident" if profile.model in loaded
+            else "target model requested"
         )
+        ensure_ready = getattr(self.ollama, "ensure_model_ready", None)
+        if ensure_ready is not None:
+            ready = ensure_ready(
+                profile.model,
+                keep_alive=f"{profile.keep_alive_seconds}s",
+                timeout_seconds=min(300, profile.request_timeout_seconds),
+            )
+        else:
+            # Compatibility seam for injected test/executor adapters. Production
+            # OllamaHTTP uses the bounded exclusive switch above.
+            for model in others:
+                self.ollama.unload(model)
+            if not self.ollama.is_ready(profile.model):
+                self.ollama.run(
+                    "generate",
+                    {"model": profile.model, "prompt": "", "keep_alive": f"{profile.keep_alive_seconds}s"},
+                )
+            wait_ready = getattr(self.ollama, "wait_ready", None)
+            ready = (
+                wait_ready(profile.model, timeout_seconds=30)
+                if wait_ready is not None
+                else self.ollama.is_ready(profile.model)
+            )
         if not ready:
             raise RuntimeError("target model did not become ready")
         payload = json.loads(row["payload"])
         options = dict(payload.get("options", {}))
-        options["num_ctx"] = min(int(options.get("num_ctx", profile.max_context)), profile.max_context)
+        default_context = profile.default_context or profile.max_context
+        options["num_ctx"] = min(int(options.get("num_ctx", default_context)), profile.max_context)
         options["num_predict"] = min(int(options.get("num_predict", profile.max_output)), profile.max_output)
         request = {k: v for k, v in payload.items() if k not in {"model", "keep_alive"}}
         request.update({"model": profile.model, "stream": False, "options": options,
@@ -1120,8 +1764,18 @@ class Broker:
             state = self.db.execute("SELECT state FROM jobs WHERE id=?", (row["id"],)).fetchone()[0]
             final = "cancelled" if state == "cancel_requested" else "completed"
             finished = self.clock()
-            self.db.execute("UPDATE jobs SET state=?,finished=?,lease_until=NULL,switch_reason=?,result_json=? WHERE id=?",
-                            (final, finished, reason, result_json, row["id"]))
+            self.db.execute(
+                "UPDATE jobs SET state=?,finished=?,lease_until=NULL,switch_reason=?,"
+                "payload=CASE WHEN ?='completed' THEN '{}' ELSE payload END,result_json=? "
+                "WHERE id=?",
+                (final, finished, reason, final, result_json, row["id"]),
+            )
+            if final == "completed":
+                self.storage.record_result(row["id"], row["source"], result, finished)
+            else:
+                self.storage.record_terminal_retention(
+                    row["id"], row["source"], "cancelled", finished,
+                )
             attempt_no = self.db.execute(
                 "SELECT attempt_count FROM jobs WHERE id=?", (row["id"],)
             ).fetchone()[0]
@@ -1135,6 +1789,7 @@ class Broker:
                 attempt_no=attempt_no, from_state=state, to_state=final,
                 reason=reason, occurred=finished,
             )
+            self._complete_time_batch(finished)
             self._refresh_health_cache_locked()
             self.completed.notify_all()
 
@@ -1167,6 +1822,7 @@ class Broker:
         return {
             **self._metrics_cache,
             "loaded_models": [dict(model) for model in self._loaded_models_cache],
+            "storage": self.storage.wal_snapshot(),
             "timestamp": self.clock(),
         }
 
@@ -1208,6 +1864,8 @@ class Dispatcher(threading.Thread):
                 enabled = policy.enabled_sources()
                 allowed = enabled if enabled else frozenset()
             self.broker.recover()
+            self.broker.storage.maybe_checkpoint()
+            self.broker.storage.maybe_maintain()
             if not self.drain_event.is_set():
                 self.broker.dispatch_once(allowed, policy)
             self.stop_event.wait(self.interval)
