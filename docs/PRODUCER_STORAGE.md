@@ -132,6 +132,12 @@ not count queued, running, cancel-requested, or retryable payloads: those bodies
 are required for execution, so their growth remains visible but cannot be
 discarded or mistaken for reclaimable retention usage.
 
+New admissions also preserve a filesystem reserve: the larger of 2 GiB and 5%
+of the database filesystem. The check uses current free space plus the incoming
+canonical payload size, applies to active payloads without imposing a queue-size
+quota, and fails closed when filesystem capacity cannot be read. Idempotent
+replay of an already durable job remains available under disk pressure.
+
 Queued, running, cancel-requested, and still-retryable payloads always remain
 inline and byte-identical. Completed payloads are cleared immediately because a
 completed job cannot be retried. A producer-owned completed result remains

@@ -4,6 +4,8 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from broker.policy import SourcePolicyError, normalize_source_policy
 from broker.retention_migration import (
@@ -309,6 +311,32 @@ class RetentionTests(unittest.TestCase):
                 "WHERE source='producer'"
             ).fetchone()[0],
             len("{}") + len(json.dumps({"done": True, "output": "terminal"})),
+        )
+
+    def test_disk_reserve_blocks_only_new_admission_and_preserves_replay(self):
+        existing = self._admit("disk-replay")
+        two_gib = 2 * 1024 * 1024 * 1024
+        constrained = SimpleNamespace(
+            total=20 * 1024 * 1024 * 1024,
+            used=18 * 1024 * 1024 * 1024,
+            free=two_gib,
+        )
+        with patch("broker.storage.shutil.disk_usage", return_value=constrained):
+            replay = self._admit("disk-replay")
+            self.assertEqual(replay["id"], existing["id"])
+            with self.assertRaisesRegex(
+                StorageContractError, "free-space reserve would be breached",
+            ):
+                self._admit("disk-blocked")
+            disk = self.broker.storage_health()["disk"]
+        self.assertEqual(disk["reserve_bytes"], two_gib)
+        self.assertEqual(disk["admission_available_bytes"], 0)
+        self.assertTrue(disk["under_pressure"])
+        self.assertEqual(
+            self.broker.db.execute(
+                "SELECT count(*) FROM jobs WHERE external_id='disk-blocked'"
+            ).fetchone()[0],
+            0,
         )
 
     def test_startup_queued_at_backfill_uses_partial_index(self):
