@@ -118,6 +118,10 @@ def main() -> None:
             os.environ.get("BROKER_WAL_CHECKPOINT_INTERVAL_SECONDS"), 60,
             "BROKER_WAL_CHECKPOINT_INTERVAL_SECONDS",
         ),
+        min_free_space_bytes=positive_integer(
+            os.environ.get("BROKER_MIN_FREE_SPACE_BYTES"), 2 * 1024 * 1024 * 1024,
+            "BROKER_MIN_FREE_SPACE_BYTES",
+        ),
     )
     policy = None
     configured_policy = policy_path(os.environ.get("BROKER_SOURCES_POLICY"))

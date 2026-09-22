@@ -94,6 +94,7 @@ class BrokerTests(unittest.TestCase):
         unit = (root / "systemd/ollama-inference-broker.service").read_text()
         readme = (root / "README.md").read_text()
         self.assertIn("ExecReload=/usr/bin/kill -USR1 $MAINPID", unit)
+        self.assertIn("Environment=BROKER_MIN_FREE_SPACE_BYTES=2147483648", unit)
         self.assertIn("systemctl --user reload ollama-inference-broker.service", readme)
         self.assertIn("systemctl --user kill -s SIGUSR1", readme)
 

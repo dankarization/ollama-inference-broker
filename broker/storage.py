@@ -6,7 +6,9 @@ from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 import logging
+import math
 import re
+import shutil
 import sqlite3
 import uuid
 from datetime import datetime
@@ -32,6 +34,8 @@ DEFAULT_MAINTENANCE_OVERSIZE_BYTES = 64 * 1024 * 1024
 DEFAULT_INCREMENTAL_VACUUM_PAGES = 1024
 DEFAULT_DATABASE_TARGET_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_GLOBAL_INLINE_BUDGET_BYTES = 768 * 1024 * 1024
+DEFAULT_MIN_FREE_SPACE_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_FREE_SPACE_RESERVE_FRACTION = 0.05
 HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 SCHEMA_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ATTEMPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
@@ -537,9 +541,16 @@ class StorageManager:
         journal_size_limit_bytes: int = DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
         wal_budget_bytes: int = DEFAULT_WAL_BUDGET_BYTES,
         checkpoint_interval_seconds: float = DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
+        min_free_space_bytes: int = DEFAULT_MIN_FREE_SPACE_BYTES,
     ) -> None:
-        if wal_budget_bytes <= 0 or checkpoint_interval_seconds <= 0:
-            raise ValueError("WAL budget and checkpoint interval must be positive")
+        if (
+            wal_budget_bytes <= 0
+            or checkpoint_interval_seconds <= 0
+            or min_free_space_bytes <= 0
+        ):
+            raise ValueError(
+                "WAL budget, checkpoint interval, and free-space reserve must be positive"
+            )
         self.db = db
         self.database = database
         self.lock = lock
@@ -550,6 +561,7 @@ class StorageManager:
         self.journal_size_limit_bytes = journal_size_limit_bytes
         self.wal_budget_bytes = wal_budget_bytes
         self.checkpoint_interval_seconds = float(checkpoint_interval_seconds)
+        self.min_free_space_bytes = int(min_free_space_bytes)
         self.last_checkpoint: dict[str, Any] | None = None
         self._last_checkpoint_at = 0.0
         self._last_maintenance_at = 0.0
@@ -708,8 +720,18 @@ class StorageManager:
         }
 
     def _assert_admission_capacity(
-        self, source: str, _payload_bytes: int, *, config: dict[str, Any] | None,
+        self, source: str, payload_bytes: int, *, config: dict[str, Any] | None,
     ) -> None:
+        try:
+            disk = self._disk_capacity()
+        except OSError as exc:
+            raise StorageContractError(
+                "broker filesystem capacity is unavailable"
+            ) from exc
+        if payload_bytes > disk["admission_available_bytes"]:
+            raise StorageContractError(
+                "broker filesystem free-space reserve would be breached"
+            )
         if config is None:
             config = self._source_config(source)
         if not config["retention_enabled"]:
@@ -727,6 +749,23 @@ class StorageManager:
         ).fetchone()[0])
         if total_inline_bytes >= DEFAULT_GLOBAL_INLINE_BUDGET_BYTES:
             raise StorageContractError("global terminal inline storage budget is exhausted")
+
+    def _disk_capacity(self) -> dict[str, int | str | bool]:
+        database_directory = Path(self.database).resolve().parent
+        usage = shutil.disk_usage(database_directory)
+        reserve = max(
+            self.min_free_space_bytes,
+            math.ceil(usage.total * DEFAULT_FREE_SPACE_RESERVE_FRACTION),
+        )
+        available = max(0, usage.free - reserve)
+        return {
+            "path": str(database_directory),
+            "total_bytes": int(usage.total),
+            "free_bytes": int(usage.free),
+            "reserve_bytes": int(reserve),
+            "admission_available_bytes": int(available),
+            "under_pressure": usage.free <= reserve,
+        }
 
     def record_admission(
         self, job_id: str, source: str, fields: dict[str, Any], created: float,
@@ -1666,6 +1705,18 @@ class StorageManager:
             "effective_wal_autocheckpoint_pages": effective_wal_autocheckpoint_pages,
             "effective_journal_size_limit_bytes": effective_journal_size_limit_bytes,
         })
+        try:
+            disk: dict[str, Any] = self._disk_capacity()
+        except OSError:
+            disk = {
+                "path": str(Path(self.database).resolve().parent),
+                "total_bytes": None,
+                "free_bytes": None,
+                "reserve_bytes": self.min_free_space_bytes,
+                "admission_available_bytes": 0,
+                "under_pressure": True,
+                "error": "unavailable",
+            }
         return {
             "schema_version": STORAGE_SCHEMA_VERSION,
             **counts,
@@ -1675,4 +1726,5 @@ class StorageManager:
             "database_target_bytes": DEFAULT_DATABASE_TARGET_BYTES,
             "global_inline_budget_bytes": DEFAULT_GLOBAL_INLINE_BUDGET_BYTES,
             "global_terminal_inline_budget_bytes": DEFAULT_GLOBAL_INLINE_BUDGET_BYTES,
+            "disk": disk,
         }

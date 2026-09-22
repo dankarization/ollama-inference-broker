@@ -17,6 +17,7 @@ Environment=BROKER_WAL_AUTOCHECKPOINT_PAGES=4096
 Environment=BROKER_JOURNAL_SIZE_LIMIT_BYTES=67108864
 Environment=BROKER_WAL_BUDGET_BYTES=134217728
 Environment=BROKER_WAL_CHECKPOINT_INTERVAL_SECONDS=60
+Environment=BROKER_MIN_FREE_SPACE_BYTES=2147483648
 Environment=BROKER_STORAGE_TOKEN_FILE=%h/.local/state/ollama-inference-broker/storage-api.token
 # Legacy allowlist is intentionally retained for policy-less rollback only.
 # With the policy above, dispatcher sources/weights are loaded at runtime.

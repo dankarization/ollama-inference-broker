@@ -32,6 +32,7 @@ from .rollback_guard import LEGACY_HIDDEN_STORAGE_FIELDS
 from .storage import (
     DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
     DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+    DEFAULT_MIN_FREE_SPACE_BYTES,
     DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
     DEFAULT_WAL_BUDGET_BYTES,
     PUBLIC_JOB_PREDICATE,
@@ -241,7 +242,8 @@ class Broker:
                  wal_autocheckpoint_pages=DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
                  journal_size_limit_bytes=DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
                  wal_budget_bytes=DEFAULT_WAL_BUDGET_BYTES,
-                 checkpoint_interval_seconds=DEFAULT_CHECKPOINT_INTERVAL_SECONDS):
+                 checkpoint_interval_seconds=DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
+                 min_free_space_bytes=DEFAULT_MIN_FREE_SPACE_BYTES):
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
         self.database = str(database)
         self.db = sqlite3.connect(self.database, check_same_thread=False)
@@ -280,6 +282,7 @@ class Broker:
             journal_size_limit_bytes=self.journal_size_limit_bytes,
             wal_budget_bytes=int(wal_budget_bytes),
             checkpoint_interval_seconds=float(checkpoint_interval_seconds),
+            min_free_space_bytes=int(min_free_space_bytes),
         )
         self.recover()
         self.storage.reconcile()
