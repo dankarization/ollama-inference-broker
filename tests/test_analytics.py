@@ -286,7 +286,7 @@ class AnalyticsTests(unittest.TestCase):
         self.assertNotIn("payload", matches[0])
         self.assertNotIn("result", matches[0])
 
-    def test_weighted_selection_tracks_inverse_weight_share(self):
+    def test_time_batch_selection_records_direct_weight_context(self):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock)
         policy = self.policy({
@@ -317,11 +317,14 @@ class AnalyticsTests(unittest.TestCase):
         snapshot = broker.analytics(policy, windows=(3_600,))
         scheduler = snapshot["scheduler"]["windows"]["3600"]
         self.assertEqual(scheduler["selections"], 17)
-        self.assertEqual(scheduler["modes"]["weighted_round_robin"], 17)
-        self.assertGreater(
-            scheduler["sources"]["shutterstock-video"]["selected"],
-            scheduler["sources"]["olya-vision"]["selected"],
+        self.assertEqual(scheduler["modes"]["time_batch"], 17)
+        first = next(
+            event["metadata"] for event in broker.audit_events(limit=1_000)
+            if event["event_type"] == "scheduler.selected"
         )
+        self.assertEqual(first["horizon_seconds"], 3_600)
+        self.assertEqual(first["active_weights"]["olya-vision"], 8.0)
+        self.assertEqual(first["active_weights"]["shutterstock-video"], 3.0)
         self.assertEqual(
             snapshot["scheduler"]["active_policy"]["sources"]["olya-vision"]["weight"],
             8.0,

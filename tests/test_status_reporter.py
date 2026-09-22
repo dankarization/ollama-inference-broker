@@ -57,7 +57,24 @@ class StatusReporterTests(unittest.TestCase):
         handle.close()
         self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
         self.assertEqual(_policy(handle.name), {
-            "defaulted": {"enabled": True, "weight": 1.0},
+            "defaulted": {
+                "enabled": True, "weight": 1.0, "admission_allowed": True,
+                "producer_storage_enabled": False,
+                "producer_storage_mode": "broker_temporary",
+                "ack_required": False,
+                "compaction_enabled": False,
+                "legacy_result_fallback": True,
+                "compaction_grace_seconds": 86400.0,
+                "quarantine_grace_seconds": 86400.0,
+                "retention_enabled": False,
+                "acked_body_retention_seconds": 3600.0,
+                "unacked_terminal_retention_seconds": 604800.0,
+                "failed_cancelled_retention_seconds": 604800.0,
+                "metadata_retention_seconds": 15552000.0,
+                "receipt_retention_seconds": 31536000.0,
+                "tombstone_retention_seconds": 157680000.0,
+                "inline_budget_bytes": 134217728,
+            },
         })
 
     def test_policy_rejects_unknown_keys_like_the_dispatcher(self):

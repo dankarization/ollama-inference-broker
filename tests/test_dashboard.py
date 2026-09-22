@@ -98,7 +98,8 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("tr.innerHTML", html)
         self.assertIn("td.textContent", html)
         self.assertIn("timeZone:'Asia/Tbilisi'", html)
-        self.assertNotIn("<button", html)
+        self.assertIn("querySelectorAll('.bulk-action')", html)
+        self.assertIn("window.confirm", html)
         self.assertIn("addEventListener('change'", html)
         self.assertIn("while(desired!==saved)", html)
         self.assertIn("desired===value", html)
@@ -321,7 +322,10 @@ class DashboardTests(unittest.TestCase):
         body, _ = get("/v1/dashboard")
         data = json.loads(body)
         source = next(item for item in data["sources"] if item["source"] == "dashboard-source")
-        self.assertEqual(source["scheduler"], {"enabled": True, "weight": 3.0, "next_allowed": None})
+        self.assertEqual(source["scheduler"], {
+            "enabled": True, "dispatch_paused": False,
+            "admission_allowed": True, "weight": 3.0, "next_allowed": None,
+        })
         self.assertEqual(source["states"]["lease"], 1)
         self.assertEqual(source["states"]["completed"], 2)
         self.assertEqual(source["completed_last_hour"], 1)
@@ -331,7 +335,8 @@ class DashboardTests(unittest.TestCase):
         data = broker.dashboard(policy)
         omitted = next(item for item in data["sources"] if item["source"] == "omitted-source")
         self.assertEqual(omitted["scheduler"], {
-            "enabled": False, "weight": None, "next_allowed": None,
+            "enabled": False, "dispatch_paused": True,
+            "admission_allowed": True, "weight": None, "next_allowed": None,
         })
         html, content_type = get("/dashboard")
         self.assertIn("text/html", content_type)
@@ -342,7 +347,7 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn(b">3.0<", html)
         self.assertIn(b"weight-feedback", html)
         self.assertNotIn(b"Dead", html)
-        self.assertIn(b'<tr><td colspan=13>None</td></tr>', render({
+        self.assertIn(b'<tr><td colspan=15>None</td></tr>', render({
             "timestamp": 0,
             "sources": [],
             "active_jobs": [],

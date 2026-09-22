@@ -10,7 +10,10 @@ from unittest.mock import patch
 from urllib.request import urlopen
 
 from broker.http import serve
-from broker.__main__ import dispatch_enabled, dispatch_sources, install_drain_handler
+from broker.__main__ import (
+    dispatch_enabled, dispatch_sources, install_drain_handler, positive_integer,
+    positive_number, storage_token,
+)
 from broker.adapters import OllamaHTTP
 from broker.service import Broker
 
@@ -62,6 +65,30 @@ class BrokerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be positive"):
             OllamaHTTP(timeout_seconds=0)
 
+    def test_wal_integer_limits_reject_fractional_and_zero_values(self):
+        self.assertEqual(positive_integer(None, 4096, "WAL"), 4096)
+        self.assertEqual(positive_integer("1024", 4096, "WAL"), 1024)
+        for value in ("0", "1.5", "invalid"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "positive integer"):
+                positive_integer(value, 4096, "WAL")
+
+    def test_wal_checkpoint_interval_requires_a_finite_positive_number(self):
+        self.assertEqual(positive_number("1.5", 60, "WAL interval"), 1.5)
+        for value in ("0", "nan", "inf", "-inf", "invalid"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "positive number"):
+                positive_number(value, 60, "WAL interval")
+
+    def test_storage_token_file_must_be_owner_only(self):
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as handle:
+            handle.write("x" * 32)
+            path = Path(handle.name)
+        self.addCleanup(path.unlink)
+        path.chmod(0o600)
+        self.assertEqual(storage_token(str(path)), "x" * 32)
+        path.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "owner-only"):
+            storage_token(str(path))
+
     def test_systemd_drain_reload_targets_only_the_broker_main_pid(self):
         root = Path(__file__).resolve().parents[1]
         unit = (root / "systemd/ollama-inference-broker.service").read_text()
@@ -80,6 +107,60 @@ class BrokerTests(unittest.TestCase):
         ):
             self.assertTrue(client.wait_ready("gemma4:12b", timeout_seconds=3))
         self.assertEqual(sleep.call_count, 2)
+
+    def test_model_switch_waits_for_delayed_unload_before_loading_target(self):
+        client = OllamaHTTP()
+        old = "nemotron3:33b"
+        target = "qwen3.8:ad-iq2-xs"
+        states = iter((
+            {"models": [{"name": old}]},
+            {"models": [{"name": old}]},
+            {"models": []},
+            {"models": [{"name": target}]},
+        ))
+        calls = []
+        client.ps = lambda: (calls.append("ps"), next(states))[1]
+        client.unload = lambda model, timeout_seconds=None: calls.append(
+            ("unload", model, timeout_seconds)
+        )
+        client._request = lambda path, body, timeout_seconds=None: calls.append(
+            ("load", path, body.copy(), timeout_seconds)
+        ) or {"done": True}
+        with patch("broker.adapters.time.sleep"):
+            self.assertTrue(client.ensure_model_ready(
+                target, keep_alive="1800s", timeout_seconds=300, poll_seconds=0,
+            ))
+        unload_index = next(i for i, call in enumerate(calls) if isinstance(call, tuple) and call[0] == "unload")
+        load_index = next(i for i, call in enumerate(calls) if isinstance(call, tuple) and call[0] == "load")
+        self.assertGreater(load_index, unload_index)
+        self.assertGreaterEqual(calls[:load_index].count("ps"), 3)
+        self.assertEqual(calls[load_index][2], {"model": target, "keep_alive": "1800s"})
+
+    def test_dispatch_uses_profile_bounded_exclusive_model_switch(self):
+        class ExclusiveSwitchOllama(FakeOllama):
+            def ensure_model_ready(self, model, *, keep_alive, timeout_seconds):
+                self.calls.append(("ensure_model_ready", model, keep_alive, timeout_seconds))
+                self.loaded[:] = [model]
+                return True
+
+        self.calls = []
+        self.tmp = tempfile.NamedTemporaryFile()
+        self.addCleanup(self.tmp.close)
+        self.ol = ExclusiveSwitchOllama(self.calls, ["nemotron3:33b"])
+        broker = Broker(self.tmp.name, self.ol, FakeWol(self.calls))
+        job = broker.submit(
+            "syncopia-memory-qwen38", "chat",
+            {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+             "tools": [], "stream": False, "think": "low"},
+            source="syncopia-telegram-memory",
+        )
+        broker.dispatch_once()
+        self.assertEqual(broker.status(job["id"])["state"], "completed")
+        self.assertIn(
+            ("ensure_model_ready", "qwen3.8:ad-iq2-xs", "1800s", 300),
+            self.calls,
+        )
+        self.assertNotIn(("unload", "nemotron3:33b"), self.calls)
     def test_global_fifo_without_policy(self):
         b=self.make(["nemotron3:33b"], clock=iter(range(1_000)).__next__)
         cron=b.submit("cron", "generate", {"prompt":"cron"})["id"]
@@ -109,6 +190,52 @@ class BrokerTests(unittest.TestCase):
             b.submit("shutterstock-canary", "generate", {
                 "prompt": "photo", "images": ["aGVsbG8="], "format": {},
             }, source="shutterstock")
+
+    def test_uncensored_eval_profiles_are_source_scoped_text_only_and_128k_bounded(self):
+        cases = {
+            "uncensored-eval-rvn-iq2m": "qwen3.8:unc-rvn-iq2m",
+            "uncensored-eval-rvn-iq2s": "qwen3.8:unc-rvn-iq2s",
+            "uncensored-eval-rvn-iq2xs": "qwen3.8:unc-rvn-iq2xs",
+            "uncensored-eval-rvn-iq2xxs": "qwen3.8:unc-rvn-iq2xxs",
+            "uncensored-eval-huihui-q2kxl": "qwen3.8:unc-huihui-q2kxl",
+            "uncensored-eval-unleashed-q2kxl": "qwen3.8:unc-unleashed-q2kxl",
+            "uncensored-eval-hauhau-iq2m": "qwen3.8:unc-hauhau-iq2m",
+        }
+        for profile, model in cases.items():
+            with self.subTest(profile=profile):
+                broker = self.make([model])
+                job = broker.submit(
+                    profile, "generate", {"prompt": "compare", "options": {"num_ctx": 999_999}},
+                    source="uncensored-eval",
+                )
+                self.assertEqual(job["source"], "uncensored-eval")
+                self.assertTrue(broker.dispatch_once(frozenset({"uncensored-eval"})))
+                request = next(
+                    call[2] for call in self.ol.calls
+                    if isinstance(call, tuple) and call[0] == "run" and call[2].get("prompt") == "compare"
+                )
+                self.assertEqual(request["model"], model)
+                self.assertEqual(request["options"], {"num_ctx": 131_072, "num_predict": 8_192})
+                self.assertEqual(request["_broker_timeout_seconds"], 7_200)
+
+        broker = self.make([cases["uncensored-eval-rvn-iq2s"]])
+        job = broker.submit(
+            "uncensored-eval-rvn-iq2s", "generate", {"prompt": "normal"},
+            source="uncensored-eval",
+        )
+        broker.dispatch_once(frozenset({"uncensored-eval"}))
+        request = next(
+            call[2] for call in self.ol.calls
+            if isinstance(call, tuple) and call[0] == "run" and call[2].get("prompt") == "normal"
+        )
+        self.assertEqual(request["options"], {"num_ctx": 65_536, "num_predict": 8_192})
+        self.assertEqual(broker.status(job["id"])["state"], "completed")
+        with self.assertRaisesRegex(ValueError, "source uncensored-eval"):
+            broker.submit("uncensored-eval-rvn-iq2s", "generate", {"prompt": "wrong"}, source="olya-decision")
+        with self.assertRaisesRegex(ValueError, "text-only"):
+            broker.submit("uncensored-eval-rvn-iq2s", "generate", {"prompt": "media", "images": ["aGVsbG8="]}, source="uncensored-eval")
+        with self.assertRaisesRegex(ValueError, "MTP/draft"):
+            broker.submit("uncensored-eval-rvn-iq2s", "generate", {"prompt": "draft", "options": {"num_draft": 4}}, source="uncensored-eval")
 
     def test_dispatch_allowlist_leaves_non_pilot_work_queued(self):
         b=self.make(["nemotron3:33b"])
@@ -415,12 +542,21 @@ class SourcePolicyTests(unittest.TestCase):
         from pathlib import Path
         from broker.service import SourcePolicy
         policy_path = Path(__file__).resolve().parents[1] / "config" / "sources.production.json"
-        self.assertEqual(SourcePolicy(policy_path).snapshot()["sources"], {
-            "shutterstock-video": {"enabled": True, "weight": 3.0},
-            "olya-vision": {"enabled": True, "weight": 8.0},
-            "olya-decision": {"enabled": True, "weight": 6.0},
-            "syncopia-telegram-memory": {"enabled": True, "weight": 4.0},
-        })
+        sources = SourcePolicy(policy_path).snapshot()["sources"]
+        self.assertEqual(
+            {name: entry["weight"] for name, entry in sources.items()},
+            {"shutterstock-video": 3.0, "olya-vision": 8.0,
+             "olya-decision": 6.0, "syncopia-telegram-memory": 4.0},
+        )
+        for name, entry in sources.items():
+            with self.subTest(source=name):
+                self.assertTrue(entry["enabled"])
+                self.assertTrue(entry["admission_allowed"])
+                self.assertTrue(entry["producer_storage_enabled"])
+                self.assertFalse(entry["ack_required"])
+                self.assertFalse(entry["compaction_enabled"])
+                self.assertTrue(entry["legacy_result_fallback"])
+        self.assertEqual(sources["syncopia-telegram-memory"]["producer_storage_mode"], "hybrid")
 
 class WeightedDispatchTests(unittest.TestCase):
     def make(self, loaded=None):
@@ -751,6 +887,66 @@ class SyncopiaMemoryEndpointTests(unittest.TestCase):
         ):
             with self.subTest(message=message), self.assertRaisesRegex(CompatibilityError, message):
                 validate_syncopia_memory_payload(invalid)
+
+    def test_freeform_dispatch_preserves_text_think_and_idempotency(self):
+        from broker.compat import submit_syncopia_memory
+        broker = self.make(["qwen3.8:ad-iq2-xs"])
+        request = self.request(think="low", options={"num_ctx": 999999})
+        del request["format"], request["response_format"]
+        request["messages"][1]["content"] = "  Русский текст\n" * 2000 + "КОНЕЦ  "
+        original = json.loads(json.dumps(request))
+        job = submit_syncopia_memory(broker, request)
+        self.assertEqual(submit_syncopia_memory(broker, request)["id"], job["id"])
+        self.assertTrue(broker.dispatch_once(frozenset({"syncopia-telegram-memory"})))
+        self.assertEqual(submit_syncopia_memory(broker, request)["id"], job["id"])
+        self.assertFalse(broker.dispatch_once(frozenset({"syncopia-telegram-memory"})))
+        dispatched = [c[2] for c in self.calls if isinstance(c, tuple) and c[:2] == ("run", "chat")]
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["think"], "low")
+        self.assertEqual(dispatched[0]["messages"], original["messages"])
+        self.assertEqual(dispatched[0]["model"], "qwen3.8:ad-iq2-xs")
+        self.assertNotIn("format", dispatched[0])
+        self.assertNotIn("response_format", dispatched[0])
+        self.assertEqual(dispatched[0]["options"], {
+            "temperature": 0, "num_ctx": 65536, "num_predict": 8192,
+        })
+        self.assertEqual(request, original)
+
+    def test_schema_mode_keeps_legacy_normalization(self):
+        from broker.compat import validate_syncopia_memory_payload
+        for think in (None, False, True, "low", "high"):
+            for response_format in (None, {"type": "json_object"}):
+                with self.subTest(think=think, response_format=response_format):
+                    request = self.request(think=think, response_format=response_format)
+                    payload = validate_syncopia_memory_payload(request)
+                    self.assertIs(payload["think"], False)
+                    self.assertEqual(payload["format"], request["format"])
+        request = self.request()
+        del request["response_format"]
+        self.assertIs(validate_syncopia_memory_payload(request)["think"], False)
+
+    def test_freeform_invalid_modes_and_shared_limits_fail_closed(self):
+        from broker.compat import CompatibilityError, validate_syncopia_memory_payload
+        freeform = self.request(think="low")
+        del freeform["format"], freeform["response_format"]
+        invalid_overrides = [
+            {"think": value} for value in (None, False, True, "", "medium", "high", [], {})
+        ] + [
+            {"format": None}, {"format": "json"}, {"format": []},
+            {"response_format": None}, {"response_format": {"type": "json_object"}},
+            {"response_format": {"type": "text"}}, {"stream": True},
+            {"tools": [{"type": "function"}]}, {"images": ["synthetic"]},
+            {"model": "other"},
+            {"messages": [{"role": "user", "content": "missing system"}]},
+            {"messages": [{"role": "system", "content": "s"},
+                          {"role": "user", "content": "x" * 196608}]},
+        ]
+        for overrides in invalid_overrides:
+            with self.subTest(fields=list(overrides)), self.assertRaises(CompatibilityError):
+                validate_syncopia_memory_payload({**freeform, **overrides})
+        del freeform["think"]
+        with self.assertRaises(CompatibilityError):
+            validate_syncopia_memory_payload(freeform)
 
     def test_synchronous_endpoint_returns_broker_identity(self):
         broker = self.make(["qwen3.8:ad-iq2-xs"])
