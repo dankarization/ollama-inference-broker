@@ -23,7 +23,11 @@ class LocalConfigTests(unittest.TestCase):
 
     def test_file_is_read_and_environment_overrides_broker_values(self):
         self.assertEqual(local_config.load_local_config(self.path), self.values)
-        with patch.dict(os.environ, {}, clear=True):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(local_config, "DEFAULT_LOCAL_CONFIG_PATH", self.path),
+        ):
+            self.assertEqual(local_config.load_local_config(), self.values)
             self.assertEqual(local_config.ollama_url(self.values), self.values["ollama_url"])
             self.assertEqual(local_config.mainpc_mac(self.values), self.values["mainpc_mac"])
         with patch.dict(os.environ, {
@@ -45,7 +49,7 @@ class LocalConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "local executor config"):
                     local_config.load_local_config(self.path)
             for url in ("http://127.0.0.1:bad", "file:///tmp/x", "http://user@host:11434"):
-                with self.subTest(url=url), self.assertRaisesRegex(ValueError, "HTTP\(S\) origin"):
+                with self.subTest(url=url), self.assertRaisesRegex(ValueError, r"HTTP\(S\) origin"):
                     local_config.ollama_url({"ollama_url": url})
             with self.assertRaisesRegex(ValueError, "six colon-separated"):
                 local_config.mainpc_mac({"mainpc_mac": "invalid"})
@@ -53,7 +57,7 @@ class LocalConfigTests(unittest.TestCase):
     def test_broker_startup_uses_file_without_inline_executor_values(self):
         with (
             patch.dict(os.environ, {"BROKER_DISPATCH_ENABLED": "false"}, clear=True),
-            patch.object(local_config, "LOCAL_CONFIG_PATH", self.path),
+            patch.dict(os.environ, {"BROKER_LOCAL_CONFIG": str(self.path)}, clear=False),
             patch.object(app, "Broker"),
             patch.object(app, "OllamaHTTP") as ollama,
             patch.object(app, "WakeOnLan") as wol,
@@ -69,7 +73,7 @@ class LocalConfigTests(unittest.TestCase):
         urls = []
         with (
             patch.dict(os.environ, {}, clear=True),
-            patch.object(local_config, "LOCAL_CONFIG_PATH", self.path),
+            patch.dict(os.environ, {"BROKER_LOCAL_CONFIG": str(self.path)}, clear=False),
         ):
             health = status_reporter.health_snapshot(
                 service_probe=lambda _: True,
@@ -79,7 +83,7 @@ class LocalConfigTests(unittest.TestCase):
         self.assertEqual(urls[-1], self.values["ollama_url"] + "/api/ps")
         with (
             patch.dict(os.environ, {"BROKER_OLLAMA_URL": "http://other.test:11434"}, clear=True),
-            patch.object(local_config, "LOCAL_CONFIG_PATH", self.path),
+            patch.dict(os.environ, {"BROKER_LOCAL_CONFIG": str(self.path)}, clear=False),
         ):
             urls.clear()
             status_reporter.health_snapshot(

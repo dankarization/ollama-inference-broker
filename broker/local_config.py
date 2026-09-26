@@ -7,13 +7,13 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
-LOCAL_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "local.json"
+DEFAULT_LOCAL_CONFIG_PATH = Path.home() / ".config" / "ollama-inference-broker" / "local.json"
 _KEYS = {"ollama_url", "mainpc_mac"}
 
 
 def load_local_config(path: Path | None = None) -> dict[str, str]:
     """Read an optional untracked config; reject malformed or unexpected fields."""
-    path = path or LOCAL_CONFIG_PATH
+    path = path or Path(os.environ.get("BROKER_LOCAL_CONFIG", DEFAULT_LOCAL_CONFIG_PATH)).expanduser()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -30,7 +30,7 @@ def load_local_config(path: Path | None = None) -> dict[str, str]:
 def executor_setting(config: dict[str, str], key: str, env_name: str) -> str:
     value = os.environ.get(env_name) or config.get(key)
     if not value or not value.strip():
-        raise ValueError(f"Set {env_name} or {key} in config/local.json")
+        raise ValueError(f"Set {env_name} or {key} in local.json")
     return value.strip()
 
 
