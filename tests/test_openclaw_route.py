@@ -347,7 +347,8 @@ class OpenClawRouteTests(unittest.TestCase):
                     "UPDATE jobs SET external_id='legacy-duplicate' WHERE id=?",
                     (job["id"],),
                 )
-        reopened = Broker(self.broker.database, FakeOllama(), FakeWol())
+        executor = FakeOllama()
+        reopened = Broker(self.broker.database, executor, FakeWol())
         try:
             self.assertEqual(reopened.db.execute(
                 "SELECT count(*) FROM jobs WHERE source='openclaw' "
@@ -356,6 +357,9 @@ class OpenClawRouteTests(unittest.TestCase):
             self.assertEqual(
                 len(reopened._candidates(frozenset({"uncensored-eval"}))), 1,
             )
+            with patch.object(executor, "is_ready", return_value=True):
+                self.assertTrue(reopened.dispatch_once(frozenset({"uncensored-eval"})))
+            self.assertEqual(executor.requests[-1][1]["options"]["num_ctx"], 65_536)
         finally:
             reopened.db.close()
 

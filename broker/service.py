@@ -1806,7 +1806,8 @@ class Broker:
             raise RuntimeError("target model did not become ready")
         payload = json.loads(row["payload"])
         options = dict(payload.get("options", {}))
-        options["num_ctx"] = min(int(options.get("num_ctx", profile.max_context)), profile.max_context)
+        default_context = profile.default_context or profile.max_context
+        options["num_ctx"] = min(int(options.get("num_ctx", default_context)), profile.max_context)
         options["num_predict"] = min(int(options.get("num_predict", profile.max_output)), profile.max_output)
         request = {k: v for k, v in payload.items() if k not in {"model", "keep_alive"}}
         request.update({"model": profile.model, "stream": False, "options": options,
