@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import stat
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -15,9 +16,18 @@ def load_local_config(path: Path | None = None) -> dict[str, str]:
     """Read an optional untracked config; reject malformed or unexpected fields."""
     path = path or Path(os.environ.get("BROKER_LOCAL_CONFIG", DEFAULT_LOCAL_CONFIG_PATH)).expanduser()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
         return {}
+    except OSError as exc:
+        raise ValueError(f"Cannot read local executor config at {path}") from exc
+    try:
+        with os.fdopen(fd, encoding="utf-8") as file:
+            info = os.fstat(file.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077):
+                raise ValueError(f"Local executor config at {path} must be owner-only")
+            data = json.load(file)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"Cannot read local executor config at {path}") from exc
     if not isinstance(data, dict) or set(data) - _KEYS or any(

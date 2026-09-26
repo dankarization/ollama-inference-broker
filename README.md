@@ -46,6 +46,25 @@ curl --fail http://127.0.0.1:8088/healthz
 
 The API binds to `127.0.0.1:8088` by default. Keep it on a trusted local interface: legacy job APIs are not a public authentication boundary. The supplied systemd units are templates: create owner-only `~/.config/ollama-inference-broker/broker.env` (and `report.env` if using the report timer) for other deployment settings before installing them. For deployment, place the same JSON at `~/.config/ollama-inference-broker/local.json` with owner-only permissions: both broker and reporter read this stable path by default, independently of their release directories. `BROKER_LOCAL_CONFIG` selects another file for development. `OLLAMA_URL` and `MAINPC_MAC` override its broker values, and `BROKER_OLLAMA_URL` overrides its reporter URL. Set `WOL_BROADCAST` separately if needed. Dispatch is disabled in the broker template until explicitly enabled.
 
+### Installing the systemd templates
+
+Both units set `WorkingDirectory=%h/.local/share/ollama-inference-broker`. Put a checkout at **that exact path** before enabling them; copying only the unit files will fail with systemd `CHDIR`. For example, on a fresh host:
+
+```bash
+mkdir -p "$HOME/.local/share" "$HOME/.config/ollama-inference-broker" "$HOME/.config/systemd/user"
+git clone https://github.com/dankarization/ollama-inference-broker.git "$HOME/.local/share/ollama-inference-broker"
+cd "$HOME/.local/share/ollama-inference-broker"
+cp config/local.example.json "$HOME/.config/ollama-inference-broker/local.json"
+# Edit the executor URL and MAC in local.json, then restrict it to the owner.
+chmod 600 "$HOME/.config/ollama-inference-broker/local.json"
+touch "$HOME/.config/ollama-inference-broker/broker.env"
+chmod 600 "$HOME/.config/ollama-inference-broker/broker.env"
+cp systemd/ollama-inference-broker*.service systemd/ollama-inference-broker-report.timer "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+```
+
+The report timer is optional. Before enabling it, copy `config/report.env.example` to `~/.config/ollama-inference-broker/report.env`, replace the chat and thread placeholders, and `chmod 600` the file. `OPENCLAW_CONFIG_PATH` defaults to `~/.openclaw/openclaw.json`; it must point to an existing OpenClaw JSON with `channels.telegram.accounts.<account>.botToken` (or `token`). `BROKER_REPORT_TELEGRAM_ACCOUNT` defaults to `default`. The example uses the shared `local.json` for the Ollama health URL; `BROKER_OLLAMA_URL` is an optional reporter-only override. Never put the bot token in `report.env` or Git.
+
 ### Key contracts
 
 - The opt-in OpenClaw native chat route waits on the same durable queue and returns an Ollama-compatible response; it does not change legacy admission-only endpoints. See [OpenClaw route](docs/OPENCLAW_ROUTE.md) for its wire contract and rollout boundary.
@@ -108,6 +127,12 @@ curl --fail http://127.0.0.1:8088/healthz
 ```
 
 По умолчанию API слушает `127.0.0.1:8088`. Не открывайте legacy API недоверенной сети: он не является публичной границей аутентификации. Приложенные systemd units — шаблоны: до установки создайте доступный только владельцу `~/.config/ollama-inference-broker/broker.env` (и `report.env` для таймера отчёта) для остальных настроек развёртывания. Для развёртывания поместите тот же JSON в `~/.config/ollama-inference-broker/local.json` с правами только для владельца: брокер и отчёт читают этот стабильный путь независимо от каталогов релизов. `BROKER_LOCAL_CONFIG` позволяет указать другой файл при разработке. `OLLAMA_URL` и `MAINPC_MAC` переопределяют значения брокера, `BROKER_OLLAMA_URL` — адрес для отчёта. При необходимости задайте `WOL_BROADCAST` отдельно. В шаблоне брокера dispatch отключён до явного включения.
+
+### Установка шаблонов systemd
+
+Оба unit-файла задают `WorkingDirectory=%h/.local/share/ollama-inference-broker`. До включения unit поместите checkout **именно по этому пути**: установка только unit-файлов завершится ошибкой systemd `CHDIR`. На новом хосте выполните команды из раздела [Installing the systemd templates](#installing-the-systemd-templates): они создают checkout, локальный JSON, обязательный `broker.env` и устанавливают unit-файлы, но не запускают dispatch.
+
+Таймер отчёта необязателен. До его включения скопируйте `config/report.env.example` в `~/.config/ollama-inference-broker/report.env`, замените chat/thread placeholders и установите права `0600`. `OPENCLAW_CONFIG_PATH` по умолчанию равен `~/.openclaw/openclaw.json` и должен указывать на существующий OpenClaw JSON с `channels.telegram.accounts.<account>.botToken` (либо `token`). `BROKER_REPORT_TELEGRAM_ACCOUNT` по умолчанию — `default`. Адрес Ollama для проверки здоровья берётся из общего `local.json`; `BROKER_OLLAMA_URL` позволяет переопределить его только для отчёта. Не записывайте токен бота в `report.env` или Git.
 
 ### Основные контракты
 
