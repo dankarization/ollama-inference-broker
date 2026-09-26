@@ -117,6 +117,9 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     self._json(429, {"error": str(error)})
                     return
                 streaming = request.get("stream", True)
+                if job["state"] == "completed" and "result" not in job:
+                    self._json(410, {"error": "broker result has expired", "job_id": job["id"]})
+                    return
                 deadline = time.monotonic() + MAX_WAIT_SECONDS
                 try:
                     if streaming:
@@ -142,14 +145,24 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                             if key is None:
                                 broker.cancel(job["id"])
                             return
-                        job = broker.wait_for_terminal(job["id"], min(HEARTBEAT_SECONDS, remaining))
+                        job = broker.wait_for_terminal(
+                            job["id"], min(HEARTBEAT_SECONDS, remaining),
+                            hydrate_pending=False,
+                        )
                         if job is None:
                             raise RuntimeError("submitted OpenClaw job disappeared")
                         if streaming and job["state"] not in {"completed", "failed", "cancelled"}:
                             self.wfile.write(heartbeat())
                             self.wfile.flush()
                     if job["state"] == "completed":
-                        if streaming:
+                        if "result" not in job:
+                            if streaming:
+                                self.wfile.write(error_frame(410, "broker result has expired"))
+                                self.wfile.flush()
+                            else:
+                                self._json(410, {"error": "broker result has expired",
+                                                 "job_id": job["id"]})
+                        elif streaming:
                             self.wfile.write(terminal_frame(job["result"]))
                             self.wfile.flush()
                         else:
@@ -241,6 +254,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 try:
                     result=broker.retry(job_id); self._json(200 if result else 404, result or {"error":"not found"})
                 except ValueError as e: self._json(409, {"error":str(e)})
+                except SourceQueueFull as e: self._json(429, {"error":str(e)})
             elif path.startswith("/v1/sources/") and path.endswith("/weight"):
                 source = unquote(path[len("/v1/sources/"):-len("/weight")]).strip("/")
                 try:
@@ -327,6 +341,8 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     self._storage_authorized()
                 except (SourcePolicyError, ValueError) as error:
                     self._json(400, {"error": str(error)})
+                except SourceQueueFull as error:
+                    self._json(429, {"error": str(error)})
             elif path in {"/api/chat", "/api/generate"}:
                 try:
                     job=submit_compatibility(broker, path.rsplit("/", 1)[-1], body)

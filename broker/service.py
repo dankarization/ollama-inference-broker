@@ -453,11 +453,9 @@ class Broker:
                 "ON jobs(source,external_id) WHERE source='syncopia-telegram-memory' "
                 "AND external_id IS NOT NULL"
             )
-            self.db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS jobs_openclaw_external "
-                "ON jobs(source,external_id) WHERE source='openclaw' "
-                "AND external_id IS NOT NULL"
-            )
+            # Existing ordinary source='openclaw' rows may reuse external_id.
+            # The broker lock serializes new idempotent admissions; do not impose
+            # a retroactive uniqueness constraint on durable legacy history.
 
     def _retire_priority_column(self) -> None:
         """Remove a legacy priority column only when new inserts need it gone.
@@ -578,6 +576,15 @@ class Broker:
             if expired:
                 self._refresh_health_cache_locked()
             self.completed.notify_all()
+
+    def _ensure_openclaw_capacity_locked(self, additional: int = 1) -> None:
+        outstanding = self.db.execute(
+            "SELECT count(*) FROM jobs WHERE source='openclaw' "
+            "AND state IN ('queued','running','cancel_requested')"
+        ).fetchone()[0]
+        if outstanding + additional > MAX_OUTSTANDING:
+            raise SourceQueueFull("openclaw has 8 outstanding jobs")
+
     def submit(self, profile: str, kind: str, payload: dict, source: str | None = None,
                source_item_id: str | None = None,
                external_id: str | None = None,
@@ -738,11 +745,8 @@ class Broker:
                 # Rejection itself is durable observability, despite aborting admission.
                 self.db.commit()
                 raise SourceAdmissionBlocked(source)
-            if source == "openclaw" and self.db.execute(
-                "SELECT count(*) FROM jobs WHERE source='openclaw' "
-                "AND state IN ('queued','running','cancel_requested')"
-            ).fetchone()[0] >= MAX_OUTSTANDING:
-                raise SourceQueueFull("openclaw has 8 outstanding jobs")
+            if source == "openclaw":
+                self._ensure_openclaw_capacity_locked()
             self.db.execute(
                 "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
                 "queued_at,source_item_id,external_id,input_storage_mode,input_ref,input_hash,"
@@ -836,6 +840,8 @@ class Broker:
                 raise StorageAuthorizationRequired
             if any(row["compaction_state"] != "full" for row in rows):
                 raise ValueError("one or more failed jobs have expired retry bodies")
+            if source == "openclaw" and rows:
+                self._ensure_openclaw_capacity_locked(len(rows))
             for row in rows:
                 attempt_no = row["attempt_count"] or None
                 self._audit(
@@ -991,6 +997,8 @@ class Broker:
                 raise ValueError("only failed or cancelled jobs may be retried")
             if row["compaction_state"] != "full":
                 raise ValueError("job retry retention has expired")
+            if row["source"] == "openclaw":
+                self._ensure_openclaw_capacity_locked()
             now = self.clock()
             self._audit(
                 "job.retry_requested", job_id=job_id, source=row["source"],
@@ -1843,12 +1851,23 @@ class Broker:
             self._refresh_health_cache_locked()
             self.completed.notify_all()
 
-    def wait_for_terminal(self, job_id: str, timeout_seconds: float) -> dict | None:
-        """Wait for a persisted terminal state; executor dispatch remains external."""
+    def wait_for_terminal(
+        self, job_id: str, timeout_seconds: float, *, hydrate_pending: bool = True,
+    ) -> dict | None:
+        """Wait for a persisted terminal state; optionally poll state without payload."""
         deadline = time.monotonic() + timeout_seconds
         with self.completed:
             while True:
-                job = self.status(job_id)
+                if hydrate_pending:
+                    job = self.status(job_id)
+                else:
+                    row = self.db.execute(
+                        "SELECT state FROM jobs WHERE id=?", (job_id,)
+                    ).fetchone()
+                    state = row["state"] if row else None
+                    job = self.status(job_id) if state is None or state in {
+                        "completed", "failed", "cancelled"
+                    } else {"id": job_id, "state": state}
                 if job is None or job["state"] in {"completed", "failed", "cancelled"}:
                     return job
                 remaining = deadline - time.monotonic()

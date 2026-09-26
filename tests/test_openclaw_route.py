@@ -12,7 +12,7 @@ from urllib.request import Request, ProxyHandler, build_opener
 from broker.http import serve
 from broker.openclaw import MODEL, normalize_request
 from broker.profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES
-from broker.service import Broker
+from broker.service import Broker, SourceQueueFull
 
 
 class FakeWol:
@@ -257,6 +257,107 @@ class OpenClawRouteTests(unittest.TestCase):
         self.assertEqual(job["state"], "queued")
         self.assertEqual(self.broker.submit("openclaw", "chat", normalize_request(self.sample()),
                                             external_id="retry-turn")["id"], job["id"])
+
+    def test_rejects_numeric_thinking_and_fractional_integer_options(self):
+        for change in (
+            *({"think": value} for value in (0, 1, 0.0, 1.0)),
+            *({"options": {field: 1.5}} for field in ("top_k", "repeat_last_n", "seed")),
+        ):
+            with self.subTest(change=change), self.assertRaises(HTTPError) as caught:
+                self.opener.open(self.request({**self.sample(), **change}))
+            self.assertEqual(caught.exception.code, 400)
+        self.assertEqual(self.broker.health()["queue_depth"], 0)
+
+    def test_expired_reattached_result_returns_410_in_both_modes(self):
+        body = self.sample()
+        payload = normalize_request(body)
+        job = self.broker.submit("openclaw", "chat", payload, external_id="expired-turn")
+        self.broker.dispatch_once(frozenset({"openclaw"}))
+        with self.broker.db:
+            self.broker.db.execute(
+                "UPDATE jobs SET result_json=NULL,compaction_state='metadata_only' WHERE id=?",
+                (job["id"],),
+            )
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming), self.assertRaises(HTTPError) as caught:
+                self.opener.open(self.request(
+                    {**body, "stream": streaming}, {"Idempotency-Key": "expired-turn"},
+                ))
+            self.assertEqual(caught.exception.code, 410)
+            self.assertIn("expired", caught.exception.read().decode())
+
+    def test_openclaw_retries_respect_outstanding_limit_atomically(self):
+        payload = normalize_request(self.sample())
+        cancelled = self.broker.submit("openclaw", "chat", payload)
+        self.broker.cancel(cancelled["id"])
+        failed = [self.broker.submit("openclaw", "chat", payload) for _ in range(2)]
+        with self.broker.db:
+            for job in failed:
+                self.broker.db.execute(
+                    "UPDATE jobs SET state='failed' WHERE id=?", (job["id"],),
+                )
+        active = [self.broker.submit("openclaw", "chat", payload) for _ in range(8)]
+        with self.assertRaises(SourceQueueFull):
+            self.broker.retry(cancelled["id"])
+        retry_request = Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/jobs/{cancelled['id']}/retry",
+            data=b"{}", headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with self.assertRaises(HTTPError) as caught:
+            self.opener.open(retry_request)
+        self.assertEqual(caught.exception.code, 429)
+        with self.assertRaises(SourceQueueFull):
+            self.broker.bulk_retry_failed("openclaw")
+        self.assertEqual(
+            [self.broker.status(job["id"])["state"] for job in failed],
+            ["failed", "failed"],
+        )
+        self.broker.cancel(active[-1]["id"])
+        with self.assertRaises(SourceQueueFull):
+            self.broker.bulk_retry_failed("openclaw")
+        self.assertEqual(
+            [self.broker.status(job["id"])["state"] for job in failed],
+            ["failed", "failed"],
+        )
+
+    def test_poll_pending_openclaw_job_does_not_hydrate_payload(self):
+        job = self.broker.submit("openclaw", "chat", normalize_request(self.sample()))
+        with patch.object(self.broker, "status", side_effect=AssertionError("hydrated")):
+            pending = self.broker.wait_for_terminal(
+                job["id"], 0, hydrate_pending=False,
+            )
+        self.assertEqual(pending, {"id": job["id"], "state": "queued"})
+        self.broker.dispatch_once(frozenset({"openclaw"}))
+        terminal = self.broker.wait_for_terminal(job["id"], 0, hydrate_pending=False)
+        self.assertEqual(terminal["result"]["done"], True)
+
+    def test_legacy_profiles_and_duplicate_openclaw_keys_survive_restart(self):
+        legacy = self.broker.submit(
+            "uncensored-eval-rvn-iq2m", "chat",
+            {"messages": [{"role": "user", "content": "legacy"}]},
+            source="uncensored-eval",
+        )
+        candidates = self.broker._candidates(frozenset({"uncensored-eval"}))
+        self.assertEqual([row["id"] for row in candidates], [legacy["id"]])
+        payload = normalize_request(self.sample())
+        old = [self.broker.submit("openclaw", "chat", payload) for _ in range(2)]
+        with self.broker.db:
+            for job in old:
+                self.broker.db.execute(
+                    "UPDATE jobs SET external_id='legacy-duplicate' WHERE id=?",
+                    (job["id"],),
+                )
+        reopened = Broker(self.broker.database, FakeOllama(), FakeWol())
+        try:
+            self.assertEqual(reopened.db.execute(
+                "SELECT count(*) FROM jobs WHERE source='openclaw' "
+                "AND external_id='legacy-duplicate'"
+            ).fetchone()[0], 2)
+            self.assertEqual(
+                len(reopened._candidates(frozenset({"uncensored-eval"}))), 1,
+            )
+        finally:
+            reopened.db.close()
 
     def test_disconnect_cancels_unkeyed_and_timeout_returns_error(self):
         with patch("broker.http.HEARTBEAT_SECONDS", .02):

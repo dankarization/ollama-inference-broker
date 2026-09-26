@@ -112,13 +112,19 @@ def normalize_request(request: Any) -> dict:
                 not isinstance(item, str) or len(item) > 256 for item in value
             ):
                 raise OpenClawRequestError("stop must contain at most 32 bounded strings")
+        elif field in {"top_k", "repeat_last_n", "seed"}:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise OpenClawRequestError(f"{field} must be an integer")
         elif (isinstance(value, bool) or not isinstance(value, (int, float))
               or not math.isfinite(value)):
             raise OpenClawRequestError(f"{field} must be finite numeric")
     if request.get("truncate", False) is not False or request.get("shift", False) is not False:
         raise OpenClawRequestError("context truncation and shifting are not allowed")
     think = request.get("think")
-    if think is not None and think not in (True, False, "low", "medium", "high", "max"):
+    if think is not None and not (
+        isinstance(think, bool)
+        or isinstance(think, str) and think in {"low", "medium", "high", "max"}
+    ):
         raise OpenClawRequestError("unsupported thinking level")
     format_value = request.get("format")
     if format_value is not None and format_value != "json" and not isinstance(format_value, dict):

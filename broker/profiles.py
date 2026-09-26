@@ -14,6 +14,8 @@ class Profile:
     request_timeout_seconds: int = 300
     max_images: int = 0
     max_schema_bytes: int = 0
+    # Retained for durable jobs admitted with legacy evaluation profiles.
+    default_context: int | None = None
 
 
 # This is deliberately server-owned. Callers can select a profile, never a model
@@ -76,6 +78,37 @@ PROFILES = {
         "syncopia-memory-qwen38", "qwen3.8:ad-iq2-xs", 65_536, 8_192, 1_800,
         max_concurrency=1, request_timeout_seconds=900,
         max_schema_bytes=65_536,
+    ),
+    # Seven isolated, text-only comparison lanes.  They deliberately share one
+    # source so their evaluations cannot borrow any production caller's share.
+    # 64k is the normal comparison default; 128k is an explicit stress ceiling.
+    "uncensored-eval-rvn-iq2m": Profile(
+        "uncensored-eval-rvn-iq2m", "qwen3.8:unc-rvn-iq2m", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
+    ),
+    "uncensored-eval-rvn-iq2s": Profile(
+        "uncensored-eval-rvn-iq2s", "qwen3.8:unc-rvn-iq2s", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
+    ),
+    "uncensored-eval-rvn-iq2xs": Profile(
+        "uncensored-eval-rvn-iq2xs", "qwen3.8:unc-rvn-iq2xs", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
+    ),
+    "uncensored-eval-rvn-iq2xxs": Profile(
+        "uncensored-eval-rvn-iq2xxs", "qwen3.8:unc-rvn-iq2xxs", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
+    ),
+    "uncensored-eval-huihui-q2kxl": Profile(
+        "uncensored-eval-huihui-q2kxl", "qwen3.8:unc-huihui-q2kxl", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
+    ),
+    "uncensored-eval-unleashed-q2kxl": Profile(
+        "uncensored-eval-unleashed-q2kxl", "qwen3.8:unc-unleashed-q2kxl", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
+    ),
+    "uncensored-eval-hauhau-iq2m": Profile(
+        "uncensored-eval-hauhau-iq2m", "qwen3.8:unc-hauhau-iq2m", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
     ),
     "batch-video": Profile("batch-video", "nemotron3:33b", 8_192, 512, 120),
     # This is an intentionally separate source from the active Shutterstock
