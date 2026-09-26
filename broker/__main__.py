@@ -102,10 +102,13 @@ def main() -> None:
     broker = Broker(
         os.environ.get("BROKER_DB", "broker.sqlite3"),
         OllamaHTTP(
-            os.environ.get("OLLAMA_URL", "http://192.168.2.5:11434"),
+            os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434"),
             float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "300")),
         ),
-        WakeOnLan(os.environ["MAINPC_MAC"]),
+        WakeOnLan(
+            os.environ["MAINPC_MAC"],
+            os.environ.get("WOL_BROADCAST", "255.255.255.255"),
+        ),
         wal_autocheckpoint_pages=positive_integer(
             os.environ.get("BROKER_WAL_AUTOCHECKPOINT_PAGES"), 4096,
             "BROKER_WAL_AUTOCHECKPOINT_PAGES",

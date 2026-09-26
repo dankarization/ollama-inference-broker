@@ -171,7 +171,7 @@ def health_snapshot(
 ) -> dict[str, bool]:
     """Only deterministic process/HTTP probes; this never requests inference."""
     broker_url = os.environ.get("BROKER_HEALTH_URL", "http://127.0.0.1:8088/healthz")
-    ollama_url = os.environ.get("BROKER_OLLAMA_URL", "http://192.168.2.5:11434").rstrip("/")
+    ollama_url = os.environ.get("BROKER_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
     return {
         "broker_service": service_probe("ollama-inference-broker.service"),
         "broker_http": http_probe(broker_url),

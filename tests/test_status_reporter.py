@@ -258,8 +258,8 @@ class StatusReporterTests(unittest.TestCase):
             }}}}}))
             with patch.dict(os.environ, {
                 "OPENCLAW_CONFIG_PATH": str(config),
-                "BROKER_REPORT_TELEGRAM_TARGET": "5775112073",
-                "BROKER_REPORT_TELEGRAM_THREAD_ID": "471305",
+                "BROKER_REPORT_TELEGRAM_TARGET": "123456",
+                "BROKER_REPORT_TELEGRAM_THREAD_ID": "789",
                 "BROKER_REPORT_TELEGRAM_ACCOUNT": "default",
             }, clear=False):
                 self.assertEqual(deliver_via_telegram_html('<b>x</b><tg-time unix="1" format="">x</tg-time>'), "712")
@@ -267,7 +267,7 @@ class StatusReporterTests(unittest.TestCase):
         self.assertIn("name=\"parse_mode\"", seen["body"])
         self.assertIn("HTML", seen["body"])
         self.assertIn("name=\"message_thread_id\"", seen["body"])
-        self.assertIn("471305", seen["body"])
+        self.assertIn("789", seen["body"])
         self.assertIn('<b>x</b><tg-time unix="1" format="">x</tg-time>', seen["body"])
 
     def test_production_timer_configuration_and_non_llm_path(self):
@@ -275,8 +275,9 @@ class StatusReporterTests(unittest.TestCase):
         service = (root / "systemd/ollama-inference-broker-report.service").read_text()
         timer = (root / "systemd/ollama-inference-broker-report.timer").read_text()
         module = (root / "broker/status_reporter.py").read_text()
-        self.assertIn("BROKER_REPORT_TELEGRAM_TARGET=5775112073", service)
-        self.assertIn("BROKER_REPORT_TELEGRAM_THREAD_ID=471305", service)
+        self.assertIn("EnvironmentFile=%h/.config/ollama-inference-broker/report.env", service)
+        self.assertNotIn("BROKER_REPORT_TELEGRAM_TARGET=", service)
+        self.assertNotIn("BROKER_REPORT_TELEGRAM_THREAD_ID=", service)
         self.assertIn("OnCalendar=*-*-* *:00:30 Asia/Tbilisi", timer)
         self.assertIn('"parse_mode": "HTML"', module)
         self.assertNotIn("OllamaHTTP", module)
