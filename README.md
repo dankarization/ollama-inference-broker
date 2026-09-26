@@ -379,3 +379,47 @@ Broker владеет admission, порядком, residency моделей, req
 cloud routing, task orchestration или бизнес-логику callers.
 
 Подробный поэтапный план — в [ROADMAP.md](ROADMAP.md).
+
+### OpenClaw agentTurn через durable queue (opt-in)
+
+Broker route `POST /openclaw/api/chat` реализует **нативный Ollama chat** для
+выбранных OpenClaw turns. Это отдельный путь: старые `/api/chat` и
+`/api/generate` остаются асинхронными admission-only endpoints с ответом `202`.
+Провайдер OpenClaw должен использовать `api: "ollama"`, `baseUrl` вида
+`http://127.0.0.1:8088/openclaw` и provider-local model ID
+`qwen3.8:ad-iq2-xs` (полный OpenClaw ID при provider key `broker-openclaw` —
+`broker-openclaw/qwen3.8:ad-iq2-xs`). OpenClaw добавляет `/api/chat` к baseUrl;
+модель в wire request обязана совпадать с этим ID.
+
+Профиль/source называются ровно `openclaw`. Профиль закрепляет модель
+`qwen3.8:ad-iq2-xs`, `num_ctx ≤ 131072`, `num_predict ≤ 16384`, keepalive 300 s
+и executor timeout 900 s. Это соответствует выбранной OpenClaw модели
+(131072/16384), в отличие от старого профиля `cron` (8192/1024). Admission
+сохраняет до 512 сообщений и 128 tools; весь JSON request — до 2 MiB, tools —
+до 512 KiB. Эти байтовые ограничения защищают SQLite/HTTP; точный token budget
+остаётся ответственностью OpenClaw/Ollama, поэтому `truncate` и `shift`
+запрещены. Queue admission ограничен восемью незавершёнными jobs и восемью
+одновременными HTTP waiters; сверх лимита — HTTP 429. Запросы проходят обычный
+source scheduler, model switch и durable result storage; route не вызывает
+Ollama напрямую.
+
+`stream=false` возвращает настоящий Ollama JSON после terminal completion.
+`stream=true` возвращает Ollama NDJSON: пустые heartbeat-кадры примерно каждые
+2 s во время queue/model wait и один итоговый `done=true` кадр с text,
+thinking, tool calls и usage. Это корректный поток для OpenClaw agentTurn,
+но **не** progressive token streaming: executor получает целый non-stream
+ответ Ollama до записи durable result. `Idempotency-Key` (опциональный HTTP
+header, не генерируется OpenClaw автоматически) привязывает повтор к тому же
+job и отвергает другое содержимое с HTTP 400. При отключении клиента без ключа
+queued job отменяется, running получает `cancel_requested` и освобождает GPU
+после возврата Ollama; с ключом durable job остаётся доступным для повторного
+ожидания. Время ожидания HTTP — 1800 s, затем HTTP 504 / NDJSON error; для
+keyed request job сохраняется. Для OpenClaw provider timeout нужен >1800 s,
+а timeout выбранного cron agentTurn также должен покрывать очередь и inference.
+
+Перед pilot main/ops отдельно добавляет `openclaw` в **live** source policy с
+нужными `enabled`, `admission_allowed` и weight, обновляет broker release и
+создаёт изолированный cron с этим provider/model. Ни код, ни этот документ не
+меняют live policy или существующие automations. Rollback: убрать только pilot
+cron/model routing, закрыть admission для `openclaw`, дождаться/отменить его
+jobs и вернуть прежний broker release; другие sources и SQLite не удалять.

@@ -23,6 +23,8 @@ from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES,
                      validate_syncopia_memory_payload,
                      validate_uncensored_eval_payload)
 from .profiles import PROFILES
+from .openclaw import (MAX_OUTSTANDING, normalize_request as normalize_openclaw_request,
+                       validate_result as validate_openclaw_result)
 from .policy import (
     RETENTION_DEFAULTS,
     SourcePolicyError,
@@ -69,6 +71,10 @@ class SourceAdmissionBlocked(Exception):
 
 class StorageAuthorizationRequired(PermissionError):
     """A bulk mutation selected at least one producer-storage job."""
+
+
+class SourceQueueFull(Exception):
+    """The bounded OpenClaw lane has no admission slot."""
 
 
 class SourcePolicy:
@@ -448,6 +454,11 @@ class Broker:
                 "ON jobs(source,external_id) WHERE source='syncopia-telegram-memory' "
                 "AND external_id IS NOT NULL"
             )
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS jobs_openclaw_external "
+                "ON jobs(source,external_id) WHERE source='openclaw' "
+                "AND external_id IS NOT NULL"
+            )
 
     def _retire_priority_column(self) -> None:
         """Remove a legacy priority column only when new inserts need it gone.
@@ -577,6 +588,14 @@ class Broker:
         if kind not in {"chat", "generate"}:
             raise ValueError("kind must be chat or generate")
         source = source or profile
+        if source == "openclaw" and profile != "openclaw":
+            raise ValueError("source openclaw requires the OpenClaw profile")
+        if profile == "openclaw" and (source != "openclaw" or kind != "chat"):
+            raise ValueError("OpenClaw profile requires source openclaw and kind chat")
+        if profile == "openclaw":
+            if producer_storage is not None or not isinstance(payload, dict):
+                raise ValueError("OpenClaw requires inline chat payload")
+            payload = normalize_openclaw_request({**payload, "model": PROFILES[profile].model})
         if profile == "shutterstock-canary":
             if source != profile:
                 raise ValueError("shutterstock-canary must use its dedicated source")
@@ -649,7 +668,7 @@ class Broker:
                         (source, external_id),
                     ).fetchone()
                     tombstone_is_idempotent = tombstone is not None and (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory"}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw"}
                         or producer_storage is not None
                         or tombstone["producer_attempt_id"] is not None
                     )
@@ -678,7 +697,7 @@ class Broker:
                         or existing["result_storage_mode"] != "broker_temporary"
                     )
                     if (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory"}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw"}
                         or producer_storage is not None
                         or existing_has_producer_storage
                     ):
@@ -705,6 +724,11 @@ class Broker:
                                 raise ValueError(
                                     "producer storage idempotency conflict for existing correlation"
                                 )
+                        if source == "openclaw" and (
+                            existing["profile"] != profile or existing["kind"] != kind
+                            or existing["input_hash"] != content_evidence(payload)[0]
+                        ):
+                            raise ValueError("idempotency key was used for another request")
                         return self.status(existing["id"])
             storage_fields = self.storage.prepare_admission(source, payload, producer_storage)
             if self.source_policy is not None and not self.source_policy.admission_allowed(source):
@@ -720,6 +744,11 @@ class Broker:
                 # Rejection itself is durable observability, despite aborting admission.
                 self.db.commit()
                 raise SourceAdmissionBlocked(source)
+            if source == "openclaw" and self.db.execute(
+                "SELECT count(*) FROM jobs WHERE source='openclaw' "
+                "AND state IN ('queued','running','cancel_requested')"
+            ).fetchone()[0] >= MAX_OUTSTANDING:
+                raise SourceQueueFull("openclaw has 8 outstanding jobs")
             self.db.execute(
                 "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
                 "queued_at,source_item_id,external_id,input_storage_mode,input_ref,input_hash,"
@@ -1785,6 +1814,8 @@ class Broker:
         result = self.ollama.run(row["kind"], request)
         if not isinstance(result, dict):
             raise RuntimeError("Ollama returned a non-object response")
+        if row["profile"] == "openclaw":
+            validate_openclaw_result(result, profile.model)
         result_json = json.dumps(result)
         with self.lock, self.db:
             state = self.db.execute("SELECT state FROM jobs WHERE id=?", (row["id"],)).fetchone()[0]

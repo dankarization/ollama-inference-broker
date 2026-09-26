@@ -1,6 +1,10 @@
 from __future__ import annotations
 import hmac
 import json
+import select
+import socket
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -10,12 +14,15 @@ from .compat import (CompatibilityError, stream_frames, submit as submit_compati
 from .profiles import PROFILES
 from .dashboard import render as render_dashboard
 from .policy import SourcePolicyError
-from .service import SourceAdmissionBlocked, StorageAuthorizationRequired
+from .service import SourceAdmissionBlocked, SourceQueueFull, StorageAuthorizationRequired
 from .storage import ReceiptConflict, StorageContractError
+from .openclaw import (HEARTBEAT_SECONDS, MAX_OUTSTANDING, MAX_REQUEST_BYTES, MAX_WAIT_SECONDS,
+                       OpenClawRequestError, error_frame, heartbeat, normalize_request, terminal_frame)
 
 
 def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
     broker.use_source_policy(policy)
+    openclaw_slots = threading.BoundedSemaphore(MAX_OUTSTANDING)
     class Handler(BaseHTTPRequestHandler):
         def _json(self, status, value, headers=None):
             encoded=json.dumps(value).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(encoded)))
@@ -61,7 +68,110 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 self.end_headers()
                 return None, headers
             return etag, headers
+        def _peer_closed(self):
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            if not readable:
+                return False
+            try:
+                return self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+            except (BlockingIOError, InterruptedError):
+                return False
+            except OSError:
+                return True
+
+        def _openclaw_chat(self):
+            if not openclaw_slots.acquire(blocking=False):
+                self._json(429, {"error": "openclaw HTTP waiters are full"})
+                return
+            try:
+                try:
+                    size = int(self.headers.get("Content-Length", ""))
+                except ValueError:
+                    self._json(411, {"error": "Content-Length is required"})
+                    return
+                if size <= 0 or size > MAX_REQUEST_BYTES:
+                    self.close_connection = True
+                    self._json(413, {"error": "request exceeds 2 MiB or is empty"})
+                    return
+                try:
+                    self.connection.settimeout(10)
+                    try:
+                        request = json.loads(self.rfile.read(size))
+                    finally:
+                        self.connection.settimeout(None)
+                    payload = normalize_request(request)
+                    key = self.headers.get("Idempotency-Key")
+                    job = broker.submit("openclaw", "chat", payload, source="openclaw",
+                                        external_id=key)
+                except socket.timeout:
+                    self.close_connection = True
+                    self._json(408, {"error": "request body read timed out"})
+                    return
+                except (OpenClawRequestError, ValueError, TypeError, RecursionError) as error:
+                    self._json(400, {"error": str(error)})
+                    return
+                except SourceAdmissionBlocked as error:
+                    self._admission_blocked(error)
+                    return
+                except SourceQueueFull as error:
+                    self._json(429, {"error": str(error)})
+                    return
+                streaming = request.get("stream", True)
+                deadline = time.monotonic() + MAX_WAIT_SECONDS
+                try:
+                    if streaming:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/x-ndjson")
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("X-Broker-Job-Id", job["id"])
+                        self.end_headers()
+                        self.close_connection = True
+                    while job["state"] not in {"completed", "failed", "cancelled"}:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            if key is None:
+                                broker.cancel(job["id"])
+                            if streaming:
+                                self.wfile.write(error_frame(504, "broker queue wait timed out"))
+                                self.wfile.flush()
+                            else:
+                                self._json(504, {"error": "broker queue wait timed out",
+                                                 "job_id": job["id"]})
+                            return
+                        if not streaming and self._peer_closed():
+                            if key is None:
+                                broker.cancel(job["id"])
+                            return
+                        job = broker.wait_for_terminal(job["id"], min(HEARTBEAT_SECONDS, remaining))
+                        if job is None:
+                            raise RuntimeError("submitted OpenClaw job disappeared")
+                        if streaming and job["state"] not in {"completed", "failed", "cancelled"}:
+                            self.wfile.write(heartbeat())
+                            self.wfile.flush()
+                    if job["state"] == "completed":
+                        if streaming:
+                            self.wfile.write(terminal_frame(job["result"]))
+                            self.wfile.flush()
+                        else:
+                            self._json(200, job["result"], {"X-Broker-Job-Id": job["id"]})
+                    else:
+                        message = "broker job failed" if job["state"] == "failed" else "broker job cancelled"
+                        status = 502 if job["state"] == "failed" else 409
+                        if streaming:
+                            self.wfile.write(error_frame(status, message))
+                            self.wfile.flush()
+                        else:
+                            self._json(status, {"error": message, "job_id": job["id"]})
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    if key is None:
+                        broker.cancel(job["id"])
+            finally:
+                openclaw_slots.release()
+
         def do_POST(self):
+            if urlsplit(self.path).path == "/openclaw/api/chat":
+                self._openclaw_chat()
+                return
             size=int(self.headers.get("Content-Length", 0))
             try:
                 body=json.loads(self.rfile.read(size) or b"{}")
@@ -81,6 +191,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                                                   body.get("external_id"),
                                                   body.get("producer_storage")))
                 except SourceAdmissionBlocked as error: self._admission_blocked(error)
+                except SourceQueueFull as error: self._json(429, {"error": str(error)})
                 except (KeyError, TypeError, ValueError, StorageContractError) as e: self._json(400, {"error": str(e)})
             elif path.startswith("/v1/jobs/") and path.endswith("/input-received"):
                 if not self._storage_authorized():
@@ -222,6 +333,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     if body.get("stream", True): self._stream(202, stream_frames(job))
                     else: self._json(202, job)
                 except SourceAdmissionBlocked as error: self._admission_blocked(error)
+                except SourceQueueFull as error: self._json(429, {"error": str(error)})
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
             elif path == "/v1/shutterstock-canary/generate":
                 try:

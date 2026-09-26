@@ -25,6 +25,9 @@ class Profile:
 PROFILES = {
     "interactive": Profile("interactive", "nemotron3:33b", 16_384, 2_048, 180),
     "cron": Profile("cron", "nemotron3:33b", 8_192, 1_024, 120),
+    # Native Ollama agent-turn lane; match the selected OpenClaw model.
+    "openclaw": Profile("openclaw", "qwen3.8:ad-iq2-xs", 131_072, 16_384, 300,
+                        request_timeout_seconds=900),
     # Shutterstock photos stay on cloud/OmniRoute and deliberately have no
     # broker profile. Only the local video workload may acquire MAIN-PC.
     # The video lane is multimodal: one chunk arrives as base64 frames plus a
