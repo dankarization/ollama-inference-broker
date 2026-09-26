@@ -11,7 +11,7 @@ from urllib.request import Request, ProxyHandler, build_opener
 
 from broker.http import serve
 from broker.openclaw import MODEL, normalize_request
-from broker.profiles import PROFILES
+from broker.profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES
 from broker.service import Broker
 
 
@@ -33,11 +33,14 @@ class FakeOllama:
         return {"models": [{"name": MODEL}]}
 
     def is_ready(self, model):
-        return model == MODEL
+        return model in OPENCLAW_PROFILES_BY_MODEL
+
+    def unload(self, model):
+        pass
 
     def run(self, kind, request):
         self.requests.append((kind, request))
-        return self.result
+        return {**self.result, "model": request["model"]}
 
 
 class OpenClawRouteTests(unittest.TestCase):
@@ -143,6 +146,63 @@ class OpenClawRouteTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires the OpenClaw profile"):
             self.broker.submit("cron", "chat", {"messages": [{"role": "user", "content": "x"}]},
                                source="openclaw")
+
+    def test_all_configured_models_route_to_server_owned_profiles(self):
+        cases = {
+            "gemma4:12b": (262_144, 16_384, True),
+            "qwen3-vl:30b": (212_992, 16_384, True),
+            "nemotron3:33b": (131_072, 8_192, True),
+            "qwen3.8:ad-iq2-xs": (131_072, 16_384, False),
+            "qwen3.8:unc-rvn-iq2xxs": (131_072, 16_384, False),
+            "frob/ministral-3:14b-thinking-q4_K_M": (262_144, 16_384, True),
+            "nemotron-3-nano:30b-a3b-q4_K_M": (262_144, 16_384, False),
+            "gpt-oss:20b": (131_072, 16_384, False),
+        }
+        self.assertEqual(set(OPENCLAW_PROFILES_BY_MODEL), set(cases))
+        for model, (context, output, vision) in cases.items():
+            with self.subTest(model=model):
+                profile = OPENCLAW_PROFILES_BY_MODEL[model]
+                self.assertEqual((PROFILES[profile].max_context, PROFILES[profile].max_output),
+                                 (context, output))
+                body = {**self.sample(), "model": model,
+                        "options": {"num_ctx": context, "num_predict": output}}
+                if vision:
+                    body["messages"] = [{"role": "user", "content": "describe",
+                                         "images": ["aGVsbG8="]}]
+                result = {}
+                def client():
+                    with self.opener.open(self.request(body), timeout=5) as response:
+                        result["body"] = json.loads(response.read())
+                        result["id"] = response.headers["X-Broker-Job-Id"]
+                caller = threading.Thread(target=client)
+                caller.start(); self.wait_queued()
+                self.assertTrue(self.broker.dispatch_once(frozenset({"openclaw"})))
+                caller.join(timeout=2)
+                self.assertFalse(caller.is_alive())
+                self.assertEqual(result["body"]["model"], model)
+                self.assertEqual(result["body"]["message"]["tool_calls"],
+                                 self.ollama.result["message"]["tool_calls"])
+                self.assertEqual(self.broker.status(result["id"])["profile"], profile)
+                request = self.ollama.requests[-1][1]
+                self.assertEqual(request["model"], model)
+                self.assertEqual(request["options"]["num_ctx"], context)
+                self.assertEqual(request["options"]["num_predict"], output)
+                if vision:
+                    self.assertEqual(request["messages"][0]["images"], ["aGVsbG8="])
+                with self.assertRaisesRegex(ValueError, "requires source openclaw"):
+                    self.broker.submit(profile, "chat", normalize_request(body), source="other")
+                with self.assertRaisesRegex(ValueError, "must match its profile"):
+                    self.broker.submit(profile, "chat", {**normalize_request(body),
+                                                          "model": "caller-chosen:bad"},
+                                       source="openclaw")
+                if not vision:
+                    with self.assertRaises(HTTPError) as caught:
+                        self.opener.open(self.request({**body, "messages": [
+                            {"role": "user", "content": "x", "images": ["aGVsbG8="]}]}))
+                    self.assertEqual(caught.exception.code, 400)
+        with self.assertRaises(HTTPError) as caught:
+            self.opener.open(self.request({**self.sample(), "model": "caller-chosen:bad"}))
+        self.assertEqual(caught.exception.code, 400)
 
     def test_idempotency_queue_bound_and_failed_executor(self):
         payload = normalize_request(self.sample())

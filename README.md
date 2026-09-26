@@ -251,12 +251,6 @@ values и error text в control events не копируются.
 Канонический production policy хранится в `config/sources.production.json`:
 веса Shutterstock Video / Olya Vision / Olya Decision остаются `3/8/6`, а
 отдельный source `syncopia-telegram-memory` имеет scheduler weight ровно `4`.
-Изолированный text-only source `uncensored-eval` принимает только семь
-server-owned Qwen 3.8 comparison profiles. Для них `num_ctx=65536` — нормальный
-режим сравнения; caller может явно выбрать до `131072` только для stress-test.
-Output ограничен `8192`, concurrency `1`, а MTP/draft-параметры и изображения
-fail-closed. Его production weight настраивается отдельно и не задаётся этим
-feature commit.
 `weight` — единственный scheduling-параметр: он задаёт прямую долю source в
 time-batch scheduler. Policy с неизвестным ключом отклоняется, чтобы конфигурация не могла
 молча стать default `1.0`.
@@ -385,18 +379,28 @@ cloud routing, task orchestration или бизнес-логику callers.
 Broker route `POST /openclaw/api/chat` реализует **нативный Ollama chat** для
 выбранных OpenClaw turns. Это отдельный путь: старые `/api/chat` и
 `/api/generate` остаются асинхронными admission-only endpoints с ответом `202`.
-Провайдер OpenClaw должен использовать `api: "ollama"`, `baseUrl` вида
-`http://127.0.0.1:8088/openclaw` и provider-local model ID
-`qwen3.8:ad-iq2-xs` (полный OpenClaw ID при provider key `broker-openclaw` —
-`broker-openclaw/qwen3.8:ad-iq2-xs`). OpenClaw добавляет `/api/chat` к baseUrl;
-модель в wire request обязана совпадать с этим ID.
+Провайдер OpenClaw использует `api: "ollama"` и `baseUrl` вида
+`http://127.0.0.1:8088/openclaw`; OpenClaw добавляет `/api/chat`. Внутренний
+broker source остаётся `openclaw` при любом OpenClaw-facing provider key.
+Wire model обязан совпадать с одним из восьми server-owned профилей:
 
-Профиль/source называются ровно `openclaw`. Профиль закрепляет модель
-`qwen3.8:ad-iq2-xs`, `num_ctx ≤ 131072`, `num_predict ≤ 16384`, keepalive 300 s
-и executor timeout 900 s. Это соответствует выбранной OpenClaw модели
-(131072/16384), в отличие от старого профиля `cron` (8192/1024). Admission
-сохраняет до 512 сообщений и 128 tools; весь JSON request — до 2 MiB, tools —
-до 512 KiB. Эти байтовые ограничения защищают SQLite/HTTP; точный token budget
+| Wire model | Broker profile | Context/output | Image |
+| --- | --- | --- | --- |
+| `gemma4:12b` | `openclaw-gemma4` | 262144/16384 | yes |
+| `qwen3-vl:30b` | `openclaw-qwen3-vl` | 212992/16384 | yes |
+| `nemotron3:33b` | `openclaw-nemotron3` | 131072/8192 | yes |
+| `qwen3.8:ad-iq2-xs` | `openclaw` (legacy queue compatibility) | 131072/16384 | no |
+| `qwen3.8:unc-rvn-iq2xxs` | `openclaw-unc-rvn-iq2xxs` | 131072/16384 | no |
+| `frob/ministral-3:14b-thinking-q4_K_M` | `openclaw-ministral3` | 262144/16384 | yes |
+| `nemotron-3-nano:30b-a3b-q4_K_M` | `openclaw-nemotron-nano` | 262144/16384 | no |
+| `gpt-oss:20b` | `openclaw-gpt-oss` | 131072/16384 | no |
+
+Limits and modalities match the eight configured `ollama-main-pc` model entries
+at implementation time. Each profile pins model, keepalive 300 s and executor
+timeout 900 s. Admission preserves up to 512 messages and 128 tools. Text JSON
+requests are limited to 2 MiB; vision requests to 32 MiB, at most 16 images
+and 24 MiB decoded images. Tools are limited to 512 KiB. Byte limits protect
+SQLite/HTTP and can narrow oversized image turns; exact token budget
 остаётся ответственностью OpenClaw/Ollama, поэтому `truncate` и `shift`
 запрещены. Queue admission ограничен восемью незавершёнными jobs и восемью
 одновременными HTTP waiters; сверх лимита — HTTP 429. Запросы проходят обычный
@@ -417,9 +421,9 @@ queued job отменяется, running получает `cancel_requested` и 
 keyed request job сохраняется. Для OpenClaw provider timeout нужен >1800 s,
 а timeout выбранного cron agentTurn также должен покрывать очередь и inference.
 
-Перед pilot main/ops отдельно добавляет `openclaw` в **live** source policy с
+Перед rollout main/ops отдельно добавляет `openclaw` в **live** source policy с
 нужными `enabled`, `admission_allowed` и weight, обновляет broker release и
-создаёт изолированный cron с этим provider/model. Ни код, ни этот документ не
-меняют live policy или существующие automations. Rollback: убрать только pilot
-cron/model routing, закрыть admission для `openclaw`, дождаться/отменить его
+переключает OpenClaw provider/models. Ни код, ни этот документ не меняют live
+policy или automations. Rollback: вернуть прежний provider/model routing,
+закрыть admission для `openclaw`, дождаться/отменить его
 jobs и вернуть прежний broker release; другие sources и SQLite не удалять.

@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .compat import (CompatibilityError, stream_frames, submit as submit_compatibility,
                      submit_olya_decision, submit_olya_vision, submit_shutterstock_canary,
                      submit_shutterstock_video, submit_syncopia_memory)
-from .profiles import PROFILES
+from .profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES
 from .dashboard import render as render_dashboard
 from .policy import SourcePolicyError
 from .service import SourceAdmissionBlocked, SourceQueueFull, StorageAuthorizationRequired
@@ -101,7 +101,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                         self.connection.settimeout(None)
                     payload = normalize_request(request)
                     key = self.headers.get("Idempotency-Key")
-                    job = broker.submit("openclaw", "chat", payload, source="openclaw",
+                    job = broker.submit(OPENCLAW_PROFILES_BY_MODEL[request["model"]], "chat", payload, source="openclaw",
                                         external_id=key)
                 except socket.timeout:
                     self.close_connection = True

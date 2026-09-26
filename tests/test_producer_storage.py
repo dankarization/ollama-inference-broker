@@ -929,7 +929,7 @@ class ProducerStorageTests(unittest.TestCase):
                 },
                 "shutterstock-video": {"enabled": False, "weight": 10},
                 "syncopia-telegram-memory": {"enabled": True, "weight": 1},
-                "uncensored-eval": {"enabled": True, "weight": 1},
+                "unrelated-source": {"enabled": True, "weight": 1},
             },
         }
         staged, report = stage_storage_policy(live)
@@ -939,7 +939,7 @@ class ProducerStorageTests(unittest.TestCase):
                 self.assertEqual(staged["sources"][source][field], live["sources"][source][field])
         self.assertFalse(staged["sources"]["olya-vision"]["admission_allowed"])
         self.assertTrue(staged["sources"]["olya-vision"]["producer_storage_enabled"])
-        self.assertNotIn("producer_storage_enabled", staged["sources"]["uncensored-eval"])
+        self.assertNotIn("producer_storage_enabled", staged["sources"]["unrelated-source"])
         self.assertFalse(staged["sources"]["olya-vision"]["compaction_enabled"])
 
     def test_storage_policy_rejects_output_aliasing_live_policy(self):

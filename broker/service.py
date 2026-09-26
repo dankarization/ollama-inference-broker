@@ -15,14 +15,13 @@ from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
 from .dashboard import snapshot as dashboard_snapshot
-from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES,
+from .compat import (CompatibilityError,
                      validate_olya_decision_payload,
                      validate_olya_vision_payload,
                      validate_shutterstock_canary_payload,
                      validate_shutterstock_video_payload,
-                     validate_syncopia_memory_payload,
-                     validate_uncensored_eval_payload)
-from .profiles import PROFILES
+                     validate_syncopia_memory_payload)
+from .profiles import OPENCLAW_PROFILE_NAMES, PROFILES
 from .openclaw import (MAX_OUTSTANDING, normalize_request as normalize_openclaw_request,
                        validate_result as validate_openclaw_result)
 from .policy import (
@@ -588,13 +587,15 @@ class Broker:
         if kind not in {"chat", "generate"}:
             raise ValueError("kind must be chat or generate")
         source = source or profile
-        if source == "openclaw" and profile != "openclaw":
+        if source == "openclaw" and profile not in OPENCLAW_PROFILE_NAMES:
             raise ValueError("source openclaw requires the OpenClaw profile")
-        if profile == "openclaw" and (source != "openclaw" or kind != "chat"):
+        if profile in OPENCLAW_PROFILE_NAMES and (source != "openclaw" or kind != "chat"):
             raise ValueError("OpenClaw profile requires source openclaw and kind chat")
-        if profile == "openclaw":
+        if profile in OPENCLAW_PROFILE_NAMES:
             if producer_storage is not None or not isinstance(payload, dict):
                 raise ValueError("OpenClaw requires inline chat payload")
+            if "model" in payload and payload["model"] != PROFILES[profile].model:
+                raise ValueError("OpenClaw payload model must match its profile")
             payload = normalize_openclaw_request({**payload, "model": PROFILES[profile].model})
         if profile == "shutterstock-canary":
             if source != profile:
@@ -640,13 +641,6 @@ class Broker:
                     "tools": [],
                     "stream": False,
                 })
-            except CompatibilityError as exc:
-                raise ValueError(str(exc)) from exc
-        if profile in UNCENSORED_EVAL_PROFILES:
-            if source != "uncensored-eval":
-                raise ValueError("uncensored evaluation profiles must use source uncensored-eval")
-            try:
-                payload = validate_uncensored_eval_payload(payload)
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
         source_item_id = self._correlation_value("source_item_id", source_item_id)
@@ -1804,8 +1798,7 @@ class Broker:
             raise RuntimeError("target model did not become ready")
         payload = json.loads(row["payload"])
         options = dict(payload.get("options", {}))
-        default_context = profile.default_context or profile.max_context
-        options["num_ctx"] = min(int(options.get("num_ctx", default_context)), profile.max_context)
+        options["num_ctx"] = min(int(options.get("num_ctx", profile.max_context)), profile.max_context)
         options["num_predict"] = min(int(options.get("num_predict", profile.max_output)), profile.max_output)
         request = {k: v for k, v in payload.items() if k not in {"model", "keep_alive"}}
         request.update({"model": profile.model, "stream": False, "options": options,
@@ -1814,7 +1807,7 @@ class Broker:
         result = self.ollama.run(row["kind"], request)
         if not isinstance(result, dict):
             raise RuntimeError("Ollama returned a non-object response")
-        if row["profile"] == "openclaw":
+        if row["profile"] in OPENCLAW_PROFILE_NAMES:
             validate_openclaw_result(result, profile.model)
         result_json = json.dumps(result)
         with self.lock, self.db:

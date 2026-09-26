@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import json
 import math
+import base64
+import binascii
 from typing import Any
 
-from .profiles import PROFILES
+from .profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES
 
 MODEL = PROFILES["openclaw"].model
-MAX_REQUEST_BYTES = 2 * 1024 * 1024
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
+MAX_TEXT_REQUEST_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_BYTES = 24 * 1024 * 1024
 MAX_TOOL_BYTES = 512 * 1024
 MAX_MESSAGES = 512
 MAX_TOOLS = 128
@@ -35,20 +39,42 @@ def normalize_request(request: Any) -> dict:
                "truncate", "shift", "keep_alive"}
     if set(request) - allowed:
         raise OpenClawRequestError("unsupported Ollama chat request fields")
-    if request.get("model") != MODEL:
-        raise OpenClawRequestError("model must be the configured OpenClaw model")
+    model = request.get("model")
+    profile_name = OPENCLAW_PROFILES_BY_MODEL.get(model) if isinstance(model, str) else None
+    if profile_name is None:
+        raise OpenClawRequestError("model must be a configured OpenClaw model")
+    profile = PROFILES[profile_name]
     if not isinstance(request.get("stream", True), bool):
         raise OpenClawRequestError("stream must be boolean")
     messages = request.get("messages")
     if not isinstance(messages, list) or not 1 <= len(messages) <= MAX_MESSAGES:
         raise OpenClawRequestError("messages must contain 1 to 512 entries")
+    image_count = 0
+    image_bytes = 0
     for message in messages:
         if not isinstance(message, dict) or message.get("role") not in {
             "system", "user", "assistant", "tool"
         } or not isinstance(message.get("content"), str):
             raise OpenClawRequestError("messages require role and string content")
-        if set(message) - {"role", "content", "thinking", "tool_calls", "tool_call_id", "tool_name"}:
+        if set(message) - {"role", "content", "thinking", "tool_calls", "tool_call_id", "tool_name", "images"}:
             raise OpenClawRequestError("unsupported message fields")
+        if "images" in message:
+            images = message["images"]
+            if (profile.max_images == 0 or message["role"] != "user"
+                    or not isinstance(images, list) or not images):
+                raise OpenClawRequestError("images require a vision model and user message")
+            image_count += len(images)
+            if image_count > profile.max_images:
+                raise OpenClawRequestError("too many images for OpenClaw model")
+            for image in images:
+                if not isinstance(image, str):
+                    raise OpenClawRequestError("images must be base64 strings")
+                try:
+                    image_bytes += len(base64.b64decode(image, validate=True))
+                except (ValueError, UnicodeEncodeError, binascii.Error):
+                    raise OpenClawRequestError("images must be valid base64") from None
+                if image_bytes > MAX_IMAGE_BYTES:
+                    raise OpenClawRequestError("decoded images exceed 24 MiB")
         if "thinking" in message and (message["role"] != "assistant" or not isinstance(message["thinking"], str)):
             raise OpenClawRequestError("thinking must be assistant text")
         if "tool_calls" in message:
@@ -99,8 +125,8 @@ def normalize_request(request: Any) -> dict:
         raise OpenClawRequestError("format must be json or a JSON Schema")
     if format_value is not None and _json_size(format_value) > 65_536:
         raise OpenClawRequestError("format exceeds 64 KiB")
-    if _json_size(request) > MAX_REQUEST_BYTES:
-        raise OpenClawRequestError("request exceeds 2 MiB")
+    if _json_size(request) > (MAX_REQUEST_BYTES if image_count else MAX_TEXT_REQUEST_BYTES):
+        raise OpenClawRequestError("request exceeds model-specific byte limit")
     payload = {"messages": messages, "options": options, "truncate": False, "shift": False}
     if tools:
         payload["tools"] = tools
