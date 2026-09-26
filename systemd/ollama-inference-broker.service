@@ -1,27 +1,22 @@
 [Unit]
-Description=Local Ollama inference broker (source-scoped pilot dispatch)
+Description=Local Ollama inference broker (configure before dispatch)
 After=default.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/.openclaw/workspace/.deploy/ollama-inference-broker-current
+WorkingDirectory=%h/.local/share/ollama-inference-broker
 Environment=PYTHONDONTWRITEBYTECODE=1
-Environment=MAINPC_MAC=2c:f0:5d:74:6a:44
 Environment=BROKER_BIND=127.0.0.1
 Environment=BROKER_PORT=8088
 Environment=BROKER_DB=%h/.local/state/ollama-inference-broker/broker.sqlite3
 Environment=OLLAMA_TIMEOUT_SECONDS=300
-Environment=BROKER_DISPATCH_ENABLED=true
-Environment=BROKER_SOURCES_POLICY=%h/.local/state/ollama-inference-broker/sources.json
+Environment=BROKER_DISPATCH_ENABLED=false
 Environment=BROKER_WAL_AUTOCHECKPOINT_PAGES=4096
 Environment=BROKER_JOURNAL_SIZE_LIMIT_BYTES=67108864
 Environment=BROKER_WAL_BUDGET_BYTES=134217728
 Environment=BROKER_WAL_CHECKPOINT_INTERVAL_SECONDS=60
 Environment=BROKER_MIN_FREE_SPACE_BYTES=2147483648
-Environment=BROKER_STORAGE_TOKEN_FILE=%h/.local/state/ollama-inference-broker/storage-api.token
-# Legacy allowlist is intentionally retained for policy-less rollback only.
-# With the policy above, dispatcher sources/weights are loaded at runtime.
-Environment=BROKER_DISPATCH_SOURCES=pilot-mainpc
+EnvironmentFile=%h/.config/ollama-inference-broker/broker.env
 ExecStartPre=/usr/bin/mkdir -p %h/.local/state/ollama-inference-broker
 ExecStart=/usr/bin/python3 -m broker
 # The supported drain operation is `systemctl --user reload …`: signal only

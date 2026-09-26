@@ -63,7 +63,7 @@ class BrokerTests(unittest.TestCase):
 
     def test_ollama_timeout_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "must be positive"):
-            OllamaHTTP(timeout_seconds=0)
+            OllamaHTTP("http://ollama.test:11434", timeout_seconds=0)
 
     def test_wal_integer_limits_reject_fractional_and_zero_values(self):
         self.assertEqual(positive_integer(None, 4096, "WAL"), 4096)
@@ -99,7 +99,7 @@ class BrokerTests(unittest.TestCase):
         self.assertIn("systemctl --user kill -s SIGUSR1", readme)
 
     def test_ollama_readiness_wait_tolerates_delayed_ps_visibility(self):
-        client = OllamaHTTP()
+        client = OllamaHTTP("http://ollama.test:11434")
         states = iter((False, False, True))
         client.is_ready = lambda _model: next(states)
         with (
@@ -110,7 +110,7 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, 2)
 
     def test_model_switch_waits_for_delayed_unload_before_loading_target(self):
-        client = OllamaHTTP()
+        client = OllamaHTTP("http://ollama.test:11434")
         old = "nemotron3:33b"
         target = "qwen3.8:ad-iq2-xs"
         states = iter((
@@ -142,7 +142,7 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(calls[load_index][2], {"model": target, "keep_alive": "1800s"})
 
     def test_model_readiness_poll_uses_remaining_deadline(self):
-        client = OllamaHTTP()
+        client = OllamaHTTP("http://ollama.test:11434")
         observed = []
         client.ps = lambda timeout_seconds=None: (
             observed.append(timeout_seconds),

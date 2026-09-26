@@ -5,6 +5,7 @@ import signal
 from pathlib import Path
 from .adapters import OllamaHTTP, WakeOnLan
 from .http import serve
+from .local_config import load_local_config, mainpc_mac, ollama_url
 from .service import Broker, Dispatcher, SourcePolicy
 
 
@@ -92,6 +93,7 @@ def main() -> None:
         level=os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(),
         format="%(message)s",
     )
+    local_config = load_local_config()
     configured_storage_token = storage_token(
         os.environ.get("BROKER_STORAGE_TOKEN_FILE")
     )
@@ -102,10 +104,13 @@ def main() -> None:
     broker = Broker(
         os.environ.get("BROKER_DB", "broker.sqlite3"),
         OllamaHTTP(
-            os.environ.get("OLLAMA_URL", "http://192.168.2.5:11434"),
+            ollama_url(local_config),
             float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "300")),
         ),
-        WakeOnLan(os.environ["MAINPC_MAC"]),
+        WakeOnLan(
+            mainpc_mac(local_config),
+            os.environ.get("WOL_BROADCAST", "255.255.255.255"),
+        ),
         wal_autocheckpoint_pages=positive_integer(
             os.environ.get("BROKER_WAL_AUTOCHECKPOINT_PAGES"), 4096,
             "BROKER_WAL_AUTOCHECKPOINT_PAGES",
