@@ -29,14 +29,13 @@ With a runtime source policy, the scheduler takes the oldest eligible job from e
 
 ### Local start (admission only)
 
-Python 3.11+ is required. Set a placeholder MAC even with dispatch disabled; the runtime currently requires this variable at startup. No wake or Ollama request is made in this mode.
+Python 3.11+ is required. Copy `config/local.example.json` to `config/local.json`, set `ollama_url` to the executor's reachable HTTP origin and `mainpc_mac` to its Wake-on-LAN MAC, then restrict the file to the owner. The broker reads this untracked file at startup, even in admission-only mode. No wake or Ollama request is made while dispatch is disabled. There is no localhost fallback for the executor.
 
 ```bash
-BROKER_DISPATCH_ENABLED=false \
-MAINPC_MAC=02:00:00:00:00:01 \
-OLLAMA_URL=http://127.0.0.1:11434 \
-BROKER_DB=./broker.sqlite3 \
-python3 -m broker
+cp config/local.example.json config/local.json
+# Edit config/local.json for your executor before starting.
+chmod 600 config/local.json
+BROKER_DISPATCH_ENABLED=false BROKER_DB=./broker.sqlite3 python3 -m broker
 ```
 
 In another terminal:
@@ -45,7 +44,7 @@ In another terminal:
 curl --fail http://127.0.0.1:8088/healthz
 ```
 
-The API binds to `127.0.0.1:8088` by default. Keep it on a trusted local interface: legacy job APIs are not a public authentication boundary. The supplied systemd units are templates: create owner-only `~/.config/ollama-inference-broker/broker.env` (and `report.env` if using the report timer) with your executor address, WOL MAC/broadcast, policy path, and any required credentials before installing them. Dispatch is disabled in the broker template until explicitly enabled.
+The API binds to `127.0.0.1:8088` by default. Keep it on a trusted local interface: legacy job APIs are not a public authentication boundary. The supplied systemd units are templates: create owner-only `~/.config/ollama-inference-broker/broker.env` (and `report.env` if using the report timer) for other deployment settings before installing them. The broker and reporter read `config/local.json` beside the deployed source; `OLLAMA_URL` and `MAINPC_MAC` override its broker values, and `BROKER_OLLAMA_URL` overrides its reporter URL. Set `WOL_BROADCAST` separately if needed. Dispatch is disabled in the broker template until explicitly enabled.
 
 ### Key contracts
 
@@ -91,14 +90,13 @@ Tests use fakes for the executor and Wake-on-LAN; they do not start live inferen
 
 ### Локальный запуск без dispatch
 
-Нужен Python 3.11+. Даже при выключенном dispatch переменная MAC требуется при старте; тестовое значение ниже не отправляет WOL. Адрес Ollama задан локально и в этом режиме не используется.
+Нужен Python 3.11+. Скопируйте `config/local.example.json` в `config/local.json`, укажите в `ollama_url` доступный HTTP-адрес исполнителя, а в `mainpc_mac` — его Wake-on-LAN MAC, затем ограничьте доступ к файлу. Брокер читает этот неотслеживаемый файл при запуске, даже без dispatch. Пока dispatch выключен, WOL и запросов Ollama нет. Для исполнителя нет fallback на localhost.
 
 ```bash
-BROKER_DISPATCH_ENABLED=false \
-MAINPC_MAC=02:00:00:00:00:01 \
-OLLAMA_URL=http://127.0.0.1:11434 \
-BROKER_DB=./broker.sqlite3 \
-python3 -m broker
+cp config/local.example.json config/local.json
+# Перед запуском задайте параметры исполнителя в config/local.json.
+chmod 600 config/local.json
+BROKER_DISPATCH_ENABLED=false BROKER_DB=./broker.sqlite3 python3 -m broker
 ```
 
 В другом терминале:
@@ -107,7 +105,7 @@ python3 -m broker
 curl --fail http://127.0.0.1:8088/healthz
 ```
 
-По умолчанию API слушает `127.0.0.1:8088`. Не открывайте legacy API недоверенной сети: он не является публичной границей аутентификации. Приложенные systemd units — шаблоны: до установки создайте доступный только владельцу `~/.config/ollama-inference-broker/broker.env` (и `report.env` для таймера отчёта) с адресом исполнителя, WOL MAC/broadcast, путём policy и необходимыми credentials. В шаблоне брокера dispatch отключён до явного включения.
+По умолчанию API слушает `127.0.0.1:8088`. Не открывайте legacy API недоверенной сети: он не является публичной границей аутентификации. Приложенные systemd units — шаблоны: до установки создайте доступный только владельцу `~/.config/ollama-inference-broker/broker.env` (и `report.env` для таймера отчёта) для остальных настроек развёртывания. Брокер и отчёт читают `config/local.json` рядом с развёрнутым исходником; `OLLAMA_URL` и `MAINPC_MAC` переопределяют значения брокера, `BROKER_OLLAMA_URL` — адрес для отчёта. При необходимости задайте `WOL_BROADCAST` отдельно. В шаблоне брокера dispatch отключён до явного включения.
 
 ### Основные контракты
 

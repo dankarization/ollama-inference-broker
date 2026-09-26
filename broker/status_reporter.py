@@ -26,6 +26,7 @@ from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 from .policy import SourcePolicyError, normalize_source_policy
+from .local_config import load_local_config, ollama_url
 
 TBILISI = ZoneInfo("Asia/Tbilisi")
 REPORT_SOURCES = {
@@ -171,11 +172,11 @@ def health_snapshot(
 ) -> dict[str, bool]:
     """Only deterministic process/HTTP probes; this never requests inference."""
     broker_url = os.environ.get("BROKER_HEALTH_URL", "http://127.0.0.1:8088/healthz")
-    ollama_url = os.environ.get("BROKER_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+    executor_url = ollama_url(load_local_config(), "BROKER_OLLAMA_URL")
     return {
         "broker_service": service_probe("ollama-inference-broker.service"),
         "broker_http": http_probe(broker_url),
-        "ollama_http": http_probe(ollama_url + "/api/ps"),
+        "ollama_http": http_probe(executor_url + "/api/ps"),
     }
 
 

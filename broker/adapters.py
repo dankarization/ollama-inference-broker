@@ -22,7 +22,7 @@ class WakeOnLan:
 
 class OllamaHTTP:
     def __init__(
-        self, base_url: str = "http://127.0.0.1:11434", timeout_seconds: float = 300
+        self, base_url: str, timeout_seconds: float = 300
     ):
         self.base_url = base_url.rstrip("/")
         if timeout_seconds <= 0:
