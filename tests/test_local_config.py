@@ -20,6 +20,20 @@ class LocalConfigTests(unittest.TestCase):
             "mainpc_mac": "02:00:00:00:00:01",
         }
         self.path.write_text(json.dumps(self.values), encoding="utf-8")
+        self.path.chmod(0o600)
+
+    def test_rejects_non_owner_only_and_symlink_config(self):
+        self.path.chmod(0o640)
+        with self.assertRaisesRegex(ValueError, "owner-only"):
+            local_config.load_local_config(self.path)
+        self.path.chmod(0o600)
+        link = self.path.with_name("linked.json")
+        link.symlink_to(self.path)
+        with self.assertRaisesRegex(ValueError, "Cannot read"):
+            local_config.load_local_config(link)
+        with patch("broker.local_config.os.getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(ValueError, "owner-only"):
+                local_config.load_local_config(self.path)
 
     def test_file_is_read_and_environment_overrides_broker_values(self):
         self.assertEqual(local_config.load_local_config(self.path), self.values)
