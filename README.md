@@ -67,6 +67,8 @@ The report timer is optional. Before enabling it, copy `config/report.env.exampl
 
 ### Key contracts
 
+- The opt-in OpenClaw native chat route waits on the same durable queue and returns an Ollama-compatible response; it does not change legacy admission-only endpoints. See [OpenClaw route](docs/OPENCLAW_ROUTE.md) for its wire contract and rollout boundary.
+
 - `POST /v1/jobs` durably admits a server-owned profile and returns HTTP 202. `GET /v1/jobs/{id}` and `POST /v1/jobs/{id}/cancel` expose the job lifecycle.
 - `/api/chat` and `/api/generate` are admission-compatible endpoints, **not** direct Ollama streaming proxies. A streaming request returns an admission frame, not immediate model output.
 - `GET /dashboard`, `GET /v1/dashboard`, `GET /v1/forecast`, `GET /v1/analytics`, and `GET /v1/audit-events` expose local operational views. Forecast is read-only and contingent, with 10 selections by default (maximum 20). Observer failure is reported as stale or unavailable, not as invented zeroes.
@@ -133,6 +135,8 @@ curl --fail http://127.0.0.1:8088/healthz
 Таймер отчёта необязателен. До его включения скопируйте `config/report.env.example` в `~/.config/ollama-inference-broker/report.env`, замените chat/thread placeholders и установите права `0600`. `OPENCLAW_CONFIG_PATH` по умолчанию равен `~/.openclaw/openclaw.json` и должен указывать на существующий OpenClaw JSON с `channels.telegram.accounts.<account>.botToken` (либо `token`). `BROKER_REPORT_TELEGRAM_ACCOUNT` по умолчанию — `default`. Unit отчёта читает `broker.env` перед `report.env`, поэтому берёт из него путь `BROKER_SOURCES_POLICY` для отображения весов; укажите необязательный `BROKER_SOURCES_POLICY` в `report.env` только если отчёту нужен другой путь. Адрес Ollama для проверки здоровья берётся из общего `local.json`; `BROKER_OLLAMA_URL` позволяет переопределить его только для отчёта. Не записывайте токен бота в `report.env` или Git.
 
 ### Основные контракты
+
+- Дополнительный OpenClaw native chat route ждёт результат в той же устойчивой очереди и возвращает Ollama-совместимый ответ; старые admission-only endpoints не меняются. См. [маршрут OpenClaw](docs/OPENCLAW_ROUTE.md) и границы его rollout.
 
 - `POST /v1/jobs` сохраняет задание с серверным профилем и возвращает HTTP 202. `GET /v1/jobs/{id}` и `POST /v1/jobs/{id}/cancel` показывают и изменяют состояние задания.
 - `/api/chat` и `/api/generate` принимают задания, но не являются прямыми streaming-прокси Ollama. При `stream=true` возвращается кадр подтверждения приёма, а не немедленный результат модели.

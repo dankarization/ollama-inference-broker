@@ -22,7 +22,9 @@ from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES,
                      validate_shutterstock_video_payload,
                      validate_syncopia_memory_payload,
                      validate_uncensored_eval_payload)
-from .profiles import PROFILES
+from .profiles import OPENCLAW_PROFILE_NAMES, PROFILES
+from .openclaw import (MAX_OUTSTANDING, normalize_request as normalize_openclaw_request,
+                       validate_result as validate_openclaw_result)
 from .policy import (
     RETENTION_DEFAULTS,
     SourcePolicyError,
@@ -69,6 +71,10 @@ class SourceAdmissionBlocked(Exception):
 
 class StorageAuthorizationRequired(PermissionError):
     """A bulk mutation selected at least one producer-storage job."""
+
+
+class SourceQueueFull(Exception):
+    """The bounded OpenClaw lane has no admission slot."""
 
 
 class SourcePolicy:
@@ -448,6 +454,9 @@ class Broker:
                 "ON jobs(source,external_id) WHERE source='syncopia-telegram-memory' "
                 "AND external_id IS NOT NULL"
             )
+            # Existing ordinary source='openclaw' rows may reuse external_id.
+            # The broker lock serializes new idempotent admissions; do not impose
+            # a retroactive uniqueness constraint on durable legacy history.
 
     def _retire_priority_column(self) -> None:
         """Remove a legacy priority column only when new inserts need it gone.
@@ -568,6 +577,15 @@ class Broker:
             if expired:
                 self._refresh_health_cache_locked()
             self.completed.notify_all()
+
+    def _ensure_openclaw_capacity_locked(self, additional: int = 1) -> None:
+        outstanding = self.db.execute(
+            "SELECT count(*) FROM jobs WHERE source='openclaw' "
+            "AND state IN ('queued','running','cancel_requested')"
+        ).fetchone()[0]
+        if outstanding + additional > MAX_OUTSTANDING:
+            raise SourceQueueFull("openclaw has 8 outstanding jobs")
+
     def submit(self, profile: str, kind: str, payload: dict, source: str | None = None,
                source_item_id: str | None = None,
                external_id: str | None = None,
@@ -577,6 +595,16 @@ class Broker:
         if kind not in {"chat", "generate"}:
             raise ValueError("kind must be chat or generate")
         source = source or profile
+        if source == "openclaw" and profile not in OPENCLAW_PROFILE_NAMES:
+            raise ValueError("source openclaw requires the OpenClaw profile")
+        if profile in OPENCLAW_PROFILE_NAMES and (source != "openclaw" or kind != "chat"):
+            raise ValueError("OpenClaw profile requires source openclaw and kind chat")
+        if profile in OPENCLAW_PROFILE_NAMES:
+            if producer_storage is not None or not isinstance(payload, dict):
+                raise ValueError("OpenClaw requires inline chat payload")
+            if "model" in payload and payload["model"] != PROFILES[profile].model:
+                raise ValueError("OpenClaw payload model must match its profile")
+            payload = normalize_openclaw_request({**payload, "model": PROFILES[profile].model})
         if profile == "shutterstock-canary":
             if source != profile:
                 raise ValueError("shutterstock-canary must use its dedicated source")
@@ -649,7 +677,7 @@ class Broker:
                         (source, external_id),
                     ).fetchone()
                     tombstone_is_idempotent = tombstone is not None and (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory"}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw"}
                         or producer_storage is not None
                         or tombstone["producer_attempt_id"] is not None
                     )
@@ -678,7 +706,7 @@ class Broker:
                         or existing["result_storage_mode"] != "broker_temporary"
                     )
                     if (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory"}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw"}
                         or producer_storage is not None
                         or existing_has_producer_storage
                     ):
@@ -705,6 +733,11 @@ class Broker:
                                 raise ValueError(
                                     "producer storage idempotency conflict for existing correlation"
                                 )
+                        if source == "openclaw" and (
+                            existing["profile"] != profile or existing["kind"] != kind
+                            or existing["input_hash"] != content_evidence(payload)[0]
+                        ):
+                            raise ValueError("idempotency key was used for another request")
                         return self.status(existing["id"])
             storage_fields = self.storage.prepare_admission(source, payload, producer_storage)
             if self.source_policy is not None and not self.source_policy.admission_allowed(source):
@@ -720,6 +753,8 @@ class Broker:
                 # Rejection itself is durable observability, despite aborting admission.
                 self.db.commit()
                 raise SourceAdmissionBlocked(source)
+            if source == "openclaw":
+                self._ensure_openclaw_capacity_locked()
             self.db.execute(
                 "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
                 "queued_at,source_item_id,external_id,input_storage_mode,input_ref,input_hash,"
@@ -813,6 +848,8 @@ class Broker:
                 raise StorageAuthorizationRequired
             if any(row["compaction_state"] != "full" for row in rows):
                 raise ValueError("one or more failed jobs have expired retry bodies")
+            if source == "openclaw" and rows:
+                self._ensure_openclaw_capacity_locked(len(rows))
             for row in rows:
                 attempt_no = row["attempt_count"] or None
                 self._audit(
@@ -968,6 +1005,8 @@ class Broker:
                 raise ValueError("only failed or cancelled jobs may be retried")
             if row["compaction_state"] != "full":
                 raise ValueError("job retry retention has expired")
+            if row["source"] == "openclaw":
+                self._ensure_openclaw_capacity_locked()
             now = self.clock()
             self._audit(
                 "job.retry_requested", job_id=job_id, source=row["source"],
@@ -1785,6 +1824,8 @@ class Broker:
         result = self.ollama.run(row["kind"], request)
         if not isinstance(result, dict):
             raise RuntimeError("Ollama returned a non-object response")
+        if row["profile"] in OPENCLAW_PROFILE_NAMES:
+            validate_openclaw_result(result, profile.model)
         result_json = json.dumps(result)
         with self.lock, self.db:
             state = self.db.execute("SELECT state FROM jobs WHERE id=?", (row["id"],)).fetchone()[0]
@@ -1819,12 +1860,23 @@ class Broker:
             self._refresh_health_cache_locked()
             self.completed.notify_all()
 
-    def wait_for_terminal(self, job_id: str, timeout_seconds: float) -> dict | None:
-        """Wait for a persisted terminal state; executor dispatch remains external."""
+    def wait_for_terminal(
+        self, job_id: str, timeout_seconds: float, *, hydrate_pending: bool = True,
+    ) -> dict | None:
+        """Wait for a persisted terminal state; optionally poll state without payload."""
         deadline = time.monotonic() + timeout_seconds
         with self.completed:
             while True:
-                job = self.status(job_id)
+                if hydrate_pending:
+                    job = self.status(job_id)
+                else:
+                    row = self.db.execute(
+                        "SELECT state FROM jobs WHERE id=?", (job_id,)
+                    ).fetchone()
+                    state = row["state"] if row else None
+                    job = self.status(job_id) if state is None or state in {
+                        "completed", "failed", "cancelled"
+                    } else {"id": job_id, "state": state}
                 if job is None or job["state"] in {"completed", "failed", "cancelled"}:
                     return job
                 remaining = deadline - time.monotonic()
