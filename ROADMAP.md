@@ -48,12 +48,18 @@ order.
   server-side profile и возвращают NDJSON admission frame; serializer также
   определяет terminal-state frames для уже сохранённого job. Endpoint сам не
   ждёт и не dispatch-ит job.
-- [ ] Затем мигрировать один явно разрешённый canary caller.
-- [ ] Позднее перевести OpenClaw, Hermes и локальные pipelines; не
-  перенаправлять процесс только из-за места его запуска.
+- [ ] Выполнить и подтвердить end-to-end canary одного явно разрешённого
+  caller; наличие настроенного маршрута само по себе canary не доказывает.
+- [x] Реализован и изолированно проверен opt-in маршрут выбранных OpenClaw
+  AgentTurn через `/openclaw/api/chat`; OpenClaw provider `local` настроен на
+  broker. Это не означает переключение всех OpenClaw callers или defaults.
+- [ ] Остальные Hermes и локальные pipelines подключать по одному, только после
+  инвентаризации, owner approval и canary; не перенаправлять процесс только по
+  месту его запуска.
 
-Интеграция, migration callers, traffic routes, real model output и canary этой
-фазы намеренно не начаты и остаются вне текущего scope.
+Opt-in OpenClaw route реализован и настроен; end-to-end canary, подтверждение
+реального model output, переключение defaults и миграция остальных callers не
+подтверждены.
 
 ## Фаза 3 — наблюдаемость и операции
 
@@ -65,8 +71,11 @@ order.
   прерывания running job, admission allow/block до durable insert, exact-source
   bulk cancel queued и bulk retry failed с сохранением attempt/audit history.
   Policy writes атомарны и сериализованы; dashboard требует подтверждение bulk.
-- [ ] Добавить health checks за пределами локального `/healthz`, dashboards и
-  alerts поверх накопленной истории.
+- [x] Реализованы и изолированно проверены local-only dashboard и код
+  детерминированного hourly status report; dashboard не является внешним health
+  monitor.
+- [ ] Добавить независимые health checks за пределами локального `/healthz` и
+  alerts по накопленной истории; отдельно подтвердить production-работу report timer.
 - [ ] Публиковать данные MAIN-PC о VRAM и loaded models только при отдельно
   разрешённом внешнем обращении.
 
