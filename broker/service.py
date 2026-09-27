@@ -15,12 +15,13 @@ from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
 from .dashboard import snapshot as dashboard_snapshot
-from .compat import (CompatibilityError,
+from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES,
                      validate_olya_decision_payload,
                      validate_olya_vision_payload,
                      validate_shutterstock_canary_payload,
                      validate_shutterstock_video_payload,
-                     validate_syncopia_memory_payload)
+                     validate_syncopia_memory_payload,
+                     validate_uncensored_eval_payload)
 from .profiles import OPENCLAW_PROFILE_NAMES, PROFILES
 from .openclaw import (MAX_OUTSTANDING, normalize_request as normalize_openclaw_request,
                        validate_result as validate_openclaw_result)
@@ -648,6 +649,13 @@ class Broker:
                     "tools": [],
                     "stream": False,
                 })
+            except CompatibilityError as exc:
+                raise ValueError(str(exc)) from exc
+        if profile in UNCENSORED_EVAL_PROFILES:
+            if source != "uncensored-eval":
+                raise ValueError("uncensored evaluation profiles must use source uncensored-eval")
+            try:
+                payload = validate_uncensored_eval_payload(payload)
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
         source_item_id = self._correlation_value("source_item_id", source_item_id)

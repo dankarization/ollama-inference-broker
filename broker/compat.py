@@ -14,6 +14,39 @@ class CompatibilityError(ValueError):
     """The supplied Ollama-shaped request cannot enter broker admission."""
 
 
+UNCENSORED_EVAL_PROFILES = frozenset({
+    "uncensored-eval-rvn-iq2m",
+    "uncensored-eval-rvn-iq2s",
+    "uncensored-eval-rvn-iq2xs",
+    "uncensored-eval-rvn-iq2xxs",
+    "uncensored-eval-huihui-q2kxl",
+    "uncensored-eval-unleashed-q2kxl",
+    "uncensored-eval-hauhau-iq2m",
+})
+
+
+def validate_uncensored_eval_payload(payload: Any) -> dict[str, Any]:
+    """Keep comparison jobs text-only and free of speculative draft controls."""
+    if not isinstance(payload, dict):
+        raise CompatibilityError("uncensored evaluation payload must be a JSON object")
+    if payload.get("images") not in (None, []):
+        raise CompatibilityError("uncensored evaluation is text-only")
+    options = payload.get("options", {})
+    if not isinstance(options, dict):
+        raise CompatibilityError("uncensored evaluation options must be an object")
+    for scope, values in (("payload", payload), ("options", options)):
+        prohibited = sorted(
+            str(key) for key in values
+            if "draft" in str(key).lower() or "mtp" in str(key).lower()
+        )
+        if prohibited:
+            raise CompatibilityError(
+                f"uncensored evaluation must not enable MTP/draft parameters in {scope}: "
+                + ", ".join(prohibited)
+            )
+    return dict(payload)
+
+
 def submit(broker: Any, kind: str, request: Any) -> dict[str, Any]:
     if kind not in {"chat", "generate"}:
         raise CompatibilityError("unsupported compatibility endpoint")
