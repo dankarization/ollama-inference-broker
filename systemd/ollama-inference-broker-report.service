@@ -4,15 +4,12 @@ After=ollama-inference-broker.service
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/.openclaw/workspace/.deploy/ollama-inference-broker-current
+WorkingDirectory=%h/.local/share/ollama-inference-broker
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=BROKER_DB=%h/.local/state/ollama-inference-broker/broker.sqlite3
-Environment=BROKER_SOURCES_POLICY=%h/.local/state/ollama-inference-broker/sources.json
 Environment=BROKER_HEALTH_URL=http://127.0.0.1:8088/healthz
-Environment=BROKER_OLLAMA_URL=http://192.168.2.5:11434
-Environment=BROKER_REPORT_TELEGRAM_ACCOUNT=default
-Environment=BROKER_REPORT_TELEGRAM_TARGET=5775112073
-Environment=BROKER_REPORT_TELEGRAM_THREAD_ID=471305
+EnvironmentFile=%h/.config/ollama-inference-broker/broker.env
+EnvironmentFile=%h/.config/ollama-inference-broker/report.env
 ExecStart=/usr/bin/python3 -m broker.status_reporter
 UMask=0077
 NoNewPrivileges=true

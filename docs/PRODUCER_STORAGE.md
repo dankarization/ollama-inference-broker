@@ -250,7 +250,7 @@ python3 -m broker.storage_policy \
 The tool fails unless normalized `enabled`, `weight`, and
 `admission_allowed` values are byte-for-byte equivalent before and after. It
 allowlists only currently present approved producer sources, leaves unknown
-and `uncensored-eval` sources untouched, and always stages ACK optional,
+sources untouched, and always stages ACK optional,
 legacy fallback on, and compaction off. `--apply` performs an fsync + atomic
 replace after the operator preserves the original policy for rollback. The
 apply aborts if any process replaces or modifies the live policy after it was

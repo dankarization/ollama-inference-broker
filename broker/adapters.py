@@ -8,7 +8,7 @@ import time
 
 
 class WakeOnLan:
-    def __init__(self, mac: str, broadcast: str = "192.168.2.255"):
+    def __init__(self, mac: str, broadcast: str = "255.255.255.255"):
         self.mac, self.broadcast = mac, broadcast
 
     def wake(self) -> None:
@@ -22,7 +22,7 @@ class WakeOnLan:
 
 class OllamaHTTP:
     def __init__(
-        self, base_url: str = "http://192.168.2.5:11434", timeout_seconds: float = 300
+        self, base_url: str, timeout_seconds: float = 300
     ):
         self.base_url = base_url.rstrip("/")
         if timeout_seconds <= 0:

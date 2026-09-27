@@ -127,7 +127,9 @@ starvation (максимальный wait), actual-vs-expected share и смен
 В отчёте отображается effective **weight** каждого source: это единственный
 операторский scheduling-параметр. Runtime policy использует weights для
 weighted round-robin между sources, а внутри выбранного source сохраняется
-FIFO.
+FIFO. Unit отчёта читает `broker.env` перед `report.env`, поэтому использует
+тот же `BROKER_SOURCES_POLICY`, что и broker; `report.env` может переопределить
+путь, если это необходимо.
 
 Размеры файлов и queue delta не выводятся: в broker SQLite нет надёжного
 поля размера и почасового baseline snapshot. Health состоит только из
