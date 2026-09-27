@@ -8,6 +8,7 @@ WorkingDirectory=%h/.local/share/ollama-inference-broker
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=BROKER_DB=%h/.local/state/ollama-inference-broker/broker.sqlite3
 Environment=BROKER_HEALTH_URL=http://127.0.0.1:8088/healthz
+EnvironmentFile=%h/.config/ollama-inference-broker/broker.env
 EnvironmentFile=%h/.config/ollama-inference-broker/report.env
 ExecStart=/usr/bin/python3 -m broker.status_reporter
 UMask=0077
