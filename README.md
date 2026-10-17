@@ -7,6 +7,10 @@
 
 A local admission and scheduling service for one Ollama GPU executor. It keeps jobs in a durable SQLite WAL queue, runs at most one inference job at a time, and keeps model selection and limits on the server side. It does not replace Ollama or route cloud workloads.
 
+An optional [Whisper executor](docs/WHISPER_EXECUTOR.md) shares this GPU queue
+through a separately authenticated ASR API. It is disabled by default and requires
+the matching worker, private artifact storage, and explicit deployment configuration.
+
 <a id="architecture"></a>
 ### Architecture
 

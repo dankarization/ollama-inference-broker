@@ -20,7 +20,7 @@ from .openclaw import (HEARTBEAT_SECONDS, MAX_OUTSTANDING, MAX_REQUEST_BYTES, MA
                        OpenClawRequestError, error_frame, heartbeat, normalize_request, terminal_frame)
 
 
-def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
+def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, asr_api=None):
     broker.use_source_policy(policy)
     openclaw_slots = threading.BoundedSemaphore(MAX_OUTSTANDING)
     class Handler(BaseHTTPRequestHandler):
@@ -181,7 +181,20 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
             finally:
                 openclaw_slots.release()
 
+        def _asr_route(self):
+            path = urlsplit(self.path).path
+            if not path.startswith("/v1/transcriptions"):
+                return False
+            if asr_api is None:
+                self.close_connection = True
+                self._json(503, {"error": "ASR not configured"})
+            else:
+                asr_api.handle(self)
+            return True
+
         def do_POST(self):
+            if self._asr_route():
+                return
             if urlsplit(self.path).path == "/openclaw/api/chat":
                 self._openclaw_chat()
                 return
@@ -192,6 +205,16 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 self._json(400, {"error": "request body must be JSON"})
                 return
             path = urlsplit(self.path).path
+            # Keep the legacy unauthenticated mutations away from the ASR lane.
+            asr_job = None
+            if path.startswith("/v1/jobs/"):
+                asr_job = broker.status(path.split("/")[3])
+            if ((isinstance(body, dict) and (body.get("kind") == "transcribe"
+                     or body.get("profile") == "stt-whisper" or body.get("source") == "stt-whisper"))
+                    or unquote(path).startswith("/v1/sources/stt-whisper/")
+                    or (asr_job and asr_job.get("kind") == "transcribe")):
+                self._json(403, {"error": "use authenticated ASR API"})
+                return
             if path == "/v1/jobs":
                 if (
                     isinstance(body, dict) and body.get("producer_storage") is not None
@@ -460,6 +483,8 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
             else: self._json(404, {"error":"not found"})
         def do_GET(self):
+            if self._asr_route():
+                return
             parsed = urlsplit(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)

@@ -23,6 +23,7 @@ from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES,
                      validate_syncopia_memory_payload,
                      validate_uncensored_eval_payload)
 from .profiles import OPENCLAW_PROFILE_NAMES, PROFILES
+from .asr import PROFILE as ASR_PROFILE, validate_payload as validate_asr_payload
 from .openclaw import (MAX_OUTSTANDING, normalize_request as normalize_openclaw_request,
                        validate_result as validate_openclaw_result)
 from .policy import (
@@ -252,8 +253,10 @@ class Broker:
                  wal_budget_bytes=DEFAULT_WAL_BUDGET_BYTES,
                  checkpoint_interval_seconds=DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
                  min_free_space_bytes=DEFAULT_MIN_FREE_SPACE_BYTES,
-                 source_policy: SourcePolicy | None = None):
+                 source_policy: SourcePolicy | None = None, whisper_executor=None):
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
+        self.whisper_executor = whisper_executor
+        self._asr_ready_after = 0.0
         self.database = str(database)
         self.db = sqlite3.connect(self.database, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -285,6 +288,10 @@ class Broker:
         self.wal_autocheckpoint_pages = int(wal_autocheckpoint_pages)
         self.journal_size_limit_bytes = int(journal_size_limit_bytes)
         self._init_db()
+        with self.db:
+            self.db.execute("CREATE TABLE IF NOT EXISTS gpu_executor_fences "
+                            "(resource TEXT PRIMARY KEY, request_id TEXT NOT NULL, job_id TEXT NOT NULL)")
+        self._gpu_fence = self.executor_fence()
         self.storage = StorageManager(
             self.db, self.database, self.lock, self.clock, self._audit,
             lambda: self.source_policy,
@@ -592,8 +599,14 @@ class Broker:
                producer_storage: dict[str, Any] | None = None) -> dict:
         if profile not in PROFILES:
             raise ValueError("unknown profile")
-        if kind not in {"chat", "generate"}:
-            raise ValueError("kind must be chat or generate")
+        if kind not in {"chat", "generate", "transcribe"}:
+            raise ValueError("kind must be chat, generate or transcribe")
+        if kind == "transcribe" or profile == ASR_PROFILE or source == ASR_PROFILE:
+            if (kind != "transcribe" or profile != ASR_PROFILE
+                    or (source or profile) != ASR_PROFILE or producer_storage is not None
+                    or self.whisper_executor is None or not external_id):
+                raise ValueError("ASR requires configured executor, dedicated profile and idempotency key")
+            payload = validate_asr_payload(payload)
         source = source or profile
         if source == "openclaw" and profile not in OPENCLAW_PROFILE_NAMES:
             raise ValueError("source openclaw requires the OpenClaw profile")
@@ -677,7 +690,7 @@ class Broker:
                         (source, external_id),
                     ).fetchone()
                     tombstone_is_idempotent = tombstone is not None and (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw"}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", ASR_PROFILE}
                         or producer_storage is not None
                         or tombstone["producer_attempt_id"] is not None
                     )
@@ -706,7 +719,7 @@ class Broker:
                         or existing["result_storage_mode"] != "broker_temporary"
                     )
                     if (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw"}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", ASR_PROFILE}
                         or producer_storage is not None
                         or existing_has_producer_storage
                     ):
@@ -733,7 +746,7 @@ class Broker:
                                 raise ValueError(
                                     "producer storage idempotency conflict for existing correlation"
                                 )
-                        if source == "openclaw" and (
+                        if source in {"openclaw", ASR_PROFILE} and (
                             existing["profile"] != profile or existing["kind"] != kind
                             or existing["input_hash"] != content_evidence(payload)[0]
                         ):
@@ -753,6 +766,11 @@ class Broker:
                 # Rejection itself is durable observability, despite aborting admission.
                 self.db.commit()
                 raise SourceAdmissionBlocked(source)
+            if source == ASR_PROFILE:
+                count = self.db.execute("SELECT count(*) FROM jobs WHERE source=? AND state IN "
+                                        "('queued','running','cancel_requested')", (ASR_PROFILE,)).fetchone()[0]
+                if count >= 32:
+                    raise SourceQueueFull("ASR queue full")
             if source == "openclaw":
                 self._ensure_openclaw_capacity_locked()
             self.db.execute(
@@ -1687,12 +1705,46 @@ class Broker:
         self._publish_scheduler_snapshot()
         return selected
 
+    def set_executor_fence(self, request_id, job_id):
+        with self.lock, self.db:
+            self.db.execute("INSERT INTO gpu_executor_fences VALUES('mainpc-gpu',?,?)",
+                            (request_id, job_id))
+            self._gpu_fence = {"request_id": request_id, "job_id": job_id}
+
+    def clear_executor_fence(self, request_id):
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM gpu_executor_fences WHERE resource='mainpc-gpu' AND request_id=?",
+                            (request_id,))
+            self._gpu_fence = self.executor_fence()
+
+    def executor_fence(self):
+        with self.lock:
+            row = self.db.execute("SELECT * FROM gpu_executor_fences WHERE resource='mainpc-gpu'").fetchone()
+            return dict(row) if row else None
+
+    def reconcile_executor_fence(self):
+        fence = self.executor_fence()
+        if fence is None:
+            return True
+        if self.whisper_executor and self.whisper_executor.can_release(fence["request_id"]):
+            self.clear_executor_fence(fence["request_id"])
+            return self.executor_fence() is None
+        return False
+
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None) -> bool:
+        if not self.reconcile_executor_fence():
+            return False
         with self.lock, self.db:
             if self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested')").fetchone():
                 return False
             row = self._next(allowed_sources, policy)
             if not row: return False
+            if row["profile"] == ASR_PROFILE:
+                if self.whisper_executor is None or time.monotonic() < self._asr_ready_after:
+                    return False
+                if not self.whisper_executor.available(self.ollama):
+                    self._asr_ready_after = time.monotonic() + 5.0
+                    return False
             now = self.clock()
             attempt_no = int(row["attempt_count"] or 0) + 1
             # A lease covers the server-owned remote deadline, not just a
@@ -1755,7 +1807,8 @@ class Broker:
         except Exception as exc:
             with self.lock, self.db:
                 finished = self.clock()
-                error_summary = bounded_error_summary(exc)
+                error_summary = ("ASR execution failed (" + type(exc).__name__ + ")"
+                                 if execution_row["kind"] == "transcribe" else bounded_error_summary(exc))
                 self._complete_time_batch(finished)
                 self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (finished, error_summary, row["id"]))
                 self.storage.record_terminal_retention(
@@ -1776,6 +1829,12 @@ class Broker:
         return True
 
     def _execute(self, row):
+        if row["kind"] == "transcribe":
+            if self.whisper_executor is None:
+                raise RuntimeError("ASR executor disabled")
+            result = self.whisper_executor.run(self, row)
+            self._finish_execution(row, result, "Whisper completed and GPU release acknowledged")
+            return
         profile = PROFILES[row["profile"]]
         self.wol.wake()
         models = self.ollama.ps().get("models", [])
@@ -1826,6 +1885,9 @@ class Broker:
             raise RuntimeError("Ollama returned a non-object response")
         if row["profile"] in OPENCLAW_PROFILE_NAMES:
             validate_openclaw_result(result, profile.model)
+        self._finish_execution(row, result, reason)
+
+    def _finish_execution(self, row, result, reason):
         result_json = json.dumps(result)
         with self.lock, self.db:
             state = self.db.execute("SELECT state FROM jobs WHERE id=?", (row["id"],)).fetchone()[0]
@@ -1909,7 +1971,14 @@ class Broker:
         # Do not touch SQLite or wait for the dispatcher here.  Assignment of
         # the small immutable replacement mapping is atomic under CPython, so
         # this local probe remains available while a large DB transaction runs.
-        return dict(self._health_cache)
+        status = dict(self._health_cache)
+        fence = self._gpu_fence
+        if fence:
+            status["gpu_executor"] = "awaiting_worker_release"
+            status["blocked_job_id"] = fence["job_id"]
+            if status["active_job_id"] is None:
+                status["status"] = "blocked"
+        return status
 
 
 class Dispatcher(threading.Thread):
