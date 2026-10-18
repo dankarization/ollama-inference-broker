@@ -116,6 +116,15 @@ class ASRTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.broker.submit(PROFILE, "transcribe", payload, external_id="test-correlation-001")
 
+    def test_admission_cleanup_preserves_idempotent_artifact(self):
+        job = self.job()
+        existing = job["payload"]["artifact"]
+        self.assertFalse(self.spool.discard_if_unowned(self.broker, job["external_id"], existing))
+        self.assertTrue(self.spool.audio(job["payload"]).exists())
+        orphan = self.payload("orphan-after-admission-error")
+        self.assertTrue(self.spool.discard_if_unowned(self.broker, "orphan-after-admission-error", orphan["artifact"]))
+        self.assertFalse(self.spool.audio(orphan).exists())
+
     def test_audio_hash_path_and_size_are_checked(self):
         payload = self.payload()
         self.spool.path(payload["artifact"], ".audio").write_bytes(b"tampered")
