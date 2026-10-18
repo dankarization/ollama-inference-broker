@@ -577,4 +577,134 @@ class ASRTests(unittest.TestCase):
         self.assertEqual(self.request(port, "POST", path+"/ack")[0], 200)
         self.assertEqual(self.request(port, "GET", path)[0], 410)
 
+    def test_incompatible_worker_allocations_block_all_gpu_dispatch(self):
+        job = self.broker.submit('interactive', 'generate', {'prompt': 'test'})
+        for allocation in ({'model_loaded': True}, {'active_jobs': 1},
+                           {'gpu_release_confirmed': False}):
+            with self.subTest(allocation=allocation):
+                status = {'model': 'another-whisper-model', 'model_loaded': False,
+                          'active_jobs': 0, 'gpu_release_confirmed': True, **allocation}
+                with patch.object(self.worker, 'status', return_value=status):
+                    self.assertFalse(self.broker.dispatch_once())
+                self.assertEqual(self.broker.status(job['id'])['state'], 'queued')
+                self.assertFalse(self.ollama.calls)
+
+    def test_warm_admission_can_turn_cold_only_with_exact_release_proof(self):
+        for confirmed in (False, True):
+            with self.subTest(confirmed=confirmed):
+                if self.broker.executor_fence():
+                    self.broker.clear_executor_fence(self.broker.executor_fence()['request_id'])
+                self.worker.model_loaded, self.worker.released = True, False
+                self.worker.last = 'idle-race-old-owner'
+                job = self.job('idle-race-correlation-' + str(confirmed))
+                self.broker.set_executor_fence(self.worker.last, job['id'])
+                original_run = self.executor.run
+                def unload_then_run(broker, row):
+                    self.worker.model_loaded = False
+                    self.worker.released = confirmed
+                    return original_run(broker, row)
+                with patch.object(self.executor, 'run', side_effect=unload_then_run):
+                    self.assertTrue(self.broker.dispatch_once())
+                if confirmed:
+                    self.assertEqual(self.broker.status(job['id'])['state'], 'completed')
+                    self.assertIsNone(self.broker.executor_fence())
+                    self.assertEqual(len(self.worker.calls), 1)
+                else:
+                    self.assertEqual(self.broker.status(job['id'])['state'], 'failed')
+                    self.assertEqual(self.broker.executor_fence()['request_id'], 'idle-race-old-owner')
+                    self.assertFalse(self.worker.calls)
+
+    def test_disabled_asr_lane_does_not_probe_or_wake_before_llm(self):
+        self.job()
+        policy_path = self.root / 'policy.json'
+        policy_path.write_text(json.dumps({'version': 1, 'sources': {
+            PROFILE: {'enabled': False, 'weight': 1},
+            'interactive': {'enabled': True, 'weight': 1}}}))
+        for allowed, policy in ((frozenset({'interactive'}), None),
+                                (None, SourcePolicy(policy_path)),
+                                (frozenset({'interactive', PROFILE}), SourcePolicy(policy_path))):
+            self.ollama.models = []
+            self.broker.wol.wake.reset_mock()
+            job = self.broker.submit('interactive', 'generate', {'prompt': 'test'})
+            with patch.object(self.executor, 'available') as available:
+                self.assertTrue(self.broker.dispatch_once(allowed_sources=allowed, policy=policy))
+                available.assert_not_called()
+            # The selected LLM still wakes its host; disabled ASR adds no wake.
+            self.broker.wol.wake.assert_called_once()
+            self.assertEqual(self.broker.status(job['id'])['state'], 'completed')
+
+    def test_result_replacement_at_capacity_counts_only_new_size(self):
+        payload = self.payload()
+        artifact = payload['artifact']
+        self.spool.save_result(artifact, {'text': 'old'})
+        self.spool.max_bytes = self.spool.accounted_bytes()
+        self.spool.save_result(artifact, {'text': 'new'})
+        self.assertEqual(self.spool.result(artifact), {'text': 'new'})
+        self.assertEqual(self.spool.accounted_bytes(), self.spool.max_bytes)
+        with self.assertRaisesRegex(ValueError, 'capacity'):
+            self.spool.save_result(artifact, {'text': 'too large'})
+        self.assertEqual(self.spool.result(artifact), {'text': 'new'})
+
+    def test_ack_rechecks_terminal_state_after_concurrent_retry(self):
+        port = self.start_http()
+        job = self.job()
+        self.broker.cancel(job['id'])
+        path = '/v1/transcriptions/' + job['id']
+        original_status = self.broker.status
+        read, finish = threading.Event(), threading.Event()
+        responses = []
+        captured = False
+        def stale_status(job_id):
+            nonlocal captured
+            snapshot = original_status(job_id)
+            if not captured:
+                captured = True
+                read.set(); finish.wait(3)
+            return snapshot
+        with patch.object(self.broker, 'status', side_effect=stale_status):
+            ack = threading.Thread(target=lambda: responses.append(self.request(port, 'POST', path + '/ack')))
+            ack.start()
+            try:
+                self.assertTrue(read.wait(2))
+                self.assertEqual(self.request(port, 'POST', path + '/retry')[0], 202)
+            finally:
+                finish.set(); ack.join(4)
+        self.assertEqual(responses[0][0], 400)
+        self.assertEqual(self.broker.status(job['id'])['state'], 'queued')
+        self.assertTrue(self.spool.audio(job['payload']).is_file())
+        self.assertIsNone(self.broker.db.execute('SELECT 1 FROM asr_receipts WHERE job_id=?', (job['id'],)).fetchone())
+        self.assertTrue(self.broker.dispatch_once())
+        self.assertEqual(self.broker.status(job['id'])['state'], 'completed')
+
+    def test_retry_hash_does_not_hold_broker_lock_and_rechecks_fence(self):
+        port = self.start_http()
+        job = self.job()
+        self.broker.cancel(job['id'])
+        entered, finish, responsive = threading.Event(), threading.Event(), threading.Event()
+        original_audio = self.spool.audio
+        responses = []
+        def slow_audio(payload):
+            entered.set(); finish.wait(3)
+            return original_audio(payload)
+        def lookup_and_admit():
+            self.broker.status(job['id'])
+            self.broker.submit('interactive', 'generate', {'prompt': 'test'})
+            self.broker.set_executor_fence('new-owner-during-hash', job['id'])
+            responsive.set()
+        with patch.object(self.spool, 'audio', side_effect=slow_audio):
+            retry = threading.Thread(target=lambda: responses.append(self.request(
+                port, 'POST', '/v1/transcriptions/' + job['id'] + '/retry')))
+            retry.start()
+            lookup = threading.Thread(target=lookup_and_admit)
+            try:
+                self.assertTrue(entered.wait(2))
+                lookup.start()
+                self.assertTrue(responsive.wait(.5), 'artifact hashing blocked broker operations')
+            finally:
+                finish.set(); retry.join(4)
+                if lookup.ident: lookup.join(4)
+        self.assertEqual(responses[0][0], 409)
+        self.assertEqual(self.broker.status(job['id'])['state'], 'cancelled')
+        self.assertEqual(self.broker.executor_fence()['request_id'], 'new-owner-during-hash')
+
 if __name__ == "__main__": unittest.main()

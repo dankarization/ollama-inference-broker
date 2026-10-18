@@ -132,9 +132,10 @@ class Spool:
         if len(encoded) > MAX_RESULT_BYTES: raise ValueError("ASR result too large")
         path, temp = self.path(artifact, ".json"), self.path(artifact, ".result-part")
         with self.lock:
+            previous_bytes = path.stat().st_size if path.exists() else 0
             reserved = (MAX_RESULT_BYTES if not path.exists()
                         and self.path(artifact, ".audio").exists() else 0)
-            if self.accounted_bytes() - reserved + len(encoded) > self.max_bytes:
+            if self.accounted_bytes() - reserved - previous_bytes + len(encoded) > self.max_bytes:
                 raise ValueError("ASR spool capacity reached")
             try:
                 with temp.open("wb") as out:
@@ -265,9 +266,8 @@ class WhisperExecutor:
         """Detect resident/unconfirmed work independently of its reusability."""
         try:
             status=self.worker.status()
-            return (status.get("model")==MODEL and
-                    (status.get("model_loaded") is True or status.get("active_jobs",0)>0
-                     or status.get("gpu_release_confirmed") is False))
+            return (status.get("model_loaded") is True or status.get("active_jobs",0)>0
+                    or status.get("gpu_release_confirmed") is False)
         except Exception:
             return False
 
@@ -342,6 +342,10 @@ class WhisperExecutor:
                 raise RuntimeError("Whisper warm ownership mismatch")
             broker.replace_executor_fence(request_id, row["id"], fence["request_id"])
         else:
+            # Idle unload can finish after the scheduler admitted warm reuse.
+            # Retire the old fence only with request-specific release proof.
+            if fence and not broker.reconcile_executor_fence():
+                raise RuntimeError("Whisper previous GPU release unconfirmed")
             broker.set_executor_fence(request_id, row["id"])
         try:
             result = (self.worker.transcribe(audio, request_id, previous_request_id=fence['request_id'])
@@ -430,12 +434,13 @@ class ASRAPI:
                 job = self.broker.cancel(job["id"])
                 handler._json(200, {"id": job["id"], "state": job["state"]})
             elif handler.command == "POST" and len(parts) == 4 and parts[3] == "ack":
-                if job["state"] not in {"completed", "cancelled", "failed"}:
-                    raise ValueError("ASR job is not terminal")
                 with self.executor.spool.admission_lock(job["external_id"]):
                     # Receipt is durable before deletion. It is independent
                     # of the model's ownership fence and survives retries.
                     with self.broker.lock, self.broker.db:
+                        job = self.broker.status(job["id"])
+                        if job is None or job["state"] not in {"completed", "cancelled", "failed"}:
+                            raise ValueError("ASR job is not terminal")
                         self.broker.db.execute("INSERT OR IGNORE INTO asr_receipts(job_id,acknowledged_at,external_id) VALUES(?,?,?)",
                                                (job["id"], time.time(), job['external_id']))
                     artifact = (job.get("result") or job.get("payload", {})).get("artifact")
@@ -443,14 +448,16 @@ class ASRAPI:
                 handler._json(200, {"acknowledged": True})
             elif handler.command == 'POST' and len(parts) == 4 and parts[3] == 'retry':
                 with self.executor.spool.admission_lock(job['external_id']):
+                    # Same-key admission excludes ACK/pruning while hashing;
+                    # unrelated broker operations need not wait for disk IO.
+                    try: self.executor.spool.audio(job['payload'])
+                    except (OSError, ValueError, KeyError):
+                        handler._json(410, {'error':'ASR artifact unavailable'}); return
                     with self.broker.lock:
                         if self.broker.executor_fence():
                             handler._json(409, {'error':'GPU release pending'}); return
                         if self.broker.db.execute('SELECT 1 FROM asr_receipts WHERE job_id=?', (job['id'],)).fetchone():
                             handler._json(410, {'error':'ASR artifact acknowledged'}); return
-                        try: self.executor.spool.audio(job['payload'])
-                        except (OSError, ValueError, KeyError):
-                            handler._json(410, {'error':'ASR artifact unavailable'}); return
                         retried = self.broker.retry(job['id'])
                 handler._json(202, {'id':retried['id'], 'state':retried['state']})
             else: handler._json(404, {"error": "not found"})

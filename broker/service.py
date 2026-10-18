@@ -1820,7 +1820,8 @@ class Broker:
         with self.lock:
             queued_sources = frozenset(row[0] for row in self.db.execute(
                 "SELECT DISTINCT source FROM jobs WHERE state='queued'"))
-        if ASR_PROFILE in queued_sources:
+        if (ASR_PROFILE in queued_sources and ASR_PROFILE in permitted
+                and (policy is None or ASR_PROFILE in policy.enabled_sources())):
             asr_ready = False
             if self.whisper_executor and time.monotonic() >= self._asr_ready_after:
                 asr_ready = self.whisper_executor.available(self.ollama)
