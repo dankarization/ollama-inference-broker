@@ -1714,11 +1714,13 @@ class Broker:
     def replace_executor_fence(self, request_id, job_id):
         """Move an existing warm Whisper ownership fence to the next job."""
         with self.lock, self.db:
-            self.db.execute(
+            cursor = self.db.execute(
                 "UPDATE gpu_executor_fences SET request_id=?, job_id=? "
                 "WHERE resource='mainpc-gpu'",
                 (request_id, job_id),
             )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Whisper warm ownership fence missing")
             self._gpu_fence = {"request_id": request_id, "job_id": job_id}
 
     def clear_executor_fence(self, request_id):
@@ -1742,6 +1744,12 @@ class Broker:
         return False
 
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None) -> bool:
+        fence = self.executor_fence()
+        if (fence is None and self.whisper_executor
+                and self.whisper_executor.can_reuse()):
+            # A resident Whisper model without a durable broker owner is
+            # fail-closed: never schedule ASR or Ollama concurrently.
+            return False
         fence_blocked = not self.reconcile_executor_fence()
         if fence_blocked:
             # A warm Whisper model owns the GPU but can safely serve another

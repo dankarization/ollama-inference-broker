@@ -111,6 +111,12 @@ class ASRTests(unittest.TestCase):
         self.assertTrue(self.executor.release_idle(self.broker))
         self.assertIsNone(self.broker.executor_fence())
 
+    def test_warm_worker_without_durable_fence_fails_closed(self):
+        self.worker.model_loaded = True
+        self.job("warm-unfenced-correlation")
+        self.assertFalse(self.broker.dispatch_once())
+        self.assertIsNone(self.broker.executor_fence())
+
     def test_fence_survives_restart_and_disabled_executor(self):
         self.worker.fail = True
         self.job(); self.broker.dispatch_once()
