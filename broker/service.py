@@ -253,11 +253,14 @@ class Broker:
                  wal_budget_bytes=DEFAULT_WAL_BUDGET_BYTES,
                  checkpoint_interval_seconds=DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
                  min_free_space_bytes=DEFAULT_MIN_FREE_SPACE_BYTES,
-                 source_policy: SourcePolicy | None = None, whisper_executor=None):
+                 source_policy: SourcePolicy | None = None, whisper_executor=None,
+                 asr_release_on_llm_demand=False):
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
         self.whisper_executor = whisper_executor
         self._asr_ready_after = 0.0
         self._idle_fence_probe_after = 0.0
+        self.asr_release_on_llm_demand = bool(asr_release_on_llm_demand)
+        self._asr_release_retry_after = 0.0
         self.database = str(database)
         self.db = sqlite3.connect(self.database, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -293,7 +296,14 @@ class Broker:
             self.db.execute("CREATE TABLE IF NOT EXISTS gpu_executor_fences "
                             "(resource TEXT PRIMARY KEY, request_id TEXT NOT NULL, job_id TEXT NOT NULL)")
             self.db.execute("CREATE TABLE IF NOT EXISTS asr_receipts "
-                            "(job_id TEXT PRIMARY KEY, acknowledged_at REAL NOT NULL)")
+                            "(job_id TEXT PRIMARY KEY, acknowledged_at REAL NOT NULL, external_id TEXT)")
+            if 'external_id' not in {row[1] for row in self.db.execute('PRAGMA table_info(asr_receipts)')}:
+                self.db.execute('ALTER TABLE asr_receipts ADD COLUMN external_id TEXT')
+            self.db.execute("UPDATE asr_receipts SET external_id=COALESCE("
+                            "(SELECT external_id FROM jobs WHERE id=asr_receipts.job_id),"
+                            "(SELECT external_id FROM job_retention_tombstones WHERE job_id=asr_receipts.job_id)) "
+                            "WHERE external_id IS NULL")
+            self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS asr_receipt_external_id ON asr_receipts(external_id) WHERE external_id IS NOT NULL')
         self._gpu_fence = self.executor_fence()
         self.storage = StorageManager(
             self.db, self.database, self.lock, self.clock, self._audit,
@@ -1028,6 +1038,12 @@ class Broker:
                 raise ValueError("job retry retention has expired")
             if row["source"] == "openclaw":
                 self._ensure_openclaw_capacity_locked()
+            if row['source'] == ASR_PROFILE:
+                if self.source_policy is not None and not self.source_policy.admission_allowed(ASR_PROFILE):
+                    raise SourceAdmissionBlocked(ASR_PROFILE)
+                if self.db.execute("SELECT count(*) FROM jobs WHERE source=? AND state IN "
+                                   "('queued','running','cancel_requested')", (ASR_PROFILE,)).fetchone()[0] >= 32:
+                    raise SourceQueueFull('ASR queue full')
             now = self.clock()
             self._audit(
                 "job.retry_requested", job_id=job_id, source=row["source"],
@@ -1770,6 +1786,18 @@ class Broker:
             return False
         fence_blocked = not self.reconcile_executor_fence()
         fence = self.executor_fence()
+        if (fence_blocked and self.asr_release_on_llm_demand
+                and (ready_sources & permitted) - {ASR_PROFILE}
+                and time.monotonic() >= self._asr_release_retry_after):
+            # Explicit opt-in policy: yield only our idle, exact fenced owner.
+            # Never interrupt inference or unload an unrelated Ollama model.
+            self._asr_release_retry_after = time.monotonic() + 5.0
+            try:
+                if self.whisper_executor and self.whisper_executor.release_idle(self):
+                    fence_blocked = False
+                    fence = self.executor_fence()
+            except Exception as error:
+                LOGGER.warning('ASR idle handoff unconfirmed (%s)', type(error).__name__)
         if fence_blocked:
             # A warm Whisper model owns the GPU but can safely serve another
             # queued Whisper job. Non-ASR work remains blocked until the
@@ -1784,6 +1812,9 @@ class Broker:
             )
             if not warm_asr:
                 return False
+            # Filter before scheduling: an older LLM head cannot prevent safe
+            # warm ASR reuse while that LLM remains blocked by the fence.
+            allowed_sources = permitted & {ASR_PROFILE}
         # Probe outside both the broker mutex and SQLite transaction. Slow
         # private HTTP endpoints must not block submissions/status/cancel.
         with self.lock:

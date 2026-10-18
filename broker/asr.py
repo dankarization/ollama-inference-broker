@@ -207,7 +207,7 @@ class WhisperHTTP:
         if len(token) < 32: raise ValueError("Whisper token too short")
         self.token, self.timeout = token, timeout
 
-    def request(self, path, audio=None, request_id=None):
+    def request(self, path, audio=None, request_id=None, previous_request_id=None):
         cls = http.client.HTTPSConnection if self.url.scheme == "https" else http.client.HTTPConnection
         conn = cls(self.url.hostname, self.url.port, timeout=self.timeout if audio else 5)
         try:
@@ -216,6 +216,8 @@ class WhisperHTTP:
                 headers.update({"Content-Type": "application/octet-stream",
                                 "Content-Length": str(audio.stat().st_size),
                                 "X-Filename": "audio.bin", "X-Request-Id": request_id})
+                if previous_request_id:
+                    headers['X-Previous-Request-Id'] = previous_request_id
                 with audio.open("rb") as stream:
                     conn.request("POST", path, body=stream, headers=headers)
             else:
@@ -233,8 +235,8 @@ class WhisperHTTP:
             conn.close()
 
     def status(self): return self.request("/v1/status")
-    def transcribe(self, audio, request_id):
-        return self.request("/v1/transcribe", audio, request_id)
+    def transcribe(self, audio, request_id, previous_request_id=None):
+        return self.request("/v1/transcribe", audio, request_id, previous_request_id)
 
     def release(self, request_id):
         cls = http.client.HTTPSConnection if self.url.scheme == "https" else http.client.HTTPConnection
@@ -342,7 +344,8 @@ class WhisperExecutor:
         else:
             broker.set_executor_fence(request_id, row["id"])
         try:
-            result = self.worker.transcribe(audio, request_id)
+            result = (self.worker.transcribe(audio, request_id, previous_request_id=fence['request_id'])
+                      if warm else self.worker.transcribe(audio, request_id))
             if (result.get("model") != MODEL or result.get("device") != "cuda"
                     or not isinstance(result.get("text"), str) or not result["text"].strip()):
                 raise RuntimeError("invalid Whisper result")
@@ -356,6 +359,9 @@ class WhisperExecutor:
 class ASRAPI:
     def __init__(self, broker, executor, token):
         if len(token) < 32: raise ValueError("ASR token too short")
+        worker_token = getattr(executor.worker, 'token', None)
+        if isinstance(worker_token, str) and hmac.compare_digest(token.encode(), worker_token.encode()):
+            raise ValueError('ASR and worker credentials must be different')
         self.broker, self.executor, self.token = broker, executor, token
         self.slots = threading.BoundedSemaphore(2)
 
@@ -382,9 +388,11 @@ class ASRAPI:
                             "SELECT id,state FROM jobs WHERE source=? AND external_id=? LIMIT 1",
                             (SOURCE, key)).fetchone()
                         acknowledged = self.broker.db.execute(
-                            "SELECT 1 FROM asr_receipts r JOIN jobs j ON j.id=r.job_id "
-                            "WHERE j.source=? AND j.external_id=?", (SOURCE, key)).fetchone()
-                    if acknowledged:
+                            "SELECT 1 FROM asr_receipts WHERE external_id=?", (key,)).fetchone()
+                        purged = self.broker.db.execute(
+                            "SELECT 1 FROM job_retention_tombstones WHERE source=? AND external_id=?",
+                            (SOURCE, key)).fetchone()
+                    if acknowledged or purged:
                         handler._json(410, {"error": "ASR artifact acknowledged"}); return
                     if existing and existing['state'] in {'completed','failed','cancelled'}:
                         artifact = hashlib.sha256(key.encode()).hexdigest()
@@ -428,11 +436,23 @@ class ASRAPI:
                     # Receipt is durable before deletion. It is independent
                     # of the model's ownership fence and survives retries.
                     with self.broker.lock, self.broker.db:
-                        self.broker.db.execute("INSERT OR IGNORE INTO asr_receipts VALUES(?,?)",
-                                               (job["id"], time.time()))
+                        self.broker.db.execute("INSERT OR IGNORE INTO asr_receipts(job_id,acknowledged_at,external_id) VALUES(?,?,?)",
+                                               (job["id"], time.time(), job['external_id']))
                     artifact = (job.get("result") or job.get("payload", {})).get("artifact")
                     if artifact: self.executor.spool.discard(artifact)
                 handler._json(200, {"acknowledged": True})
+            elif handler.command == 'POST' and len(parts) == 4 and parts[3] == 'retry':
+                with self.executor.spool.admission_lock(job['external_id']):
+                    with self.broker.lock:
+                        if self.broker.executor_fence():
+                            handler._json(409, {'error':'GPU release pending'}); return
+                        if self.broker.db.execute('SELECT 1 FROM asr_receipts WHERE job_id=?', (job['id'],)).fetchone():
+                            handler._json(410, {'error':'ASR artifact acknowledged'}); return
+                        try: self.executor.spool.audio(job['payload'])
+                        except (OSError, ValueError, KeyError):
+                            handler._json(410, {'error':'ASR artifact unavailable'}); return
+                        retried = self.broker.retry(job['id'])
+                handler._json(202, {'id':retried['id'], 'state':retried['state']})
             else: handler._json(404, {"error": "not found"})
         except Exception as error:
             # Keep broker admission semantics visible to authenticated ASR

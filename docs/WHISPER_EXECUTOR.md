@@ -55,6 +55,9 @@ Every request below requires `Authorization: Bearer ...` from the ASR token file
 - `POST /v1/transcriptions/{id}/ack`: delete this terminal job's audio/result
   artifacts after recording a durable receipt. This does not release the GPU
   fence; a completed warm result can be acknowledged immediately.
+- `POST /v1/transcriptions/{id}/retry`: explicitly requeue failed/cancelled work
+  using the existing artifact and job ID. A pending GPU fence returns 409;
+  acknowledged/missing artifacts return 410. Source admission/capacity still apply.
 
 The legacy queue submission and mutation routes reject ASR operations. Public
 status/dashboard data contains only artifact references, never raw audio or text.
@@ -84,6 +87,16 @@ Cold and warm successful transcripts complete immediately; the model remains
 resident for `MODEL_IDLE_SECONDS` (Whisper default 1200 seconds). The idle monitor
 unloads under the inference lock and publishes request-specific release proof.
 Warm reuse requires the worker UUID to match the existing durable fence.
+The next request includes `X-Previous-Request-Id` for an exact-owner handoff;
+the worker rejects unrelated warm-owner replacements. API and worker bearer
+values must differ. Acknowledgement keys remain durable after job metadata purging.
+
+`BROKER_ASR_RELEASE_ON_LLM_DEMAND=true` explicitly opts into non-preemptive
+idle-Whisper eviction when an eligible LLM is waiting. It unloads only the
+exact fenced Whisper owner and requires fresh release proof before LLM dispatch;
+failed handoffs retain the fence and back off. It never interrupts active ASR
+or evicts an unrelated Ollama allocation. The default is false, preserving the
+previous idle-window policy; a rollout should choose this setting explicitly.
 
 For a legacy restart without a usable journal, stop dispatch and verify the old
 worker process exited and its GPU allocation is gone. The local recovery CLI

@@ -132,6 +132,7 @@ def main() -> None:
             "BROKER_MIN_FREE_SPACE_BYTES",
         ),
         source_policy=policy,
+        asr_release_on_llm_demand=dispatch_enabled(os.environ.get('BROKER_ASR_RELEASE_ON_LLM_DEMAND','false')),
     )
     asr_api = None
     if os.environ.get("BROKER_ASR_SPOOL"):

@@ -71,7 +71,7 @@ class ContractTest(unittest.TestCase):
             ollama = Mock(); ollama.ps.return_value = {"models": []}
             ollama.run.return_value = {"done": True}
             broker = Broker(directory / "queue.db", ollama, Mock(), whisper_executor=executor)
-            api = serve(broker, port=0, asr_api=ASRAPI(broker, executor, token))
+            api = serve(broker, port=0, asr_api=ASRAPI(broker, executor, token+'api'))
             threading.Thread(target=api.serve_forever, daemon=True).start()
             monitor = threading.Thread(target=transport.model_idle_monitor, args=(worker,), daemon=True)
             stop = threading.Event()
@@ -83,7 +83,7 @@ class ContractTest(unittest.TestCase):
             thread = threading.Thread(target=dispatch); thread.start()
             try:
                 client = WhisperBrokerClient({"WHISPER_BROKER_URL": f"http://127.0.0.1:{api.server_port}",
-                                              "WHISPER_BROKER_TOKEN": token}, timeout=10)
+                                              "WHISPER_BROKER_TOKEN": token+'api'}, timeout=10)
                 audio = directory / "sample.wav"; audio.write_bytes(b"fake audio")
                 with patch.object(transport, "start_process_deadline"), patch.object(transport, "stop_process_deadline"):
                     self.assertEqual(client.transcribe(audio)["text"], "Контрольная русская речь.")
@@ -158,7 +158,7 @@ class ContractTest(unittest.TestCase):
                 WhisperHTTP(f"http://127.0.0.1:{worker.server_port}", token))
             ollama = Mock(); ollama.ps.return_value = {"models": []}
             broker = Broker(directory / "queue.db", ollama, Mock(), whisper_executor=executor)
-            api = serve(broker, port=0, asr_api=ASRAPI(broker, executor, token))
+            api = serve(broker, port=0, asr_api=ASRAPI(broker, executor, token+'api'))
             threading.Thread(target=api.serve_forever, daemon=True).start()
             stop = threading.Event()
             def dispatch():
@@ -166,7 +166,7 @@ class ContractTest(unittest.TestCase):
             thread = threading.Thread(target=dispatch); thread.start()
             try:
                 client = WhisperBrokerClient({"WHISPER_BROKER_URL": f"http://127.0.0.1:{api.server_port}",
-                                              "WHISPER_BROKER_TOKEN": token}, timeout=10)
+                                              "WHISPER_BROKER_TOKEN": token+'api'}, timeout=10)
                 audio = directory / "sample.wav"; audio.write_bytes(b"fake audio")
                 with patch.object(transport, "start_process_deadline"), patch.object(transport, "stop_process_deadline"):
                     result = client.transcribe(audio)

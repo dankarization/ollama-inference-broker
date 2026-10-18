@@ -36,7 +36,7 @@ class FakeWorker:
         return {"model": MODEL, "active_jobs": self.active, "model_loaded": self.model_loaded,
                 "request_tracking": True, "last_request_id": self.last,
                 "last_request_gpu_released": self.released}
-    def transcribe(self, path, request_id):
+    def transcribe(self, path, request_id, previous_request_id=None):
         self.calls.append(request_id)
         self.last = request_id
         if self.fail: raise TimeoutError("private details must not enter database")
@@ -74,6 +74,52 @@ class ASRTests(unittest.TestCase):
         self.assertIn("ручей", self.spool.result(state["result"]["artifact"])["text"])
         self.assertNotIn("ручей", "\n".join(self.broker.db.iterdump()))
         self.assertFalse(self.ollama.calls)
+
+    def test_warm_asr_can_pass_older_blocked_llm(self):
+        first = self.job('warm-before-llm-correlation')
+        self.broker.dispatch_once()
+        self.worker.model_loaded, self.worker.released = True, False
+        self.broker.set_executor_fence(self.worker.last, first['id'])
+        llm = self.broker.submit('interactive','generate',{'prompt':'test'})
+        second = self.job('warm-after-llm-correlation')
+        self.assertTrue(self.broker.dispatch_once())
+        self.assertEqual(self.broker.status(second['id'])['state'],'completed')
+        self.assertEqual(self.broker.status(llm['id'])['state'],'queued')
+        self.assertFalse(self.ollama.calls)
+
+    def test_opt_in_llm_demand_releases_exact_idle_owner(self):
+        first = self.job('warm-demand-release-correlation')
+        self.broker.dispatch_once()
+        self.worker.model_loaded, self.worker.released = True, False
+        self.broker.set_executor_fence(self.worker.last, first['id'])
+        owner = self.worker.last
+        self.broker.asr_release_on_llm_demand = True
+        self.worker.release = Mock(wraps=self.worker.release)
+        llm = self.broker.submit('interactive','generate',{'prompt':'test'})
+        self.assertTrue(self.broker.dispatch_once())
+        self.worker.release.assert_called_once_with(owner)
+        self.assertIsNone(self.broker.executor_fence())
+        self.assertEqual(self.broker.status(llm['id'])['state'],'completed')
+
+    def test_failed_demand_release_keeps_fence_and_does_not_claim_llm(self):
+        first = self.job('warm-demand-failure-correlation')
+        self.broker.dispatch_once()
+        self.worker.model_loaded, self.worker.released = True, False
+        self.broker.set_executor_fence(self.worker.last, first['id'])
+        fence = self.broker.executor_fence()
+        self.broker.asr_release_on_llm_demand = True
+        self.worker.release = Mock(side_effect=OSError('injected release loss'))
+        llm = self.broker.submit('interactive','generate',{'prompt':'test'})
+        for _ in range(3): self.assertFalse(self.broker.dispatch_once())
+        self.worker.release.assert_called_once()
+        self.assertEqual(self.broker.executor_fence(),fence)
+        self.assertEqual(self.broker.status(llm['id'])['state'],'queued')
+
+    def test_api_rejects_reused_worker_token(self):
+        self.executor.worker = __import__('broker.asr',fromlist=['WhisperHTTP']).WhisperHTTP('http://127.0.0.1:9',TOKEN)
+        with self.assertRaisesRegex(ValueError,'credentials must be different'):
+            ASRAPI(self.broker,self.executor,TOKEN)
+        ASRAPI(self.broker,self.executor,TOKEN+'api')
 
     def test_timeout_fence_blocks_llm_until_same_request_acknowledged(self):
         self.worker.fail = True
@@ -427,6 +473,37 @@ class ASRTests(unittest.TestCase):
         for _ in range(2):
             self.assertEqual(self.request(port,'POST','/v1/transcriptions',b'audio',**{'Idempotency-Key':key})[0],410)
             self.assertEqual(list(self.spool.root.iterdir()),[])
+
+    def test_receipt_survives_metadata_purge_without_restaging(self):
+        port=self.start_http(); key='purged-receipt-correlation'
+        _,job=self.request(port,'POST','/v1/transcriptions',b'audio',**{'Idempotency-Key':key})
+        self.broker.dispatch_once()
+        self.assertEqual(self.request(port,'POST',f"/v1/transcriptions/{job['id']}/ack")[0],200)
+        with self.broker.lock,self.broker.db:
+            self.broker.db.execute("INSERT INTO job_retention_tombstones(job_id,source,external_id,profile,kind,final_state,created,purged_at) "
+                "SELECT id,source,external_id,profile,kind,state,created,? FROM jobs WHERE id=?",(time.time(),job['id']))
+            self.broker.db.execute('DELETE FROM jobs WHERE id=?',(job['id'],))
+        with patch.object(self.spool,'stage',wraps=self.spool.stage) as stage:
+            for _ in range(2):
+                self.assertEqual(self.request(port,'POST','/v1/transcriptions',b'audio',**{'Idempotency-Key':key})[0],410)
+                with self.broker.db: self.broker.db.execute('DELETE FROM job_retention_tombstones WHERE job_id=?',(job['id'],))
+            stage.assert_not_called()
+
+    def test_authenticated_retry_reuses_artifact_only_after_release(self):
+        port=self.start_http(); key='explicit-retry-correlation'
+        _,job=self.request(port,'POST','/v1/transcriptions',b'audio',**{'Idempotency-Key':key})
+        self.worker.fail=True; self.broker.dispatch_once()
+        retry=f"/v1/transcriptions/{job['id']}/retry"
+        self.assertEqual(self.request(port,'POST',retry)[0],409)
+        self.worker.released=True
+        self.assertTrue(self.broker.reconcile_executor_fence())
+        audio_files=list(self.spool.root.glob('*.audio'))
+        self.assertEqual(self.request(port,'POST',retry)[0],202)
+        self.assertEqual(list(self.spool.root.glob('*.audio')),audio_files)
+        self.worker.fail=False; self.broker.dispatch_once()
+        self.assertEqual(self.broker.status(job['id'])['state'],'completed')
+        self.assertEqual(self.request(port,'POST',f"/v1/transcriptions/{job['id']}/ack")[0],200)
+        self.assertEqual(self.request(port,'POST',retry)[0],410)
 
     def test_prune_skips_artifact_while_same_key_admission_is_active(self):
         key = 'prune-active-admission-key'
