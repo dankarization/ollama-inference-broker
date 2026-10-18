@@ -144,7 +144,7 @@ class ASRTests(unittest.TestCase):
         self.assertTrue(self.spool.audio(job["payload"]).exists())
         orphan = self.payload("orphan-after-admission-error")
         self.assertTrue(self.spool.discard_if_unowned(self.broker, "orphan-after-admission-error", orphan["artifact"]))
-        self.assertFalse(self.spool.audio(orphan).exists())
+        self.assertFalse(self.spool.path(orphan["artifact"], ".audio").exists())
 
     def test_audio_hash_path_and_size_are_checked(self):
         payload = self.payload()
