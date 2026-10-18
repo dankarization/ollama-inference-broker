@@ -46,7 +46,8 @@ Every request below requires `Authorization: Bearer ...` from the ASR token file
 - `POST /v1/transcriptions`: raw binary audio, `Content-Length` (up to 64 MiB),
   `Idempotency-Key` (16–100 ASCII letters/digits/underscore/hyphen). Returns 202
   with `id` and `state`. Same key and same input reuse the durable job; conflicting
-  input is rejected. A terminal acknowledged result cannot be resurrected by retry.
+  input is rejected. A terminal acknowledged or expired result returns 410 on
+  retry, without restaging private media.
 - `GET /v1/transcriptions/{id}`: state, `gpu_release_pending`, and raw `result`
   once completed. Missing/acknowledged result returns 410.
 - `POST /v1/transcriptions/{id}/cancel`: queued work is cancelled immediately;
@@ -63,6 +64,10 @@ older than 24 hours are pruned on the next authenticated upload; queued/running
 artifacts and all artifacts while a fence exists are preserved. There is no
 background deletion timer. Admission reserves up to 2 MiB per future result
 within the same spool cap. Idempotent retries do not reserve a duplicate copy.
+Pruning skips artifacts whose same-key admission/ACK is in progress. An empty
+or fully disabled queue does not probe the worker; a pending durable fence is
+still reconciled, at most once per five seconds while idle. WOL socket failures
+retain the ASR availability backoff without terminating the dispatcher.
 
 ## Ambiguous failures and rollback
 

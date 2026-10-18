@@ -187,7 +187,14 @@ class Spool:
                     continue
                 if ((SHA.fullmatch(path.stem) and path.suffix in {".audio", ".json", ".result-part"})
                         or (re.fullmatch(r"[a-f0-9]{32}", path.stem) and path.suffix == ".part")):
-                    path.unlink()
+                    lane = self.admission_locks[int(path.stem[:2], 16) % len(self.admission_locks)]
+                    # Never wait in inverse lock order (admission -> broker).
+                    # An active same-key upload/ACK owns this artifact until
+                    # its durable decision, so concurrent pruning skips it.
+                    if not lane.acquire(blocking=False):
+                        continue
+                    try: path.unlink()
+                    finally: lane.release()
             self.sync_directory()
 
 class WhisperHTTP:
@@ -371,11 +378,20 @@ class ASRAPI:
                 self.executor.spool.prune(self.broker)
                 with self.executor.spool.admission_lock(key):
                     with self.broker.lock:
+                        existing = self.broker.db.execute(
+                            "SELECT id,state FROM jobs WHERE source=? AND external_id=? LIMIT 1",
+                            (SOURCE, key)).fetchone()
                         acknowledged = self.broker.db.execute(
                             "SELECT 1 FROM asr_receipts r JOIN jobs j ON j.id=r.job_id "
                             "WHERE j.source=? AND j.external_id=?", (SOURCE, key)).fetchone()
                     if acknowledged:
                         handler._json(410, {"error": "ASR artifact acknowledged"}); return
+                    if existing and existing['state'] in {'completed','failed','cancelled'}:
+                        artifact = hashlib.sha256(key.encode()).hexdigest()
+                        if (not self.executor.spool.path(artifact,'.audio').is_file()
+                                or (existing['state']=='completed'
+                                    and not self.executor.spool.path(artifact,'.json').is_file())):
+                            handler._json(410, {"error":"ASR terminal artifact expired"}); return
                     payload = self.executor.spool.stage(key, handler.rfile, size, handler.connection)
                     try:
                         job = self.broker.submit(PROFILE, "transcribe", payload, SOURCE, external_id=key)

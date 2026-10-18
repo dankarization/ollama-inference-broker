@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 from broker.asr import ASRAPI, MODEL, PROFILE, MAX_RESULT_BYTES, Spool, WhisperExecutor, validate_payload
 from broker.http import serve
-from broker.service import Broker, SourceQueueFull, SourceAdmissionBlocked, SourcePolicy
+from broker.service import Broker, Dispatcher, SourceQueueFull, SourceAdmissionBlocked, SourcePolicy
 from broker.asr_recovery import recover
 
 TOKEN = "test-only-credential-" * 2
@@ -181,6 +181,60 @@ class ASRTests(unittest.TestCase):
         self.assertEqual(self.broker.status(job["id"])["state"], "queued")
         self.assertEqual(self.broker.status(other["id"])["state"], "completed")
         self.broker.wol.wake.assert_called()
+
+    def test_wol_socket_failure_does_not_kill_dispatcher_or_claim_asr(self):
+        job=self.job()
+        ready_status=self.worker.status
+        self.worker.status=Mock(side_effect=OSError('worker offline'))
+        attempted=threading.Event()
+        def fail_wake():
+            attempted.set()
+            raise OSError('injected WOL socket failure')
+        self.broker.wol.wake=Mock(side_effect=fail_wake)
+        dispatcher=Dispatcher(self.broker,interval=.01,allowed_sources=frozenset({PROFILE}))
+        dispatcher.start()
+        try:
+            self.assertTrue(attempted.wait(2))
+            time.sleep(.05)
+            self.assertTrue(dispatcher.is_alive())
+            state=self.broker.status(job['id'])
+            self.assertEqual(state['state'],'queued')
+            self.assertEqual(state['attempt_count'],0)
+            self.worker.status=ready_status
+            self.broker._asr_ready_after=0
+            deadline=time.monotonic()+3
+            while time.monotonic()<deadline and self.broker.status(job['id'])['state']!='completed':
+                time.sleep(.01)
+            self.assertEqual(self.broker.status(job['id'])['state'],'completed')
+            self.assertTrue(dispatcher.is_alive())
+        finally:
+            dispatcher.stop_event.set();dispatcher.join(3)
+
+    def test_empty_or_disabled_queue_does_not_probe_worker(self):
+        with patch.object(self.worker,'status') as status:
+            for _ in range(5): self.assertFalse(self.broker.dispatch_once())
+            status.assert_not_called()
+        self.job()
+        with patch.object(self.worker,'status') as status:
+            self.assertFalse(self.broker.dispatch_once(allowed_sources=frozenset()))
+            status.assert_not_called()
+
+    def test_idle_fence_reconciliation_is_throttled_but_can_clear(self):
+        job = self.job()
+        self.broker.dispatch_once()
+        self.broker.set_executor_fence('idle-fence-request', job['id'])
+        self.worker.last = 'idle-fence-request'
+        self.worker.released = False
+        with patch('broker.service.time.monotonic', return_value=100), patch.object(
+                self.worker, 'status', wraps=self.worker.status) as status:
+            for _ in range(5): self.assertFalse(self.broker.dispatch_once())
+            self.assertEqual(status.call_count, 1)
+            self.assertIsNotNone(self.broker.executor_fence())
+            self.worker.released = True
+            with patch('broker.service.time.monotonic', return_value=106):
+                self.assertFalse(self.broker.dispatch_once())
+            self.assertEqual(status.call_count, 2)
+            self.assertIsNone(self.broker.executor_fence())
 
     def test_policy_lane_skips_unavailable_asr_without_charging_it(self):
         job=self.job()
@@ -359,6 +413,41 @@ class ASRTests(unittest.TestCase):
         self.assertEqual(self.request(port, "POST", "/v1/transcriptions", b"audio",
                                      **{"Idempotency-Key": key})[0], 410)
         self.assertEqual(list(self.spool.root.iterdir()), [])
+
+    def test_pruned_unacknowledged_terminal_upload_is_not_restaged(self):
+        port=self.start_http()
+        key='pruned-terminal-correlation'
+        status,job=self.request(port,'POST','/v1/transcriptions',b'audio',**{'Idempotency-Key':key})
+        self.assertEqual(status,202)
+        self.broker.dispatch_once()
+        self.assertEqual(self.broker.status(job['id'])['state'],'completed')
+        for path in self.spool.root.iterdir(): os.utime(path,(1,1))
+        self.spool.prune(self.broker,now=100000)
+        self.assertEqual(list(self.spool.root.iterdir()),[])
+        for _ in range(2):
+            self.assertEqual(self.request(port,'POST','/v1/transcriptions',b'audio',**{'Idempotency-Key':key})[0],410)
+            self.assertEqual(list(self.spool.root.iterdir()),[])
+
+    def test_prune_skips_artifact_while_same_key_admission_is_active(self):
+        key = 'prune-active-admission-key'
+        payload = self.payload(key)
+        audio = self.spool.audio(payload)
+        os.utime(audio, (1, 1))
+        acquired, release = threading.Event(), threading.Event()
+        def hold_admission():
+            with self.spool.admission_lock(key):
+                acquired.set()
+                release.wait(3)
+        holder = threading.Thread(target=hold_admission)
+        holder.start()
+        try:
+            self.assertTrue(acquired.wait(2))
+            self.spool.prune(self.broker, now=100000)
+            self.assertTrue(audio.is_file())
+        finally:
+            release.set(); holder.join(3)
+        self.spool.prune(self.broker, now=100000)
+        self.assertFalse(audio.exists())
 
     def test_expiry_preserves_queued_artifacts_and_all_pending_fence_artifacts(self):
         job = self.job()

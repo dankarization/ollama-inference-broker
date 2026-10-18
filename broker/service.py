@@ -257,6 +257,7 @@ class Broker:
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
         self.whisper_executor = whisper_executor
         self._asr_ready_after = 0.0
+        self._idle_fence_probe_after = 0.0
         self.database = str(database)
         self.db = sqlite3.connect(self.database, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -1746,6 +1747,21 @@ class Broker:
         return False
 
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None) -> bool:
+        with self.lock:
+            if self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1").fetchone():
+                return False
+            ready_sources = frozenset(row[0] for row in self.db.execute(
+                "SELECT DISTINCT source FROM jobs WHERE state='queued'"))
+        permitted = (allowed_sources if allowed_sources is not None else
+                     policy.enabled_sources() if policy is not None else ready_sources)
+        if not ready_sources.intersection(permitted):
+            # No dispatch is possible. Do not poll an otherwise idle worker at
+            # the scheduler tick rate; reconcile a real pending fence at most
+            # every five seconds so an idle release still becomes visible.
+            if self.executor_fence() and time.monotonic() >= self._idle_fence_probe_after:
+                self._idle_fence_probe_after = time.monotonic() + 5.0
+                self.reconcile_executor_fence()
+            return False
         fence = self.executor_fence()
         if (fence is None and self.whisper_executor
                 and self.whisper_executor.allocation_pending()):
@@ -1779,7 +1795,13 @@ class Broker:
                 asr_ready = self.whisper_executor.available(self.ollama)
                 if not asr_ready:
                     self._asr_ready_after = time.monotonic() + 5.0
-                    self.wol.wake()
+                    try:
+                        self.wol.wake()
+                    except (OSError, ValueError) as error:
+                        # A transient broadcast failure must not terminate the
+                        # dispatcher or charge an execution attempt. Keep the
+                        # same backoff and let ready non-ASR lanes proceed.
+                        LOGGER.warning("ASR wake attempt failed (%s)", type(error).__name__)
             if not asr_ready:
                 permitted = (allowed_sources if allowed_sources is not None else
                              policy.enabled_sources() if policy is not None else queued_sources)
