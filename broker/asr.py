@@ -102,6 +102,12 @@ class Spool:
             out.flush()
             os.fsync(out.fileno())
         os.replace(temp, path)
+        if os.name != "nt":
+            directory = os.open(self.root, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         return {"artifact": artifact, "model": MODEL, "raw_text_stored": True}
 
     def result(self, artifact):
@@ -246,7 +252,13 @@ class ASRAPI:
                 size = int(handler.headers.get("Content-Length", "0"))
                 self.executor.spool.prune(self.broker)
                 payload = self.executor.spool.stage(key, handler.rfile, size, handler.connection)
-                job = self.broker.submit(PROFILE, "transcribe", payload, SOURCE, external_id=key)
+                try:
+                    job = self.broker.submit(PROFILE, "transcribe", payload, SOURCE, external_id=key)
+                except Exception:
+                    # Admission can fail after the upload is durably staged.
+                    # Do not leave an unreferenced audio artifact behind.
+                    self.executor.spool.discard(payload["artifact"])
+                    raise
                 handler._json(202, {"id": job["id"], "state": job["state"]})
                 return
             parts = path.strip("/").split("/")
