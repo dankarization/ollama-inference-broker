@@ -194,6 +194,24 @@ class WhisperHTTP:
     def transcribe(self, audio, request_id):
         return self.request("/v1/transcribe", audio, request_id)
 
+    def release(self):
+        cls = http.client.HTTPSConnection if self.url.scheme == "https" else http.client.HTTPConnection
+        conn = cls(self.url.hostname, self.url.port, timeout=10)
+        try:
+            conn.request("POST", "/v1/release", headers={"Authorization": "Bearer " + self.token})
+            response = conn.getresponse()
+            raw = response.read(MAX_RESULT_BYTES + 1)
+            if response.status != 200:
+                raise RuntimeError("Whisper release rejected")
+            result = json.loads(raw)
+            if result.get("gpu_released") is not True:
+                raise RuntimeError("Whisper release unconfirmed")
+            return result
+        except Exception:
+            raise RuntimeError("Whisper release unavailable") from None
+        finally:
+            conn.close()
+
 class WhisperExecutor:
     def __init__(self, spool, worker):
         self.spool, self.worker = spool, worker
@@ -229,6 +247,21 @@ class WhisperExecutor:
                     and status.get("request_tracking") is True)
         except Exception:
             return False
+
+    def release_idle(self, broker):
+        """Explicit, non-preemptive release for an Ollama handoff.
+
+        Callers must choose this policy explicitly; it never interrupts an
+        active inference and clears the fence only after worker confirmation.
+        """
+        fence = broker.executor_fence()
+        if not fence or not self.can_reuse():
+            return False
+        self.worker.release()
+        if self.can_release(fence["request_id"]):
+            broker.clear_executor_fence(fence["request_id"])
+            return broker.executor_fence() is None
+        return False
 
     def run(self, broker, row):
         payload = validate_payload(json.loads(row["payload"]))

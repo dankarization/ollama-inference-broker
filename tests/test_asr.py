@@ -42,6 +42,10 @@ class FakeWorker:
         self.released = True
         return {"text": "Russian transcript: ручей и тропинка", "model": MODEL, "device": "cuda"}
 
+    def release(self):
+        self.model_loaded = False
+        self.released = True
+
 class ASRTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -94,6 +98,13 @@ class ASRTests(unittest.TestCase):
         self.assertEqual(self.broker.status(first["id"])["state"], "completed")
         self.assertIsNotNone(self.broker.executor_fence())
         self.assertEqual(self.broker.executor_fence()["job_id"], first["id"])
+
+    def test_explicit_idle_release_clears_fence_after_worker_ack(self):
+        self.worker.model_loaded = True
+        job = self.job("warm-release")
+        self.broker.set_executor_fence("release-request", job["id"])
+        self.assertTrue(self.executor.release_idle(self.broker))
+        self.assertIsNone(self.broker.executor_fence())
 
     def test_fence_survives_restart_and_disabled_executor(self):
         self.worker.fail = True
