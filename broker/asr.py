@@ -205,7 +205,7 @@ class WhisperExecutor:
                 return False
             status = self.worker.status()
             return (status.get("model") == MODEL and status.get("active_jobs") == 0
-                    and status.get("model_loaded") is False
+                    and status.get("model_loaded") in {False, True}
                     and status.get("request_tracking") is True)
         except Exception:
             return False
@@ -217,6 +217,16 @@ class WhisperExecutor:
                     and status.get("model_loaded") is False
                     and status.get("last_request_id") == request_id
                     and status.get("last_request_gpu_released") is True)
+        except Exception:
+            return False
+
+    def can_reuse(self):
+        """Return true only for an idle, compatible warm Whisper owner."""
+        try:
+            status = self.worker.status()
+            return (status.get("model") == MODEL and status.get("active_jobs") == 0
+                    and status.get("model_loaded") is True
+                    and status.get("request_tracking") is True)
         except Exception:
             return False
 
@@ -232,12 +242,20 @@ class WhisperExecutor:
         if broker.ollama.ps().get("models"):
             raise RuntimeError("GPU occupied by Ollama; retry after idle expiry")
         request_id = str(uuid.uuid4())
-        broker.set_executor_fence(request_id, row["id"])
+        warm = self.can_reuse()
+        if warm:
+            broker.replace_executor_fence(request_id, row["id"])
+        else:
+            broker.set_executor_fence(request_id, row["id"])
         try:
             result = self.worker.transcribe(audio, request_id)
             if (result.get("model") != MODEL or result.get("device") != "cuda"
                     or not isinstance(result.get("text"), str) or not result["text"].strip()):
                 raise RuntimeError("invalid Whisper result")
+            if warm:
+                # Successful warm completion retains ownership. The worker's
+                # idle monitor will later unload and make can_release true.
+                return self.spool.save_result(payload["artifact"], result)
             for _ in range(20):
                 if self.can_release(request_id):
                     broker.clear_executor_fence(request_id)

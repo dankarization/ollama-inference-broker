@@ -1711,6 +1711,16 @@ class Broker:
                             (request_id, job_id))
             self._gpu_fence = {"request_id": request_id, "job_id": job_id}
 
+    def replace_executor_fence(self, request_id, job_id):
+        """Move an existing warm Whisper ownership fence to the next job."""
+        with self.lock, self.db:
+            self.db.execute(
+                "UPDATE gpu_executor_fences SET request_id=?, job_id=? "
+                "WHERE resource='mainpc-gpu'",
+                (request_id, job_id),
+            )
+            self._gpu_fence = {"request_id": request_id, "job_id": job_id}
+
     def clear_executor_fence(self, request_id):
         with self.lock, self.db:
             self.db.execute("DELETE FROM gpu_executor_fences WHERE resource='mainpc-gpu' AND request_id=?",
@@ -1733,7 +1743,19 @@ class Broker:
 
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None) -> bool:
         if not self.reconcile_executor_fence():
-            return False
+            # A warm Whisper model owns the GPU but can safely serve another
+            # queued Whisper job. Non-ASR work remains blocked until the
+            # worker's idle monitor confirms unload and the fence clears.
+            warm_asr = bool(
+                self.whisper_executor
+                and self.whisper_executor.can_reuse()
+                and self.db.execute(
+                    "SELECT 1 FROM jobs WHERE source=? AND state='queued' LIMIT 1",
+                    (ASR_PROFILE,),
+                ).fetchone()
+            )
+            if not warm_asr:
+                return False
         with self.lock, self.db:
             if self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested')").fetchone():
                 return False

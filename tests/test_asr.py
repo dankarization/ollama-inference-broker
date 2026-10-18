@@ -29,9 +29,10 @@ class FakeOllama:
 class FakeWorker:
     def __init__(self):
         self.last, self.released, self.active, self.fail = None, False, 0, False
+        self.model_loaded = False
         self.calls = []
     def status(self):
-        return {"model": MODEL, "active_jobs": self.active, "model_loaded": False,
+        return {"model": MODEL, "active_jobs": self.active, "model_loaded": self.model_loaded,
                 "request_tracking": True, "last_request_id": self.last,
                 "last_request_gpu_released": self.released}
     def transcribe(self, path, request_id):
@@ -84,6 +85,15 @@ class ASRTests(unittest.TestCase):
         self.worker.last = real
         self.assertTrue(self.broker.dispatch_once())
         self.assertTrue(self.ollama.calls)
+
+    def test_warm_whisper_reuses_owner_fence_for_next_asr(self):
+        self.worker.model_loaded = True
+        first = self.job("warm-first")
+        self.broker.set_executor_fence("old-request", first["id"])
+        self.assertTrue(self.broker.dispatch_once())
+        self.assertEqual(self.broker.status(first["id"])["state"], "completed")
+        self.assertIsNotNone(self.broker.executor_fence())
+        self.assertEqual(self.broker.executor_fence()["job_id"], first["id"])
 
     def test_fence_survives_restart_and_disabled_executor(self):
         self.worker.fail = True
