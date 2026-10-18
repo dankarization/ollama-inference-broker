@@ -92,7 +92,7 @@ class ASRTests(unittest.TestCase):
 
     def test_warm_whisper_reuses_owner_fence_for_next_asr(self):
         self.worker.model_loaded = True
-        first = self.job("warm-first-001")
+        first = self.job("warm-first-correlation")
         self.broker.set_executor_fence("old-request", first["id"])
         self.assertTrue(self.broker.dispatch_once())
         self.assertEqual(self.broker.status(first["id"])["state"], "completed")
@@ -102,6 +102,7 @@ class ASRTests(unittest.TestCase):
     def test_explicit_idle_release_clears_fence_after_worker_ack(self):
         self.worker.model_loaded = True
         job = self.job("warm-release-001")
+        self.worker.last = "release-request"
         self.broker.set_executor_fence("release-request", job["id"])
         self.assertTrue(self.executor.release_idle(self.broker))
         self.assertIsNone(self.broker.executor_fence())
