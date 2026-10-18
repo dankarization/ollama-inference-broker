@@ -1742,7 +1742,8 @@ class Broker:
         return False
 
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None) -> bool:
-        if not self.reconcile_executor_fence():
+        fence_blocked = not self.reconcile_executor_fence()
+        if fence_blocked:
             # A warm Whisper model owns the GPU but can safely serve another
             # queued Whisper job. Non-ASR work remains blocked until the
             # worker's idle monitor confirms unload and the fence clears.
@@ -1761,6 +1762,11 @@ class Broker:
                 return False
             row = self._next(allowed_sources, policy)
             if not row: return False
+            if fence_blocked and row["source"] != ASR_PROFILE:
+                # _next may select a non-ASR lane even when an ASR job also
+                # exists; warm ownership must never let that job bypass the
+                # unresolved GPU fence.
+                return False
             if row["profile"] == ASR_PROFILE:
                 if self.whisper_executor is None or time.monotonic() < self._asr_ready_after:
                     return False
