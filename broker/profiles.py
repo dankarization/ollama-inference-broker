@@ -21,6 +21,8 @@ class Profile:
 # This is deliberately server-owned. Callers can select a profile, never a model
 # or unbounded generation parameters.
 PROFILES = {
+    "stt-whisper": Profile("stt-whisper", "whisper-medium-int8-mainpc-cuda", 0, 0, 0,
+                           request_timeout_seconds=960),
     "interactive": Profile("interactive", "nemotron3:33b", 16_384, 2_048, 180),
     "cron": Profile("cron", "nemotron3:33b", 8_192, 1_024, 120),
     # Preserve the original profile name for already-queued agent turns.
