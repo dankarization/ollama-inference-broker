@@ -52,7 +52,8 @@ Every request below requires `Authorization: Bearer ...` from the ASR token file
 - `POST /v1/transcriptions/{id}/cancel`: queued work is cancelled immediately;
   running work keeps the GPU claim until the worker finishes.
 - `POST /v1/transcriptions/{id}/ack`: delete this terminal job's audio/result
-  artifacts. Refused while its GPU release remains uncertain.
+  artifacts after recording a durable receipt. This does not release the GPU
+  fence; a completed warm result can be acknowledged immediately.
 
 The legacy queue submission and mutation routes reject ASR operations. Public
 status/dashboard data contains only artifact references, never raw audio or text.
@@ -60,7 +61,8 @@ The spool allows 512 MiB of staged files and 32 outstanding ASR jobs. Uploads ar
 serialized, capped at 60 seconds and two admitted HTTP handlers. Abandoned files
 older than 24 hours are pruned on the next authenticated upload; queued/running
 artifacts and all artifacts while a fence exists are preserved. There is no
-background deletion timer. Results add at most 2 MiB per completed request.
+background deletion timer. Admission reserves up to 2 MiB per future result
+within the same spool cap. Idempotent retries do not reserve a duplicate copy.
 
 ## Ambiguous failures and rollback
 
@@ -70,10 +72,29 @@ acknowledges the same request with no active job and no loaded Whisper model.
 `/healthz` then includes `gpu_executor: awaiting_worker_release` and its job ID.
 The STT client must not fall back to another GPU backend for such an outcome.
 
-A worker restart loses its in-memory acknowledgement, so this deliberately
-requires operator recovery. Verify the old worker process has exited and its GPU
-allocation is gone before clearing that exact fence through the broker's local
-administrative API. Do not clear it merely because a new process reports idle.
+The worker durably records its in-flight UUID before inference. A replacement
+can acknowledge that same UUID only after confirming the old process exited
+and its own engine is clean. Inaccessible process state remains fail-closed.
+Cold and warm successful transcripts complete immediately; the model remains
+resident for `MODEL_IDLE_SECONDS` (Whisper default 1200 seconds). The idle monitor
+unloads under the inference lock and publishes request-specific release proof.
+Warm reuse requires the worker UUID to match the existing durable fence.
+
+For a legacy restart without a usable journal, stop dispatch and verify the old
+worker process exited and its GPU allocation is gone. The local recovery CLI
+requires both explicit operator confirmations, an exact request/job identity,
+no running broker jobs and authenticated proof of an unloaded clean worker:
+
+```sh
+python3 -m broker.asr_recovery --database /path/to/broker.sqlite3 \
+  --request-id EXACT-FENCED-UUID --job-id EXACT-FENCED-JOB-UUID \
+  --worker-url http://configured-worker:port --worker-token-file /private/worker.token \
+  --confirm-old-executor-exited --confirm-dispatch-stopped
+```
+
+The CLI records the operator decision durably and deletes only that exact fence
+in one transaction. It is not a network administrative endpoint and never
+edits source policy, stops processes or bypasses an unconfirmed native unload.
 
 Before rollback: stop new ASR admissions, cancel/drain queued ASR work, wait for
 the current worker and all fences to resolve, and save the queue database/config.

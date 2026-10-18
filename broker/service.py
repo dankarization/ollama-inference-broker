@@ -291,6 +291,8 @@ class Broker:
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS gpu_executor_fences "
                             "(resource TEXT PRIMARY KEY, request_id TEXT NOT NULL, job_id TEXT NOT NULL)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS asr_receipts "
+                            "(job_id TEXT PRIMARY KEY, acknowledged_at REAL NOT NULL)")
         self._gpu_fence = self.executor_fence()
         self.storage = StorageManager(
             self.db, self.database, self.lock, self.clock, self._audit,
@@ -1711,13 +1713,13 @@ class Broker:
                             (request_id, job_id))
             self._gpu_fence = {"request_id": request_id, "job_id": job_id}
 
-    def replace_executor_fence(self, request_id, job_id):
+    def replace_executor_fence(self, request_id, job_id, expected_request_id):
         """Move an existing warm Whisper ownership fence to the next job."""
         with self.lock, self.db:
             cursor = self.db.execute(
                 "UPDATE gpu_executor_fences SET request_id=?, job_id=? "
-                "WHERE resource='mainpc-gpu'",
-                (request_id, job_id),
+                "WHERE resource='mainpc-gpu' AND request_id=?",
+                (request_id, job_id, expected_request_id),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Whisper warm ownership fence missing")
@@ -1746,18 +1748,19 @@ class Broker:
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None) -> bool:
         fence = self.executor_fence()
         if (fence is None and self.whisper_executor
-                and self.whisper_executor.can_reuse()):
+                and self.whisper_executor.allocation_pending()):
             # A resident Whisper model without a durable broker owner is
             # fail-closed: never schedule ASR or Ollama concurrently.
             return False
         fence_blocked = not self.reconcile_executor_fence()
+        fence = self.executor_fence()
         if fence_blocked:
             # A warm Whisper model owns the GPU but can safely serve another
             # queued Whisper job. Non-ASR work remains blocked until the
             # worker's idle monitor confirms unload and the fence clears.
             warm_asr = bool(
                 self.whisper_executor
-                and self.whisper_executor.can_reuse()
+                and self.whisper_executor.can_reuse(self.executor_fence())
                 and self.db.execute(
                     "SELECT 1 FROM jobs WHERE source=? AND state='queued' LIMIT 1",
                     (ASR_PROFILE,),
@@ -1765,7 +1768,25 @@ class Broker:
             )
             if not warm_asr:
                 return False
+        # Probe outside both the broker mutex and SQLite transaction. Slow
+        # private HTTP endpoints must not block submissions/status/cancel.
+        with self.lock:
+            queued_sources = frozenset(row[0] for row in self.db.execute(
+                "SELECT DISTINCT source FROM jobs WHERE state='queued'"))
+        if ASR_PROFILE in queued_sources:
+            asr_ready = False
+            if self.whisper_executor and time.monotonic() >= self._asr_ready_after:
+                asr_ready = self.whisper_executor.available(self.ollama)
+                if not asr_ready:
+                    self._asr_ready_after = time.monotonic() + 5.0
+                    self.wol.wake()
+            if not asr_ready:
+                permitted = (allowed_sources if allowed_sources is not None else
+                             policy.enabled_sources() if policy is not None else queued_sources)
+                allowed_sources = permitted - {ASR_PROFILE}
         with self.lock, self.db:
+            if self.executor_fence() != fence:
+                return False
             if self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested')").fetchone():
                 return False
             row = self._next(allowed_sources, policy)
@@ -1775,12 +1796,6 @@ class Broker:
                 # exists; warm ownership must never let that job bypass the
                 # unresolved GPU fence.
                 return False
-            if row["profile"] == ASR_PROFILE:
-                if self.whisper_executor is None or time.monotonic() < self._asr_ready_after:
-                    return False
-                if not self.whisper_executor.available(self.ollama):
-                    self._asr_ready_after = time.monotonic() + 5.0
-                    return False
             now = self.clock()
             attempt_no = int(row["attempt_count"] or 0) + 1
             # A lease covers the server-owned remote deadline, not just a
@@ -1869,7 +1884,7 @@ class Broker:
             if self.whisper_executor is None:
                 raise RuntimeError("ASR executor disabled")
             result = self.whisper_executor.run(self, row)
-            self._finish_execution(row, result, "Whisper completed and GPU release acknowledged")
+            self._finish_execution(row, result, "Whisper transcription completed; GPU fence tracked independently")
             return
         profile = PROFILES[row["profile"]]
         self.wol.wake()

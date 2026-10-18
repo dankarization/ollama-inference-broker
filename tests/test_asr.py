@@ -8,11 +8,12 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from broker.asr import ASRAPI, MODEL, PROFILE, Spool, WhisperExecutor, validate_payload
+from broker.asr import ASRAPI, MODEL, PROFILE, MAX_RESULT_BYTES, Spool, WhisperExecutor, validate_payload
 from broker.http import serve
-from broker.service import Broker
+from broker.service import Broker, SourceQueueFull, SourceAdmissionBlocked, SourcePolicy
+from broker.asr_recovery import recover
 
 TOKEN = "test-only-credential-" * 2
 
@@ -42,7 +43,7 @@ class FakeWorker:
         self.released = True
         return {"text": "Russian transcript: ручей и тропинка", "model": MODEL, "device": "cuda"}
 
-    def release(self):
+    def release(self, request_id):
         self.model_loaded = False
         self.released = True
 
@@ -116,6 +117,84 @@ class ASRTests(unittest.TestCase):
         self.job("warm-unfenced-correlation")
         self.assertFalse(self.broker.dispatch_once())
         self.assertIsNone(self.broker.executor_fence())
+
+    def test_unusable_unfenced_allocation_also_blocks_ollama(self):
+        status=self.worker.status()
+        self.worker.status=Mock(return_value={**status,"model_loaded":True,"model_usable":False})
+        self.broker.submit("interactive","generate",{"prompt":"test"})
+        self.assertFalse(self.broker.dispatch_once())
+        self.assertFalse(self.ollama.calls)
+
+    def test_unrelated_warm_owner_cannot_replace_fence(self):
+        job = self.job("warm-owner-correlation")
+        self.broker.set_executor_fence("original-owner", job["id"])
+        self.worker.model_loaded = True
+        self.worker.last = "unrelated-owner"
+        self.assertFalse(self.broker.dispatch_once())
+        self.assertEqual(self.broker.executor_fence()["request_id"], "original-owner")
+        self.assertFalse(self.worker.calls)
+
+    def test_operator_recovery_requires_exact_identity_idle_proof_and_confirmations(self):
+        job=self.job()
+        self.broker.set_executor_fence("old-owner",job["id"])
+        worker=Mock()
+        worker.status.return_value={"model":MODEL,"active_jobs":0,"model_loaded":False,
+                                    "gpu_release_confirmed":True,"last_request_id":None}
+        arguments=(self.broker.database,worker,"old-owner",job["id"])
+        with self.assertRaises(ValueError): recover(*arguments)
+        worker.status.return_value["gpu_release_confirmed"]=False
+        with self.assertRaises(ValueError): recover(*arguments,executor_stopped=True,dispatch_stopped=True)
+        self.assertIsNotNone(self.broker.executor_fence())
+        worker.status.return_value["gpu_release_confirmed"]=True
+        with self.assertRaises(ValueError):
+            recover(self.broker.database,worker,"wrong-owner",job["id"],executor_stopped=True,dispatch_stopped=True)
+        recover(*arguments,executor_stopped=True,dispatch_stopped=True)
+        self.assertIsNone(self.broker.executor_fence())
+        self.assertEqual(self.broker.db.execute("SELECT request_id FROM asr_fence_recoveries").fetchone()[0],"old-owner")
+
+    def test_probe_does_not_block_status_or_admission(self):
+        job = self.job()
+        entered, finish = threading.Event(), threading.Event()
+        def probe(_ollama):
+            entered.set(); finish.wait(3); return False
+        with patch.object(self.executor, "available", side_effect=probe):
+            thread = threading.Thread(target=self.broker.dispatch_once)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                completed = threading.Event()
+                def lookup():
+                    self.broker.status(job["id"])
+                    self.broker.submit("interactive", "generate", {"prompt": "test"})
+                    completed.set()
+                lookup_thread = threading.Thread(target=lookup)
+                lookup_thread.start()
+                self.assertTrue(completed.wait(0.5))
+            finally:
+                finish.set(); thread.join(3); lookup_thread.join(3)
+
+    def test_unavailable_asr_does_not_starve_ollama_and_wakes_host(self):
+        job = self.job()
+        self.worker.status = Mock(side_effect=OSError("worker offline"))
+        other = self.broker.submit("interactive", "generate", {"prompt": "test"})
+        self.assertTrue(self.broker.dispatch_once())
+        self.assertEqual(self.broker.status(job["id"])["state"], "queued")
+        self.assertEqual(self.broker.status(other["id"])["state"], "completed")
+        self.broker.wol.wake.assert_called()
+
+    def test_policy_lane_skips_unavailable_asr_without_charging_it(self):
+        job=self.job()
+        path=self.root/'policy.json'
+        path.write_text(json.dumps({"version":1,"sources":{
+            PROFILE:{"enabled":True,"weight":9},"interactive":{"enabled":True,"weight":1}}}))
+        policy=SourcePolicy(path)
+        with self.broker.lock:
+            self.assertEqual(self.broker._next(policy=policy)["source"],PROFILE)
+        self.worker.status=Mock(side_effect=OSError("worker offline"))
+        other=self.broker.submit("interactive","generate",{"prompt":"test"})
+        self.assertTrue(self.broker.dispatch_once(policy=policy))
+        self.assertEqual(self.broker.status(job["id"])["attempt_count"],0)
+        self.assertEqual(self.broker.status(other["id"])["state"],"completed")
 
     def test_fence_survives_restart_and_disabled_executor(self):
         self.worker.fail = True
@@ -195,6 +274,91 @@ class ASRTests(unittest.TestCase):
         self.spool.max_bytes = 1
         with self.assertRaises(ValueError): self.payload("test-correlation-002")
         self.assertEqual(self.spool.audio(payload).read_bytes(), b"fake audio")
+
+    def test_retry_at_capacity_and_reserved_result(self):
+        self.spool.max_bytes = len(b"fake audio") + MAX_RESULT_BYTES
+        payload = self.payload()
+        self.assertEqual(self.payload(), payload)
+        with self.assertRaises(ValueError): self.payload("new-key-correlation")
+        self.spool.save_result(payload["artifact"], {"model": MODEL, "text": "test"})
+        self.assertLessEqual(self.spool.accounted_bytes(), self.spool.max_bytes)
+
+    def test_spool_rejects_foreign_uid_even_with_private_mode(self):
+        if os.name == "nt": self.skipTest("POSIX ownership check")
+        with patch("broker.asr.os.getuid", return_value=os.getuid()+1):
+            with self.assertRaisesRegex(ValueError, "owner-only"):
+                Spool(self.spool.root)
+
+    def test_artifact_rename_and_delete_fsync_directory(self):
+        if os.name=="nt": self.skipTest("directory fsync on POSIX")
+        import stat
+        snapshots=[]; real_fsync=os.fsync
+        def fsync(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                snapshots.append(sorted(path.suffix for path in self.spool.root.iterdir()))
+            return real_fsync(descriptor)
+        with patch("broker.asr.os.fsync",side_effect=fsync):
+            payload=self.payload()
+            self.spool.save_result(payload["artifact"],{"text":"test"})
+            self.spool.discard(payload["artifact"])
+        self.assertIn([".audio"],snapshots)
+        self.assertIn([".audio",".json"],snapshots)
+        self.assertEqual(snapshots[-1],[])
+
+    def test_http_admission_codes_are_preserved_and_orphans_removed(self):
+        port=self.start_http()
+        for error,expected in ((SourceAdmissionBlocked(PROFILE),403),(SourceQueueFull("test"),429)):
+            with patch.object(self.broker,"submit",side_effect=error):
+                self.assertEqual(self.request(port,"POST","/v1/transcriptions",b"audio",
+                    **{"Idempotency-Key":"rejected-admission-key"})[0],expected)
+            self.assertEqual(list(self.spool.root.iterdir()),[])
+
+    def test_concurrent_same_key_rejection_cannot_delete_other_admission(self):
+        port = self.start_http()
+        original_submit = self.broker.submit
+        original_discard = self.spool.discard_if_unowned
+        entered, second_attempt, discarded = threading.Event(), threading.Event(), threading.Event()
+        counter = 0
+        def submit(*args, **kwargs):
+            nonlocal counter
+            counter += 1
+            if counter == 1:
+                entered.set(); second_attempt.wait(2); time.sleep(0.05)
+                raise SourceQueueFull("test queue full")
+            self.assertTrue(discarded.wait(2))
+            return original_submit(*args, **kwargs)
+        def discard(*args):
+            try: return original_discard(*args)
+            finally: discarded.set()
+        responses = []
+        def request(second=False):
+            if second: second_attempt.set()
+            responses.append(self.request(port, "POST", "/v1/transcriptions", b"audio",
+                                          **{"Idempotency-Key": "concurrent-same-key"}))
+        with patch.object(self.broker,"submit",side_effect=submit), \
+             patch.object(self.spool,"discard_if_unowned",side_effect=discard):
+            first = threading.Thread(target=request); first.start()
+            self.assertTrue(entered.wait(2))
+            second = threading.Thread(target=request,args=(True,));second.start()
+            first.join(5);second.join(5)
+        self.assertEqual(sorted(code for code,_ in responses),[202,429])
+        job_id=next(data["id"] for code,data in responses if code==202)
+        self.assertEqual(self.spool.audio(self.broker.status(job_id)["payload"]).read_bytes(),b"audio")
+
+    def test_ack_while_warm_does_not_clear_fence_or_resurrect_media(self):
+        port = self.start_http()
+        key = "ack-warm-correlation"
+        status, job = self.request(port, "POST", "/v1/transcriptions", b"audio",
+                                   **{"Idempotency-Key": key})
+        self.assertEqual(status, 202)
+        self.broker.dispatch_once()
+        self.broker.set_executor_fence("still-warm", job["id"])
+        path = "/v1/transcriptions/" + job["id"]
+        self.assertEqual(self.request(port, "POST", path + "/ack")[0], 200)
+        self.assertEqual(self.broker.executor_fence()["request_id"], "still-warm")
+        self.assertEqual(self.request(port, "POST", "/v1/transcriptions", b"audio",
+                                     **{"Idempotency-Key": key})[0], 410)
+        self.assertEqual(list(self.spool.root.iterdir()), [])
 
     def test_expiry_preserves_queued_artifacts_and_all_pending_fence_artifacts(self):
         job = self.job()

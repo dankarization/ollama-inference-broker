@@ -35,9 +35,29 @@ class Spool:
     def __init__(self, root, max_bytes=512 * 1024 * 1024):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if os.name != "nt" and self.root.stat().st_mode & 0o077:
+        if os.name != "nt" and (self.root.stat().st_mode & 0o077
+                                  or self.root.stat().st_uid != os.getuid()):
             raise ValueError("ASR spool must be owner-only")
         self.max_bytes, self.lock = max_bytes, threading.Lock()
+        self.admission_locks = [threading.RLock() for _ in range(64)]
+
+    def admission_lock(self, key):
+        return self.admission_locks[int(hashlib.sha256(key.encode()).hexdigest()[:2], 16) % 64]
+
+    def sync_directory(self):
+        if os.name != "nt":
+            descriptor = os.open(self.root, os.O_RDONLY)
+            try: os.fsync(descriptor)
+            finally: os.close(descriptor)
+
+    def accounted_bytes(self):
+        files = [p for p in self.root.iterdir() if p.is_file()]
+        used = sum(p.stat().st_size for p in files)
+        # Every admitted audio can produce one bounded transcript. Reserve
+        # its maximum result until the actual result replaces that reserve.
+        used += sum(MAX_RESULT_BYTES for p in files if p.suffix == ".audio"
+                    and not self.path(p.stem, ".json").exists())
+        return used
 
     def path(self, artifact, suffix):
         if not isinstance(artifact, str) or not SHA.fullmatch(artifact):
@@ -54,10 +74,24 @@ class Spool:
         dest = self.path(artifact, ".audio")
         temp = self.root / (uuid.uuid4().hex + ".part")
         with self.lock:
-            used = sum(p.stat().st_size for p in self.root.iterdir() if p.is_file())
-            if used + size > self.max_bytes:
+            exists = dest.exists()
+            if not exists and self.accounted_bytes() + size + MAX_RESULT_BYTES > self.max_bytes:
                 raise ValueError("ASR spool capacity reached")
             digest, deadline = hashlib.sha256(), time.monotonic() + 60
+            if exists:
+                # Validate an idempotent retry by streaming its digest. No
+                # duplicate file or capacity reservation is needed.
+                remaining = size
+                while remaining:
+                    budget = deadline - time.monotonic()
+                    if budget <= 0: raise ValueError("ASR upload deadline")
+                    connection.settimeout(min(10, budget))
+                    block = stream.read(min(64 * 1024, remaining))
+                    if not block: raise ValueError("ASR incomplete upload")
+                    digest.update(block); remaining -= len(block)
+                if dest.stat().st_size != size or hashlib.sha256(dest.read_bytes()).hexdigest() != digest.hexdigest():
+                    raise ValueError("ASR idempotency conflict")
+                return {"artifact": artifact, "sha256": digest.hexdigest(), "bytes": size}
             try:
                 with temp.open("xb") as out:
                     if os.name != "nt": os.chmod(temp, 0o600)
@@ -79,12 +113,7 @@ class Spool:
                         raise ValueError("ASR idempotency conflict")
                 else:
                     os.replace(temp, dest)
-                    if os.name != "nt":
-                        directory = os.open(self.root, os.O_RDONLY)
-                        try:
-                            os.fsync(directory)
-                        finally:
-                            os.close(directory)
+                    self.sync_directory()
                 return {"artifact": artifact, "sha256": checksum, "bytes": size}
             finally:
                 temp.unlink(missing_ok=True)
@@ -102,18 +131,21 @@ class Spool:
         encoded = json.dumps(result, ensure_ascii=False).encode("utf-8")
         if len(encoded) > MAX_RESULT_BYTES: raise ValueError("ASR result too large")
         path, temp = self.path(artifact, ".json"), self.path(artifact, ".result-part")
-        with temp.open("wb") as out:
-            if os.name != "nt": os.chmod(temp, 0o600)
-            out.write(encoded)
-            out.flush()
-            os.fsync(out.fileno())
-        os.replace(temp, path)
-        if os.name != "nt":
-            directory = os.open(self.root, os.O_RDONLY)
+        with self.lock:
+            reserved = (MAX_RESULT_BYTES if not path.exists()
+                        and self.path(artifact, ".audio").exists() else 0)
+            if self.accounted_bytes() - reserved + len(encoded) > self.max_bytes:
+                raise ValueError("ASR spool capacity reached")
             try:
-                os.fsync(directory)
+                with temp.open("wb") as out:
+                    if os.name != "nt": os.chmod(temp, 0o600)
+                    out.write(encoded)
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.replace(temp, path)
+                self.sync_directory()
             finally:
-                os.close(directory)
+                temp.unlink(missing_ok=True)
         return {"artifact": artifact, "model": MODEL, "raw_text_stored": True}
 
     def result(self, artifact):
@@ -123,6 +155,7 @@ class Spool:
         with self.lock:
             for suffix in (".audio", ".json"):
                 self.path(artifact, suffix).unlink(missing_ok=True)
+            self.sync_directory()
 
     def discard_if_unowned(self, broker, key, artifact):
         """Remove only a newly staged artifact with no durable job reference."""
@@ -135,6 +168,7 @@ class Spool:
                 return False
             for suffix in (".audio", ".json"):
                 self.path(artifact, suffix).unlink(missing_ok=True)
+            self.sync_directory()
             return True
 
     def prune(self, broker, now=None):
@@ -154,6 +188,7 @@ class Spool:
                 if ((SHA.fullmatch(path.stem) and path.suffix in {".audio", ".json", ".result-part"})
                         or (re.fullmatch(r"[a-f0-9]{32}", path.stem) and path.suffix == ".part")):
                     path.unlink()
+            self.sync_directory()
 
 class WhisperHTTP:
     def __init__(self, url, token, timeout=900):
@@ -194,11 +229,12 @@ class WhisperHTTP:
     def transcribe(self, audio, request_id):
         return self.request("/v1/transcribe", audio, request_id)
 
-    def release(self):
+    def release(self, request_id):
         cls = http.client.HTTPSConnection if self.url.scheme == "https" else http.client.HTTPConnection
         conn = cls(self.url.hostname, self.url.port, timeout=10)
         try:
-            conn.request("POST", "/v1/release", headers={"Authorization": "Bearer " + self.token})
+            conn.request("POST", "/v1/release", headers={"Authorization": "Bearer " + self.token,
+                                                       "X-Request-Id": request_id})
             response = conn.getresponse()
             raw = response.read(MAX_RESULT_BYTES + 1)
             if response.status != 200:
@@ -216,14 +252,26 @@ class WhisperExecutor:
     def __init__(self, spool, worker):
         self.spool, self.worker = spool, worker
 
+    def allocation_pending(self):
+        """Detect resident/unconfirmed work independently of its reusability."""
+        try:
+            status=self.worker.status()
+            return (status.get("model")==MODEL and
+                    (status.get("model_loaded") is True or status.get("active_jobs",0)>0
+                     or status.get("gpu_release_confirmed") is False))
+        except Exception:
+            return False
+
     def available(self, ollama):
         try:
             # Leave resident models and their callers alone; wait for natural expiry.
             if ollama.ps(timeout_seconds=5).get("models"):
                 return False
             status = self.worker.status()
-            return (status.get("model") == MODEL and status.get("active_jobs") == 0
+            return (status.get("status", "ready") == "ready"
+                    and status.get("model") == MODEL and status.get("active_jobs") == 0
                     and status.get("model_loaded") in {False, True}
+                    and status.get("model_usable",True) is True
                     and status.get("request_tracking") is True)
         except Exception:
             return False
@@ -238,13 +286,15 @@ class WhisperExecutor:
         except Exception:
             return False
 
-    def can_reuse(self):
+    def can_reuse(self, fence=None, *, for_release=False):
         """Return true only for an idle, compatible warm Whisper owner."""
         try:
             status = self.worker.status()
             return (status.get("model") == MODEL and status.get("active_jobs") == 0
                     and status.get("model_loaded") is True
-                    and status.get("request_tracking") is True)
+                    and status.get("request_tracking") is True
+                    and (for_release or status.get("model_usable",True) is True)
+                    and (fence is None or status.get("last_request_id") == fence["request_id"]))
         except Exception:
             return False
 
@@ -255,9 +305,9 @@ class WhisperExecutor:
         active inference and clears the fence only after worker confirmation.
         """
         fence = broker.executor_fence()
-        if not fence or not self.can_reuse():
+        if not fence or not self.can_reuse(fence, for_release=True):
             return False
-        self.worker.release()
+        self.worker.release(fence["request_id"])
         if self.can_release(fence["request_id"]):
             broker.clear_executor_fence(fence["request_id"])
             return broker.executor_fence() is None
@@ -267,7 +317,8 @@ class WhisperExecutor:
         payload = validate_payload(json.loads(row["payload"]))
         audio = self.spool.audio(payload)
         status = self.worker.status()
-        if (status.get("model") != MODEL or status.get("active_jobs") != 0
+        if (status.get("status", "ready") != "ready"
+                or status.get("model") != MODEL or status.get("active_jobs") != 0
                 or status.get("model_loaded") not in (False, True)
                 or status.get("request_tracking") is not True):
             raise RuntimeError("Whisper worker not idle or incompatible")
@@ -275,9 +326,12 @@ class WhisperExecutor:
         if broker.ollama.ps().get("models"):
             raise RuntimeError("GPU occupied by Ollama; retry after idle expiry")
         request_id = str(uuid.uuid4())
-        warm = self.can_reuse()
+        fence = broker.executor_fence()
+        warm = status.get("model_loaded") is True
         if warm:
-            broker.replace_executor_fence(request_id, row["id"])
+            if not fence or not self.can_reuse(fence):
+                raise RuntimeError("Whisper warm ownership mismatch")
+            broker.replace_executor_fence(request_id, row["id"], fence["request_id"])
         else:
             broker.set_executor_fence(request_id, row["id"])
         try:
@@ -285,16 +339,10 @@ class WhisperExecutor:
             if (result.get("model") != MODEL or result.get("device") != "cuda"
                     or not isinstance(result.get("text"), str) or not result["text"].strip()):
                 raise RuntimeError("invalid Whisper result")
-            if warm:
-                # Successful warm completion retains ownership. The worker's
-                # idle monitor will later unload and make can_release true.
-                return self.spool.save_result(payload["artifact"], result)
-            for _ in range(20):
-                if self.can_release(request_id):
-                    broker.clear_executor_fence(request_id)
-                    return self.spool.save_result(payload["artifact"], result)
-                time.sleep(0.1)
-            raise RuntimeError("Whisper release not acknowledged")
+            # Transcript completion and GPU ownership are independent. Keep
+            # the fence until request-specific unload proof, including cold
+            # requests that leave the model warm for the idle window.
+            return self.spool.save_result(payload["artifact"], result)
         finally:
             if self.can_release(request_id): broker.clear_executor_fence(request_id)
 
@@ -321,14 +369,19 @@ class ASRAPI:
                 key = handler.headers.get("Idempotency-Key", "")
                 size = int(handler.headers.get("Content-Length", "0"))
                 self.executor.spool.prune(self.broker)
-                payload = self.executor.spool.stage(key, handler.rfile, size, handler.connection)
-                try:
-                    job = self.broker.submit(PROFILE, "transcribe", payload, SOURCE, external_id=key)
-                except Exception:
-                    # Admission can fail after the upload is durably staged.
-                    # Do not leave an unreferenced audio artifact behind.
-                    self.executor.spool.discard_if_unowned(self.broker, key, payload["artifact"])
-                    raise
+                with self.executor.spool.admission_lock(key):
+                    with self.broker.lock:
+                        acknowledged = self.broker.db.execute(
+                            "SELECT 1 FROM asr_receipts r JOIN jobs j ON j.id=r.job_id "
+                            "WHERE j.source=? AND j.external_id=?", (SOURCE, key)).fetchone()
+                    if acknowledged:
+                        handler._json(410, {"error": "ASR artifact acknowledged"}); return
+                    payload = self.executor.spool.stage(key, handler.rfile, size, handler.connection)
+                    try:
+                        job = self.broker.submit(PROFILE, "transcribe", payload, SOURCE, external_id=key)
+                    except Exception:
+                        self.executor.spool.discard_if_unowned(self.broker, key, payload["artifact"])
+                        raise
                 handler._json(202, {"id": job["id"], "state": job["state"]})
                 return
             parts = path.strip("/").split("/")
@@ -338,6 +391,9 @@ class ASRAPI:
             if job is None or job.get("kind") != "transcribe":
                 handler._json(404, {"error": "not found"}); return
             if handler.command == "GET" and len(parts) == 3:
+                with self.broker.lock:
+                    if self.broker.db.execute("SELECT 1 FROM asr_receipts WHERE job_id=?", (job["id"],)).fetchone():
+                        handler._json(410, {"error": "ASR artifact acknowledged"}); return
                 fence = self.broker.executor_fence()
                 response = {"id": job["id"], "state": job["state"],
                             "gpu_release_pending": bool(fence and fence["job_id"] == job["id"])}
@@ -352,11 +408,14 @@ class ASRAPI:
             elif handler.command == "POST" and len(parts) == 4 and parts[3] == "ack":
                 if job["state"] not in {"completed", "cancelled", "failed"}:
                     raise ValueError("ASR job is not terminal")
-                fence = self.broker.executor_fence()
-                if fence and fence["job_id"] == job["id"]:
-                    raise ValueError("ASR GPU release pending")
-                artifact = (job.get("result") or job.get("payload", {})).get("artifact")
-                if artifact: self.executor.spool.discard(artifact)
+                with self.executor.spool.admission_lock(job["external_id"]):
+                    # Receipt is durable before deletion. It is independent
+                    # of the model's ownership fence and survives retries.
+                    with self.broker.lock, self.broker.db:
+                        self.broker.db.execute("INSERT OR IGNORE INTO asr_receipts VALUES(?,?)",
+                                               (job["id"], time.time()))
+                    artifact = (job.get("result") or job.get("payload", {})).get("artifact")
+                    if artifact: self.executor.spool.discard(artifact)
                 handler._json(200, {"acknowledged": True})
             else: handler._json(404, {"error": "not found"})
         except Exception as error:
