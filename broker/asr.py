@@ -268,7 +268,7 @@ class WhisperExecutor:
         audio = self.spool.audio(payload)
         status = self.worker.status()
         if (status.get("model") != MODEL or status.get("active_jobs") != 0
-                or status.get("model_loaded") is not False
+                or status.get("model_loaded") not in (False, True)
                 or status.get("request_tracking") is not True):
             raise RuntimeError("Whisper worker not idle or incompatible")
         # Do not evict models: an out-of-band caller may still own them.
