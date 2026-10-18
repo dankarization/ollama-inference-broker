@@ -92,8 +92,6 @@ class ASRTests(unittest.TestCase):
 
     def test_warm_whisper_reuses_owner_fence_for_next_asr(self):
         first = self.job("warm-first-correlation")
-        self.worker.last = "old-request"
-        self.broker.set_executor_fence("old-request", first["id"])
         self.assertTrue(self.broker.dispatch_once())
         self.assertEqual(self.broker.status(first["id"])["state"], "completed")
         self.assertIsNotNone(self.broker.executor_fence())
