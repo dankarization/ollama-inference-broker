@@ -91,7 +91,6 @@ class ASRTests(unittest.TestCase):
         self.assertTrue(self.ollama.calls)
 
     def test_warm_whisper_reuses_owner_fence_for_next_asr(self):
-        self.worker.model_loaded = True
         first = self.job("warm-first-correlation")
         self.worker.last = "old-request"
         self.broker.set_executor_fence("old-request", first["id"])
