@@ -57,7 +57,7 @@ class ASRTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.addCleanup(self.broker.db.close)
 
-    def payload(self, key="test-correlation-001", data=b"fake audio"):
+    def payload(self, key="test-correlation-001", data=b"x" * 1024):
         return self.spool.stage(key, io.BytesIO(data), len(data), Mock())
 
     def job(self, key="test-correlation-001"):
