@@ -57,11 +57,11 @@ class ASRTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.addCleanup(self.broker.db.close)
 
-    def payload(self, key="test-correlation-001", data=b"x" * 1024):
+    def payload(self, key="test-correlation-001", data=b"fake audio"):
         return self.spool.stage(key, io.BytesIO(data), len(data), Mock())
 
     def job(self, key="test-correlation-001"):
-        return self.broker.submit(PROFILE, "transcribe", self.payload(key), external_id=key)
+        return self.broker.submit(PROFILE, "transcribe", self.payload(key, b"x" * 1024), external_id=key)
 
     def test_raw_media_and_text_stay_outside_sqlite(self):
         job = self.job()
@@ -92,7 +92,7 @@ class ASRTests(unittest.TestCase):
 
     def test_warm_whisper_reuses_owner_fence_for_next_asr(self):
         self.worker.model_loaded = True
-        first = self.job("warm-first")
+        first = self.job("warm-first-001")
         self.broker.set_executor_fence("old-request", first["id"])
         self.assertTrue(self.broker.dispatch_once())
         self.assertEqual(self.broker.status(first["id"])["state"], "completed")
@@ -101,7 +101,7 @@ class ASRTests(unittest.TestCase):
 
     def test_explicit_idle_release_clears_fence_after_worker_ack(self):
         self.worker.model_loaded = True
-        job = self.job("warm-release")
+        job = self.job("warm-release-001")
         self.broker.set_executor_fence("release-request", job["id"])
         self.assertTrue(self.executor.release_idle(self.broker))
         self.assertIsNone(self.broker.executor_fence())
