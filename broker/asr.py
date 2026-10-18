@@ -79,6 +79,12 @@ class Spool:
                         raise ValueError("ASR idempotency conflict")
                 else:
                     os.replace(temp, dest)
+                    if os.name != "nt":
+                        directory = os.open(self.root, os.O_RDONLY)
+                        try:
+                            os.fsync(directory)
+                        finally:
+                            os.close(directory)
                 return {"artifact": artifact, "sha256": checksum, "bytes": size}
             finally:
                 temp.unlink(missing_ok=True)
@@ -117,6 +123,19 @@ class Spool:
         with self.lock:
             for suffix in (".audio", ".json"):
                 self.path(artifact, suffix).unlink(missing_ok=True)
+
+    def discard_if_unowned(self, broker, key, artifact):
+        """Remove only a newly staged artifact with no durable job reference."""
+        with broker.lock, self.lock:
+            row = broker.db.execute(
+                "SELECT 1 FROM jobs WHERE source=? AND external_id=? LIMIT 1",
+                (SOURCE, key),
+            ).fetchone()
+            if row is not None:
+                return False
+            for suffix in (".audio", ".json"):
+                self.path(artifact, suffix).unlink(missing_ok=True)
+            return True
 
     def prune(self, broker, now=None):
         """Expire abandoned staging after a day, preserving queued work and fences."""
@@ -257,7 +276,7 @@ class ASRAPI:
                 except Exception:
                     # Admission can fail after the upload is durably staged.
                     # Do not leave an unreferenced audio artifact behind.
-                    self.executor.spool.discard(payload["artifact"])
+                    self.executor.spool.discard_if_unowned(self.broker, key, payload["artifact"])
                     raise
                 handler._json(202, {"id": job["id"], "state": job["state"]})
                 return
@@ -289,7 +308,15 @@ class ASRAPI:
                 if artifact: self.executor.spool.discard(artifact)
                 handler._json(200, {"acknowledged": True})
             else: handler._json(404, {"error": "not found"})
-        except Exception:
-            handler._json(400, {"error": "ASR request rejected"})
+        except Exception as error:
+            # Keep broker admission semantics visible to authenticated ASR
+            # clients without importing service.py (which imports this module).
+            error_name = type(error).__name__
+            if error_name == "SourceAdmissionBlocked":
+                handler._json(403, {"error": str(error)})
+            elif error_name == "SourceQueueFull":
+                handler._json(429, {"error": str(error)})
+            else:
+                handler._json(400, {"error": "ASR request rejected"})
         finally:
             self.slots.release()
