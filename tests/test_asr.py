@@ -94,8 +94,14 @@ class ASRTests(unittest.TestCase):
         first = self.job("warm-first-correlation")
         self.assertTrue(self.broker.dispatch_once())
         self.assertEqual(self.broker.status(first["id"])["state"], "completed")
+        self.worker.model_loaded = True
+        self.worker.released = False
+        second = self.job("warm-second-correlation")
+        self.broker.set_executor_fence(self.worker.last, first["id"])
+        self.assertTrue(self.broker.dispatch_once())
+        self.assertEqual(self.broker.status(second["id"])["state"], "completed")
         self.assertIsNotNone(self.broker.executor_fence())
-        self.assertEqual(self.broker.executor_fence()["job_id"], first["id"])
+        self.assertEqual(self.broker.executor_fence()["job_id"], second["id"])
 
     def test_explicit_idle_release_clears_fence_after_worker_ack(self):
         self.worker.model_loaded = True
